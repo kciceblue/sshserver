@@ -1,0 +1,8 @@
+Just Another Terminal Sync Server
+Copyright 2026 Hengyu Xu
+
+This product is licensed under the Apache License, Version 2.0.
+
+No third-party runtime or build dependencies are distributed at this scaffold
+stage. External GitHub Actions used by CI are recorded in DEPENDENCIES.json
+and are not redistributed by this repository.

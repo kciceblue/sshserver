@@ -1,0 +1,19 @@
+{
+  "allowed_licenses": [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT"
+  ],
+  "dependencies": [
+    {
+      "license": "MIT",
+      "name": "actions/checkout",
+      "selector": "actions/checkout@v4",
+      "usage": "ci-action"
+    }
+  ],
+  "policy": "go-modules-and-ci-actions",
+  "schema_version": 1
+}

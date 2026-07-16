@@ -1,0 +1,32 @@
+name: DCO
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  commits:
+    name: Signed-off commits
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the trusted base revision so a pull request cannot weaken the
+      # checker it is being evaluated by.
+      - name: Check out trusted base
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Fetch pull-request commits
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head"
+          test "$(git rev-parse "refs/remotes/pull/${PR_NUMBER}/head")" = "$HEAD_SHA"
+      - name: Verify every commit has a matching sign-off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/check_dco.py --base "$BASE_SHA" --head "$HEAD_SHA"
