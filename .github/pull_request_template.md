@@ -1,6 +1,14 @@
 ## Coordinator task
 
-Task ID: <!-- Required, for example 2.1. External contributors may reference a public issue. -->
+Maintainers and internal contributors follow the
+[private coordinator task workflow](https://github.com/kciceblue/just-another-terminal/blob/main/PLAN.md#how-agents-should-use-this-file).
+External contributors without coordinator access may
+[open or link a public issue](https://github.com/kciceblue/sshserver/issues/new)
+instead. One of the following references is required.
+
+Coordinator task ID: <!-- For example 2.1. -->
+
+Public issue: <!-- For example #123. -->
 
 ## Summary
 
@@ -19,5 +27,5 @@ Task ID: <!-- Required, for example 2.1. External contributors may reference a p
 - [ ] Dependency inventory, bundled license texts, and NOTICE are current.
 - [ ] No prohibited source was used as an implementation input.
 - [ ] Tom reviewed any Crypto, Keychain, or Network Extension changes.
-- [ ] Any resolved decision or gate is recorded in the coordinator ledger.
+- [ ] Any resolved decision or gate is recorded in the coordinator ledger and the public projection is updated when relevant.
 - [ ] Ordinary SSH targets remain agentless.

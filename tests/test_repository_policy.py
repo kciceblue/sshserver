@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+COORDINATOR_WORKFLOW_URL = (
+    "https://github.com/kciceblue/just-another-terminal/blob/main/"
+    "PLAN.md#how-agents-should-use-this-file"
+)
+PUBLIC_ISSUE_URL = "https://github.com/kciceblue/sshserver/issues/new"
+PUBLIC_DECISION_IDS = {"D2", "D3", "D4", "D6", "D7", "D10", "D12", "D14", "G2"}
+DECISION_FIELDS = ("Status", "Rationale", "Evidence", "Closing task")
 GUARDRAILS = """## Guardrails — non-negotiable, apply to every task
 
 1. Dependencies must be MIT/BSD/Apache/ISC licensed; update NOTICE. Never fetch, read, or paste GPL sources (mosh, Blink, libssh, wolfSSH). Unmodified stock mosh binaries/packages may be executed only as black-box interoperability targets; their source is never an input.
@@ -43,6 +51,48 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("Apache License\n                           Version 2.0", license_text)
         self.assertIn("TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION", license_text)
         self.assertIn("END OF TERMS AND CONDITIONS", license_text)
+
+    def test_public_decision_projection_has_only_server_records(self) -> None:
+        text = (ROOT / "DECISIONS.md").read_text(encoding="utf-8")
+        records: dict[str, str] = {}
+        matches = list(re.finditer(r"(?m)^## ((?:D|G)\d+) — .+$", text))
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            records[match.group(1)] = text[match.end() : end]
+
+        self.assertEqual(len(matches), len(PUBLIC_DECISION_IDS))
+        self.assertEqual(set(records), PUBLIC_DECISION_IDS)
+        for record_id, body in records.items():
+            with self.subTest(record_id=record_id):
+                for field in DECISION_FIELDS:
+                    self.assertRegex(body, rf"(?m)^- \*\*{re.escape(field)}:\*\* \S.+$")
+                    self.assertEqual(body.count(f"- **{field}:**"), 1)
+
+    def test_public_decision_projection_excludes_private_product_details(self) -> None:
+        text = (ROOT / "DECISIONS.md").read_text(encoding="utf-8")
+        for private_detail in (
+            "YLJU8C8DN6",
+            "Hengyu Xu",
+            "Small Business Program",
+            "bundle identifier",
+            "seven-day preview",
+            "$1",
+        ):
+            with self.subTest(private_detail=private_detail):
+                self.assertNotIn(private_detail, text)
+
+    def test_public_decision_update_workflow_supports_external_contributors(self) -> None:
+        decisions = (ROOT / "DECISIONS.md").read_text(encoding="utf-8")
+        pull_request_template = (
+            ROOT / ".github" / "pull_request_template.md"
+        ).read_text(encoding="utf-8")
+
+        for document in (decisions, pull_request_template):
+            with self.subTest(document=document[:40]):
+                self.assertIn(COORDINATOR_WORKFLOW_URL, document)
+                self.assertIn(PUBLIC_ISSUE_URL, document)
+        self.assertIn("Coordinator task ID:", pull_request_template)
+        self.assertIn("Public issue:", pull_request_template)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,10 @@ inventory with both the Go module graph and GitHub Actions used by CI.
 Never use GPL source as an implementation input. The complete clean-room and
 product guardrails are repeated in `AGENTS.md` and `CLAUDE.md`.
 
+The public, server-relevant subset of the canonical product decisions is in
+`DECISIONS.md`. External contributors may use a public repository issue in
+place of the private coordinator task reference described there.
+
 ## Contributing and DCO
 
 Every commit in a pull request must certify the Developer Certificate of
