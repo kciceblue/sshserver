@@ -100,6 +100,19 @@ class DependencyLicensePolicyTests(unittest.TestCase):
             errors,
         )
 
+    def test_test_peer_usage_does_not_broaden_dependency_allowlist(self) -> None:
+        forbidden = dict(CHECKOUT)
+        forbidden["usage"] = "test-peer"
+        forbidden["license"] = "GPL-3.0-only"
+        self.write_inventory([forbidden])
+
+        errors = checker.validate_repository(self.root)
+
+        self.assertTrue(
+            any("non-allowlisted license GPL-3.0-only" in item for item in errors),
+            errors,
+        )
+
     def test_unlisted_action_fails(self) -> None:
         (self.root / ".github" / "workflows" / "ci.yml").write_text(
             "steps:\n  - uses: example/unreviewed@v1\n", encoding="utf-8"

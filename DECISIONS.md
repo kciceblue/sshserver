@@ -70,6 +70,20 @@ be used as dependencies or implementation inputs. Unmodified stock mosh
 binaries or packages may be executed only as black-box interoperability peers;
 their source is never an input.
 
+## D16 — Non-shipped black-box test peers
+
+- **Status:** Locked.
+- **Rationale:** Interoperability tests need representative stock peers without turning those programs or their source into implementation inputs or distributed server components.
+- **Evidence:** [Repository guardrails](AGENTS.md), the [development policy](README.md), and the fail-closed dependency license check.
+- **Closing task:** 0.5 records the approved policy for current and future interoperability test harnesses.
+
+Unmodified stock mosh, Dropbear, and tmux binaries/packages may be executed
+only as non-shipped black-box interoperability targets in tests, including
+future test harnesses. Their source is never an implementation input, and they
+are never linked into or redistributed with this server or the products.
+Product/runtime dependencies and implementation inputs remain restricted to
+the D6 allowlist.
+
 ## D7 — Agentless ordinary SSH targets
 
 - **Status:** Locked.

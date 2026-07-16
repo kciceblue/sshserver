@@ -18,11 +18,19 @@ Run the complete local policy suite before proposing a change:
 make check
 ```
 
-Only MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0, and ISC dependencies are
-permitted. Every Go module must be recorded in `DEPENDENCIES.json`; its full
-license text must be placed in `ThirdPartyLicenses/`; and its required notice
-must be added to `NOTICE`. The fail-closed policy checker compares the
-inventory with both the Go module graph and GitHub Actions used by CI.
+Only MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0, and ISC product/runtime
+dependencies and implementation inputs are permitted. Every Go module must be
+recorded in `DEPENDENCIES.json`; its full license text must be placed in
+`ThirdPartyLicenses/`; and its required notice must be added to `NOTICE`. The
+fail-closed policy checker compares the inventory with both the Go module graph
+and GitHub Actions used by CI.
+
+Test harnesses may execute unmodified stock mosh, Dropbear, and tmux
+binaries/packages only as external, non-shipped black-box interoperability
+targets. Their source is never an implementation input, and the targets are
+never linked into or redistributed with the products. Code and dependencies
+used to implement those harnesses remain subject to the allowlist and
+inventory requirements above.
 
 Never use GPL source as an implementation input. The complete clean-room and
 product guardrails are repeated in `AGENTS.md` and `CLAUDE.md`.
