@@ -129,6 +129,19 @@ Linux and macOS on amd64 and arm64. Installation is available through the app
 over SSH and as an equivalent copyable one-line command. Ordinary SSH targets
 need nothing beyond SSH.
 
+## D18 — Manual-only GitHub Actions
+
+- **Status:** Locked.
+- **Rationale:** Local Codex validation avoids duplicate hosted work while explicit dispatch preserves remote evidence when a pull request needs the protected checks.
+- **Evidence:** The manual-dispatch CI and DCO workflows plus repository policy tests.
+- **Closing task:** 0.11 adopts and verifies the policy across all three repositories.
+
+GitHub Actions do not run automatically on pushes, pull requests, tags, or
+schedules. Codex runs local checks by default and dispatches hosted validation
+only when remote-runner evidence is materially necessary. For a server pull
+request, manual CI and DCO runs publish the existing protected status contexts
+to the pull-request head commit.
+
 ## G2 — Proprietary session daemon
 
 - **Status:** Closed and superseded by D7.

@@ -21,6 +21,7 @@ PUBLIC_DECISION_IDS = {
     "D12",
     "D14",
     "D16",
+    "D18",
     "G2",
 }
 DECISION_FIELDS = ("Status", "Rationale", "Evidence", "Closing task")
@@ -51,11 +52,31 @@ class RepositoryPolicyTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "dco.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("on:\n  pull_request:", workflow)
+        self.assertIn("on:\n  workflow_dispatch:", workflow)
+        self.assertIn("pull_request_number:", workflow)
         self.assertNotIn("pull_request_target", workflow)
         self.assertIn("fetch-depth: 0", workflow)
-        self.assertIn("ref: ${{ github.event.pull_request.base.sha }}", workflow)
+        self.assertIn("ref: ${{ steps.pull_request.outputs.base_sha }}", workflow)
         self.assertIn("python3 scripts/check_dco.py", workflow)
+        self.assertIn('name="Signed-off commits"', workflow)
+
+    def test_all_workflows_are_manual_only(self) -> None:
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertTrue(workflows)
+        for workflow in workflows:
+            with self.subTest(workflow=workflow.name):
+                text = workflow.read_text(encoding="utf-8")
+                self.assertIn("on:\n  workflow_dispatch:", text)
+                for trigger in ("pull_request", "push", "schedule", "merge_group"):
+                    self.assertNotIn(f"\n  {trigger}:", text)
+
+    def test_manual_ci_reports_existing_branch_protection_context(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("pull_request_number:", workflow)
+        self.assertIn('name="Repository policy"', workflow)
+        self.assertIn("checks: write", workflow)
 
     def test_repository_uses_full_apache_2_license(self) -> None:
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")

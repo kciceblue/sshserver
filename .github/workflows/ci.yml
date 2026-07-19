@@ -1,18 +1,66 @@
 name: CI
 
 on:
-  pull_request:
-  push:
-
-permissions:
-  contents: read
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Optional pull request number to validate and report
+        required: false
+        default: 0
+        type: number
 
 jobs:
   policy:
     name: Repository policy
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
+      - name: Resolve pull-request revision
+        if: inputs.pull_request_number > 0
+        id: pull_request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+        run: |
+          set -euo pipefail
+          head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)"
+          test -n "$head_sha"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=refs/pull/${PR_NUMBER}/head" >> "$GITHUB_OUTPUT"
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pull_request.outputs.checkout_ref || github.sha }}
+          persist-credentials: false
       - name: Run policy checks and tests
         run: make check
+
+  report:
+    name: Publish repository-policy status
+    if: always() && inputs.pull_request_number > 0
+    needs: policy
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      pull-requests: read
+    steps:
+      - name: Publish result on pull-request head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          RESULT: ${{ needs.policy.result }}
+        run: |
+          set -euo pipefail
+          head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)"
+          conclusion=failure
+          if [ "$RESULT" = success ]; then
+            conclusion=success
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+            -f name="Repository policy" \
+            -f head_sha="$head_sha" \
+            -f status=completed \
+            -f conclusion="$conclusion" \
+            -f details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
