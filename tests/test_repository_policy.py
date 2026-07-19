@@ -59,6 +59,17 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("ref: ${{ steps.pull_request.outputs.base_sha }}", workflow)
         self.assertIn("python3 scripts/check_dco.py", workflow)
         self.assertIn('context="Signed-off commits"', workflow)
+        self.assertIn(
+            "validated_head_sha: ${{ steps.pull_request.outputs.head_sha }}",
+            workflow,
+        )
+        self.assertIn(
+            "VALIDATED_HEAD_SHA: ${{ needs.commits.outputs.validated_head_sha }}",
+            workflow,
+        )
+        self.assertIn(
+            'test "$current_head_sha" = "$VALIDATED_HEAD_SHA"', workflow
+        )
 
     def test_all_workflows_are_manual_only(self) -> None:
         workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
@@ -77,6 +88,10 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("pull_request_number:", workflow)
         self.assertIn('context="Repository policy"', workflow)
         self.assertIn("statuses: write", workflow)
+        self.assertIn(
+            "VALIDATED_HEAD_SHA: ${{ needs.policy.outputs.validated_head_sha }}",
+            workflow,
+        )
 
     def test_repository_uses_full_apache_2_license(self) -> None:
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
