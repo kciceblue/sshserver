@@ -1,0 +1,52 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-shape-only",
+  "description": "Envelope shape and generation/CAS cases. wrapped_vmk values are placeholders, not valid XChaCha20-Poly1305 outputs.",
+  "base_mode": {
+    "expected_generation": "0",
+    "new_generation": "1",
+    "envelope": {
+      "protocol_version": "1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "instance_id": "00000000-0000-4000-8000-000000000001",
+      "vault_id": "00000000-0000-4000-8000-000000000002",
+      "envelope_generation": "1",
+      "instance_secret_generation": "1",
+      "mode": "base",
+      "hkdf_salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "argon2": null,
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "wrapped_vmk": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  },
+  "passphrase_rewrap": {
+    "expected_generation": "1",
+    "new_generation": "2",
+    "envelope": {
+      "protocol_version": "1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "instance_id": "00000000-0000-4000-8000-000000000001",
+      "vault_id": "00000000-0000-4000-8000-000000000002",
+      "envelope_generation": "2",
+      "instance_secret_generation": "1",
+      "mode": "passphrase",
+      "hkdf_salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "argon2": {
+        "version": 19,
+        "salt": "AAAAAAAAAAAAAAAAAAAAAA",
+        "memory_kib": 65536,
+        "iterations": 3,
+        "parallelism": 1,
+        "output_length": 32
+      },
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "wrapped_vmk": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  },
+  "cases": [
+    {"name": "create", "expected_generation": "0", "new_generation": "1", "result": "commit"},
+    {"name": "same_generation_retry", "expected_generation": "1", "new_generation": "2", "result": "commit_once"},
+    {"name": "stale_writer", "expected_generation": "1", "new_generation": "2", "stored_generation": "2", "result": "generation_conflict"},
+    {"name": "skip_generation", "expected_generation": "2", "new_generation": "4", "result": "invalid_request"}
+  ]
+}

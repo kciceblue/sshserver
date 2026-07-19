@@ -1,0 +1,43 @@
+{
+  "fixture_version": 1,
+  "status": "tom-review-required-no-expected-outputs",
+  "description": "The proposed construction inputs are frozen for review, but expected cryptographic values are intentionally absent until Tom approves the profile and independent Swift/Go implementations agree.",
+  "proposed_suite": "jat-xchacha-hkdf-argon2id-draft1",
+  "inputs": {
+    "instance_id": "00000000-0000-4000-8000-000000000001",
+    "vault_id": "00000000-0000-4000-8000-000000000002",
+    "record_id": "00000000-0000-4000-8000-000000000020",
+    "revision_id": "00000000-0000-4000-8000-000000000021",
+    "device_id": "00000000-0000-4000-8000-000000000010",
+    "instance_secret_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "vmk_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "hkdf_salt_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "argon2_salt_hex": "606162636465666768696a6b6c6d6e6f",
+    "passphrase_utf8_hex_after_nfc": "636f727265637420686f727365206261747465727920737461706c65",
+    "envelope_nonce_hex": "707172737475767778797a7b7c7d7e7f8081828384858687",
+    "record_nonce_hex": "88898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "record_plaintext_utf8_hex": "7b227061796c6f61645f76657273696f6e223a312c227265636f72645f74797065223a22736e6970706574222c22626f6479223a7b226e616d65223a2274657374222c22636f6d6d616e64223a227072696e74662074657374222c226e6f746573223a22222c22637265617465645f6174223a22323032362d30372d31395431323a30303a30302e3030305a222c22757064617465645f6174223a22323032362d30372d31395431323a30303a30302e3030305a227d7d"
+  },
+  "proposed_argon2id": {
+    "version": 19,
+    "memory_kib": 65536,
+    "iterations": 3,
+    "parallelism": 1,
+    "output_length": 32
+  },
+  "expected": {
+    "base_wrap_key_hex": null,
+    "base_envelope_ad_hex": null,
+    "base_wrapped_vmk_hex": null,
+    "passphrase_material_hex": null,
+    "passphrase_wrap_key_hex": null,
+    "passphrase_wrapped_vmk_hex": null,
+    "record_key_hex": null,
+    "record_ad_hex": null,
+    "record_ciphertext_hex": null,
+    "tampered_ad_result": null,
+    "wrong_passphrase_result": null,
+    "rewrap_preserves_vmk": null
+  },
+  "exit_condition": "Replace every null with independently verified reviewed values before removing review-pending status."
+}

@@ -1,0 +1,92 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-semantics",
+  "health": {"status": "ok", "protocol_version": "1"},
+  "capabilities": {
+    "instance_id": "00000000-0000-4000-8000-000000000001",
+    "vault_id": "00000000-0000-4000-8000-000000000002",
+    "protocol_min": "1",
+    "protocol_max": "1",
+    "storage_schema": "1",
+    "crypto_suites": ["jat-xchacha-hkdf-argon2id-draft1"],
+    "capabilities": [
+      "conflict-siblings-v1",
+      "device-token-rotation-v1",
+      "envelope-cas-v1",
+      "snapshot-read-v1",
+      "tombstone-ack-v1"
+    ],
+    "limits": {
+      "max_body_bytes": 4194304,
+      "max_mutations": 256,
+      "max_page_changes": 128,
+      "max_snapshot_page_revisions": 128,
+      "max_devices": 64
+    }
+  },
+  "empty_sync_request": {
+    "protocol_version": "1",
+    "device_id": "00000000-0000-4000-8000-000000000003",
+    "request_id": "00000000-0000-4000-8000-000000000030",
+    "after_cursor": "0",
+    "ack_cursor": "0",
+    "mutations": []
+  },
+  "empty_sync_response": {
+    "protocol_version": "1",
+    "server_cursor": "0",
+    "next_cursor": "0",
+    "has_more": false,
+    "envelope_generation": "0",
+    "changes": []
+  },
+  "mutation_ordering": {
+    "key": ["author_counter_uint64", "record_id_uuid_bytes", "revision_id_uuid_bytes"],
+    "ordered_examples": [
+      {"author_counter": "1", "record_id": "00000000-0000-4000-8000-000000000030", "revision_id": "00000000-0000-4000-8000-000000000031"},
+      {"author_counter": "2", "record_id": "00000000-0000-4000-8000-000000000020", "revision_id": "00000000-0000-4000-8000-000000000021"},
+      {"author_counter": "2", "record_id": "00000000-0000-4000-8000-000000000020", "revision_id": "00000000-0000-4000-8000-000000000022"}
+    ],
+    "duplicates_allowed": false,
+    "unsorted_error": "invalid_request"
+  },
+  "backup_manifest": {
+    "format_version": 1,
+    "instance_id": "00000000-0000-4000-8000-000000000001",
+    "vault_id": "00000000-0000-4000-8000-000000000002",
+    "instance_secret_generation": "1",
+    "secret_rotation_state": "stable",
+    "storage_schema": "1",
+    "created_at": "2026-07-19T12:00:00.000Z",
+    "files": [
+      {"path": "sync.db", "mode": "0600", "size": "4096", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+      {"path": "instance-secret", "mode": "0600", "size": "32", "sha256": "1111111111111111111111111111111111111111111111111111111111111111"},
+      {"path": "config.json", "mode": "0600", "size": "256", "sha256": "2222222222222222222222222222222222222222222222222222222222222222"}
+    ]
+  },
+  "restore_cases": [
+    {"name": "matching_complete_backup", "result": "validate_in_isolation_then_atomic_replace"},
+    {"name": "database_secret_instance_mismatch", "result": "instance_mismatch"},
+    {"name": "missing_secret", "result": "restore_incompatible"},
+    {"name": "future_storage_schema", "result": "restore_incompatible"},
+    {"name": "checksum_mismatch", "result": "restore_incompatible"}
+  ],
+  "backup_cases": [
+    {"name": "stable_secret_generation", "result": "complete_backup"},
+    {"name": "pending_secret_exists", "result": "backup_refused_rotation_in_progress"},
+    {"name": "old_recovery_slot_exists", "result": "backup_refused_rotation_in_progress"}
+  ],
+  "errors": [
+    {"http_status": 401, "code": "token_revoked", "retryable": false},
+    {"http_status": 409, "code": "generation_conflict", "retryable": true},
+    {"http_status": 409, "code": "revision_equivocation", "retryable": false},
+    {"http_status": 410, "code": "cursor_expired", "retryable": false},
+    {"http_status": 403, "code": "authenticated_device_mismatch", "retryable": false},
+    {"http_status": 404, "code": "device_not_found", "retryable": false},
+    {"http_status": 404, "code": "snapshot_not_found", "retryable": false},
+    {"http_status": 410, "code": "snapshot_expired", "retryable": false},
+    {"http_status": 409, "code": "stale_after_collection", "retryable": false},
+    {"http_status": 426, "code": "unsupported_protocol", "retryable": false},
+    {"http_status": 500, "code": "internal_error", "retryable": true}
+  ]
+}

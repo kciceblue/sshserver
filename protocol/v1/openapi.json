@@ -1,0 +1,437 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Just Another Terminal Sync API",
+    "version": "1.0.0-review-draft",
+    "description": "Task 2.0 review-pending API. It is reachable only through an SSH-forwarded loopback listener and is not approved for shipping."
+  },
+  "x-jat-error-status-map": {
+    "invalid_request": 400,
+    "unsupported_protocol": 426,
+    "unsupported_capability": 426,
+    "unauthorized": 401,
+    "token_revoked": 401,
+    "scope_denied": 403,
+    "authenticated_device_mismatch": 403,
+    "rate_limited": 429,
+    "grant_expired": 410,
+    "grant_consumed": 410,
+    "enrollment_replay_mismatch": 409,
+    "request_id_reused": 409,
+    "generation_conflict": 409,
+    "counter_conflict": 409,
+    "counter_exhausted": 409,
+    "revision_equivocation": 409,
+    "too_many_siblings": 409,
+    "limit_exceeded": 413,
+    "cursor_expired": 410,
+    "envelope_missing": 404,
+    "device_not_found": 404,
+    "snapshot_not_found": 404,
+    "snapshot_expired": 410,
+    "stale_after_collection": 409,
+    "zero_active_confirmation_required": 409,
+    "instance_mismatch": 409,
+    "server_cursor_exhausted": 507,
+    "internal_error": 500
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:37421",
+      "description": "Loopback endpoint reached through a verified SSH local forward"
+    }
+  ],
+  "paths": {
+    "/v1/healthz": {
+      "get": {
+        "operationId": "getHealth",
+        "security": [],
+        "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
+        "responses": {
+          "200": {
+            "description": "Service is ready",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/health_response"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/capabilities": {
+      "get": {
+        "operationId": "getCapabilities",
+        "security": [],
+        "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
+        "responses": {
+          "200": {
+            "description": "Exact protocol and capability range",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/capabilities_response"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/enrollments": {
+      "post": {
+        "operationId": "createEnrollment",
+        "security": [{"enrollmentGrant": []}],
+        "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "schemas/wire.schema.json#/$defs/enrollment_request"}
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Device enrolled",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/enrollment_response"}
+              }
+            }
+          },
+          "200": {
+            "description": "Byte-equivalent idempotent retry",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/enrollment_response"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "410": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/vault-envelope": {
+      "get": {
+        "operationId": "getVaultEnvelope",
+        "security": [{"deviceBearer": []}],
+        "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
+        "responses": {
+          "200": {
+            "description": "Current wrapped VMK envelope",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/vault_envelope"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      },
+      "put": {
+        "operationId": "putVaultEnvelope",
+        "security": [{"deviceBearer": []}],
+        "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "schemas/wire.schema.json#/$defs/put_envelope_request"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Envelope generation committed",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/vault_envelope"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "413": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/sync": {
+      "post": {
+        "operationId": "syncVault",
+        "security": [{"deviceBearer": []}],
+        "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "schemas/wire.schema.json#/$defs/sync_request"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Atomic mutation/ack commit followed by one ordered page",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/sync_response"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "410": {"$ref": "#/components/responses/Error"},
+          "413": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"},
+          "507": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/snapshot-reads": {
+      "post": {
+        "operationId": "createSnapshotRead",
+        "security": [{"deviceBearer": []}],
+        "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_create_request"}
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Stable snapshot cut and first page token created",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_create_response"}
+              }
+            }
+          },
+          "200": {
+            "description": "Idempotent snapshot creation retry",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_create_response"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "413": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/snapshot-reads/{snapshot_id}/pages": {
+      "post": {
+        "operationId": "readSnapshotPage",
+        "security": [{"deviceBearer": []}],
+        "parameters": [
+          {"$ref": "#/components/parameters/ProtocolVersion"},
+          {"$ref": "#/components/parameters/RequestID"},
+          {
+            "name": "snapshot_id",
+            "in": "path",
+            "required": true,
+            "schema": {"$ref": "schemas/wire.schema.json#/$defs/uuid"}
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_page_request"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One stable page containing every retained undominated sibling in key order",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_page_response"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "410": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/devices": {
+      "get": {
+        "operationId": "listDevices",
+        "security": [{"deviceBearer": []}],
+        "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
+        "responses": {
+          "200": {
+            "description": "Server-visible device registry",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/devices_response"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/devices/{device_id}/revoke": {
+      "post": {
+        "operationId": "revokeDevice",
+        "security": [{"deviceBearer": []}],
+        "parameters": [
+          {"$ref": "#/components/parameters/ProtocolVersion"},
+          {"$ref": "#/components/parameters/RequestID"},
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {"$ref": "schemas/wire.schema.json#/$defs/uuid"}
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "schemas/wire.schema.json#/$defs/revoke_device_request"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Device durably revoked",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/device"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/v1/device-token-rotations": {
+      "post": {
+        "operationId": "rotateDeviceToken",
+        "description": "Self-only: request device_id must equal the bearer-authenticated device or HTTP 403 authenticated_device_mismatch is returned before mutation.",
+        "security": [{"deviceBearer": []}],
+        "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "schemas/wire.schema.json#/$defs/token_rotation_request"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token hash replaced or equivalent retry confirmed",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "schemas/wire.schema.json#/$defs/device"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "426": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "500": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "deviceBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "32 random bytes encoded as unpadded base64url"
+      },
+      "enrollmentGrant": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "Authorization",
+        "description": "JAT-Enrollment followed by a short-lived 32-byte grant"
+      }
+    },
+    "parameters": {
+      "ProtocolVersion": {
+        "name": "JAT-Protocol-Version",
+        "in": "header",
+        "required": true,
+        "schema": {"const": "1"}
+      },
+      "RequestID": {
+        "name": "JAT-Request-ID",
+        "in": "header",
+        "required": true,
+        "schema": {"$ref": "schemas/wire.schema.json#/$defs/uuid"}
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Stable redaction-safe error",
+        "content": {
+          "application/json": {
+            "schema": {"$ref": "schemas/wire.schema.json#/$defs/error_response"}
+          }
+        }
+      }
+    }
+  }
+}

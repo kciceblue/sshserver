@@ -1,0 +1,143 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-semantics",
+  "description": "Stable full-snapshot pagination retains both sides of an edit/delete conflict and then transitions to deltas strictly after the cut cursor.",
+  "create_request": {
+    "protocol_version": "1",
+    "device_id": "00000000-0000-4000-8000-000000000003",
+    "request_id": "00000000-0000-4000-8000-000000000040"
+  },
+  "create_response": {
+    "protocol_version": "1",
+    "snapshot_id": "00000000-0000-4000-8000-000000000041",
+    "cut_cursor": "50",
+    "envelope_generation": "1",
+    "envelope": {
+      "protocol_version": "1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "instance_id": "00000000-0000-4000-8000-000000000001",
+      "vault_id": "00000000-0000-4000-8000-000000000002",
+      "envelope_generation": "1",
+      "instance_secret_generation": "1",
+      "mode": "base",
+      "hkdf_salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "argon2": null,
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "wrapped_vmk": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    "expires_at": "2026-07-19T12:15:00.000Z",
+    "first_page_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "pages": [
+    {
+      "request": {
+        "protocol_version": "1",
+        "device_id": "00000000-0000-4000-8000-000000000003",
+        "page_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "response": {
+        "protocol_version": "1",
+        "snapshot_id": "00000000-0000-4000-8000-000000000041",
+        "cut_cursor": "50",
+        "envelope_generation": "1",
+        "revisions": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000020",
+            "revision_id": "00000000-0000-4000-8000-000000000021",
+            "author_device_id": "00000000-0000-4000-8000-000000000010",
+            "author_counter": "1",
+            "version_vector": [
+              {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+            ],
+            "payload_schema": "1",
+            "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+            "tombstone": false,
+            "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
+          }
+        ],
+        "next_page_token": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        "has_more": true
+      }
+    },
+    {
+      "request": {
+        "protocol_version": "1",
+        "device_id": "00000000-0000-4000-8000-000000000003",
+        "page_token": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+      },
+      "response": {
+        "protocol_version": "1",
+        "snapshot_id": "00000000-0000-4000-8000-000000000041",
+        "cut_cursor": "50",
+        "envelope_generation": "1",
+        "revisions": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000020",
+            "revision_id": "00000000-0000-4000-8000-000000000022",
+            "author_device_id": "00000000-0000-4000-8000-000000000011",
+            "author_counter": "1",
+            "version_vector": [
+              {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+            ],
+            "payload_schema": "1",
+            "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+            "tombstone": true,
+            "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
+          }
+        ],
+        "next_page_token": null,
+        "has_more": false
+      }
+    }
+  ],
+  "delta_transition_request": {
+    "protocol_version": "1",
+    "device_id": "00000000-0000-4000-8000-000000000003",
+    "request_id": "00000000-0000-4000-8000-000000000042",
+    "after_cursor": "50",
+    "ack_cursor": "50",
+    "mutations": []
+  },
+  "delta_transition_response": {
+    "protocol_version": "1",
+    "server_cursor": "51",
+    "next_cursor": "51",
+    "has_more": false,
+    "envelope_generation": "1",
+    "changes": [
+      {
+        "cursor": "51",
+        "kind": "record_revision",
+        "received_at": "2026-07-19T12:01:00.000Z",
+        "record_revision": {
+          "record_id": "00000000-0000-4000-8000-000000000020",
+          "revision_id": "00000000-0000-4000-8000-000000000023",
+          "author_device_id": "00000000-0000-4000-8000-000000000010",
+          "author_counter": "2",
+          "version_vector": [
+            {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
+            {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+          ],
+          "payload_schema": "1",
+          "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+          "tombstone": false,
+          "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
+        },
+        "collection_marker": null
+      }
+    ]
+  },
+  "expected": {
+    "membership_frozen_at_cut_cursor": true,
+    "page_replay_is_byte_equivalent": true,
+    "ordering_key": ["record_id_uuid_bytes", "revision_id_uuid_bytes"],
+    "all_undominated_siblings_included": true,
+    "live_sibling_count": 1,
+    "tombstone_sibling_count": 1,
+    "partial_snapshot_must_be_discarded_on_expiry": true,
+    "first_delta_after_cursor": "50"
+  }
+}

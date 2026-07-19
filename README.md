@@ -10,6 +10,22 @@ client and the canonical product plan live in separate repositories. The
 server implementation has not started yet; this scaffold establishes the
 licensing and contribution controls required before feature work begins.
 
+## Protocol review draft
+
+Task 2.0's public [sync protocol](SYNC-PROTOCOL.md) and
+[threat model](docs/THREAT-MODEL.md) are review drafts. Their exact HTTP,
+credential, cryptographic, retention, and recovery profiles are deliberately
+marked **REVIEW-PENDING** and are not approved for implementation or release.
+Machine-readable schemas, OpenAPI, and non-cryptographic shape fixtures live in
+[`protocol/v1/`](protocol/v1/). The crypto fixture intentionally has no expected
+outputs until the owner review and independent Swift/Go verification required
+by the protocol are complete.
+
+The draft does not start the server implementation. It preserves the locked
+boundaries that the server remains loopback-only, stores opaque client-encrypted
+records, performs no vault cryptography, parses no private keys, and is never
+installed on ordinary SSH targets.
+
 ## Development policy
 
 Run the complete local policy suite before proposing a change:

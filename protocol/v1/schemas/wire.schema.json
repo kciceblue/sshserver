@@ -1,0 +1,570 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kciceblue/sshserver/protocol/v1/schemas/wire.schema.json",
+  "title": "Just Another Terminal sync protocol V1 wire objects",
+  "description": "Review-pending task 2.0 schema. It is not an approved shipping crypto profile.",
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "uint64": {
+      "type": "string",
+      "description": "Canonical unsigned decimal in the inclusive range 0 through 18446744073709551615. Implementations MUST also parse with checked uint64 conversion before use.",
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "base64url": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]*$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    },
+    "scope": {
+      "type": "string",
+      "enum": [
+        "devices:manage",
+        "devices:read",
+        "envelope:read",
+        "envelope:write",
+        "sync:read",
+        "sync:write"
+      ]
+    },
+    "vector_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id", "counter"],
+      "properties": {
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "counter": {"$ref": "#/$defs/uint64"}
+      }
+    },
+    "record_revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_id",
+        "revision_id",
+        "author_device_id",
+        "author_counter",
+        "version_vector",
+        "payload_schema",
+        "crypto_suite",
+        "tombstone",
+        "nonce",
+        "ciphertext"
+      ],
+      "properties": {
+        "record_id": {"$ref": "#/$defs/uuid"},
+        "revision_id": {"$ref": "#/$defs/uuid"},
+        "author_device_id": {"$ref": "#/$defs/uuid"},
+        "author_counter": {"$ref": "#/$defs/uint64"},
+        "version_vector": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/vector_entry"}
+        },
+        "payload_schema": {"const": "1"},
+        "crypto_suite": {"const": "jat-xchacha-hkdf-argon2id-draft1"},
+        "tombstone": {"type": "boolean"},
+        "nonce": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "ciphertext": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 22,
+          "maxLength": 699072
+        }
+      }
+    },
+    "vault_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "base"}}},
+          "then": {"properties": {"argon2": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"mode": {"const": "passphrase"}}},
+          "then": {"properties": {"argon2": {"$ref": "#/$defs/argon2_parameters"}}}
+        }
+      ],
+      "required": [
+        "protocol_version",
+        "crypto_suite",
+        "instance_id",
+        "vault_id",
+        "envelope_generation",
+        "instance_secret_generation",
+        "mode",
+        "hkdf_salt",
+        "argon2",
+        "nonce",
+        "wrapped_vmk"
+      ],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "crypto_suite": {"const": "jat-xchacha-hkdf-argon2id-draft1"},
+        "instance_id": {"$ref": "#/$defs/uuid"},
+        "vault_id": {"$ref": "#/$defs/uuid"},
+        "envelope_generation": {"$ref": "#/$defs/uint64"},
+        "instance_secret_generation": {"$ref": "#/$defs/uint64"},
+        "mode": {"type": "string", "enum": ["base", "passphrase"]},
+        "hkdf_salt": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 43,
+          "maxLength": 43
+        },
+        "argon2": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/argon2_parameters"}
+          ]
+        },
+        "nonce": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "wrapped_vmk": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 64,
+          "maxLength": 64
+        }
+      }
+    },
+    "argon2_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "salt", "memory_kib", "iterations", "parallelism", "output_length"],
+      "properties": {
+        "version": {"const": 19},
+        "salt": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 22,
+          "maxLength": 22
+        },
+        "memory_kib": {"const": 65536},
+        "iterations": {"const": 3},
+        "parallelism": {"const": 1},
+        "output_length": {"const": 32}
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_id",
+        "scopes",
+        "status",
+        "created_at",
+        "revoked_at",
+        "last_sync_at",
+        "ack_cursor",
+        "max_author_counter"
+      ],
+      "properties": {
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "scopes": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/scope"}
+        },
+        "status": {"type": "string", "enum": ["active", "revoked"]},
+        "created_at": {"$ref": "#/$defs/timestamp"},
+        "revoked_at": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/timestamp"}]
+        },
+        "last_sync_at": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/timestamp"}]
+        },
+        "ack_cursor": {"$ref": "#/$defs/uint64"},
+        "max_author_counter": {"$ref": "#/$defs/uint64"}
+      }
+    },
+    "collection_marker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_id", "collected_revision_id", "frontier", "barrier_cursor"],
+      "properties": {
+        "record_id": {"$ref": "#/$defs/uuid"},
+        "collected_revision_id": {"$ref": "#/$defs/uuid"},
+        "frontier": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/vector_entry"}
+        },
+        "barrier_cursor": {"$ref": "#/$defs/uint64"}
+      }
+    },
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "record_revision"}}},
+          "then": {
+            "properties": {
+              "record_revision": {"$ref": "#/$defs/record_revision"},
+              "collection_marker": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"kind": {"const": "collection_marker"}}},
+          "then": {
+            "properties": {
+              "record_revision": {"type": "null"},
+              "collection_marker": {"$ref": "#/$defs/collection_marker"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {"enum": ["envelope_changed", "device_changed"]}
+            }
+          },
+          "then": {
+            "properties": {
+              "record_revision": {"type": "null"},
+              "collection_marker": {"type": "null"}
+            }
+          }
+        }
+      ],
+      "required": ["cursor", "kind", "received_at", "record_revision", "collection_marker"],
+      "properties": {
+        "cursor": {"$ref": "#/$defs/uint64"},
+        "kind": {
+          "type": "string",
+          "enum": ["record_revision", "collection_marker", "envelope_changed", "device_changed"]
+        },
+        "received_at": {"$ref": "#/$defs/timestamp"},
+        "record_revision": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/record_revision"}]
+        },
+        "collection_marker": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/collection_marker"}]
+        }
+      }
+    },
+    "health_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "protocol_version"],
+      "properties": {
+        "status": {"const": "ok"},
+        "protocol_version": {"const": "1"}
+      }
+    },
+    "capabilities_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instance_id",
+        "vault_id",
+        "protocol_min",
+        "protocol_max",
+        "storage_schema",
+        "crypto_suites",
+        "capabilities",
+        "limits"
+      ],
+      "properties": {
+        "instance_id": {"$ref": "#/$defs/uuid"},
+        "vault_id": {"$ref": "#/$defs/uuid"},
+        "protocol_min": {"const": "1"},
+        "protocol_max": {"const": "1"},
+        "storage_schema": {"const": "1"},
+        "crypto_suites": {
+          "type": "array",
+          "items": {"const": "jat-xchacha-hkdf-argon2id-draft1"},
+          "minItems": 1,
+          "maxItems": 1
+        },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string"}
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_body_bytes", "max_mutations", "max_page_changes", "max_snapshot_page_revisions", "max_devices"],
+          "properties": {
+            "max_body_bytes": {"const": 4194304},
+            "max_mutations": {"const": 256},
+            "max_page_changes": {"const": 128},
+            "max_snapshot_page_revisions": {"const": 128},
+            "max_devices": {"const": 64}
+          }
+        }
+      }
+    },
+    "enrollment_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "enrollment_id", "device_id", "device_token", "scopes"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "enrollment_id": {"$ref": "#/$defs/uuid"},
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "device_token": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 43,
+          "maxLength": 43
+        },
+        "scopes": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/scope"}
+        }
+      }
+    },
+    "enrollment_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "instance_id", "vault_id", "device", "envelope_generation", "became_first_active_device"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "instance_id": {"$ref": "#/$defs/uuid"},
+        "vault_id": {"$ref": "#/$defs/uuid"},
+        "device": {"$ref": "#/$defs/device"},
+        "envelope_generation": {"$ref": "#/$defs/uint64"},
+        "became_first_active_device": {"type": "boolean"}
+      }
+    },
+    "put_envelope_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected_generation", "new_generation", "envelope"],
+      "properties": {
+        "expected_generation": {"$ref": "#/$defs/uint64"},
+        "new_generation": {"$ref": "#/$defs/uint64"},
+        "envelope": {"$ref": "#/$defs/vault_envelope"}
+      }
+    },
+    "sync_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "device_id", "request_id", "after_cursor", "ack_cursor", "mutations"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "request_id": {"$ref": "#/$defs/uuid"},
+        "after_cursor": {"$ref": "#/$defs/uint64"},
+        "ack_cursor": {"$ref": "#/$defs/uint64"},
+        "mutations": {
+          "type": "array",
+          "description": "Strictly increasing by (author_counter as uint64, record_id UUID bytes, revision_id UUID bytes); duplicates and unsorted input are invalid_request.",
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/record_revision"}
+        }
+      }
+    },
+    "sync_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "server_cursor", "next_cursor", "has_more", "envelope_generation", "changes"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "server_cursor": {"$ref": "#/$defs/uint64"},
+        "next_cursor": {"$ref": "#/$defs/uint64"},
+        "has_more": {"type": "boolean"},
+        "envelope_generation": {"$ref": "#/$defs/uint64"},
+        "changes": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {"$ref": "#/$defs/change"}
+        }
+      }
+    },
+    "snapshot_create_request": {
+      "type": "object",
+      "description": "The device_id MUST equal the bearer-authenticated device ID.",
+      "additionalProperties": false,
+      "required": ["protocol_version", "device_id", "request_id"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "request_id": {"$ref": "#/$defs/uuid"}
+      }
+    },
+    "snapshot_create_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "snapshot_id", "cut_cursor", "envelope_generation", "envelope", "expires_at", "first_page_token"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "snapshot_id": {"$ref": "#/$defs/uuid"},
+        "cut_cursor": {"$ref": "#/$defs/uint64"},
+        "envelope_generation": {"$ref": "#/$defs/uint64"},
+        "envelope": {"$ref": "#/$defs/vault_envelope"},
+        "expires_at": {"$ref": "#/$defs/timestamp"},
+        "first_page_token": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 43,
+          "maxLength": 43
+        }
+      }
+    },
+    "snapshot_page_request": {
+      "type": "object",
+      "description": "The device_id MUST equal the bearer-authenticated device ID; page_token is replayable only for the same snapshot and device.",
+      "additionalProperties": false,
+      "required": ["protocol_version", "device_id", "page_token"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "page_token": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 43,
+          "maxLength": 43
+        }
+      }
+    },
+    "snapshot_page_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"has_more": {"const": true}}},
+          "then": {
+            "properties": {
+              "next_page_token": {
+                "allOf": [{"$ref": "#/$defs/base64url"}],
+                "minLength": 43,
+                "maxLength": 43
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"has_more": {"const": false}}},
+          "then": {"properties": {"next_page_token": {"type": "null"}}}
+        }
+      ],
+      "required": ["protocol_version", "snapshot_id", "cut_cursor", "envelope_generation", "revisions", "next_page_token", "has_more"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "snapshot_id": {"$ref": "#/$defs/uuid"},
+        "cut_cursor": {"$ref": "#/$defs/uint64"},
+        "envelope_generation": {"$ref": "#/$defs/uint64"},
+        "revisions": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {"$ref": "#/$defs/record_revision"}
+        },
+        "next_page_token": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "allOf": [{"$ref": "#/$defs/base64url"}],
+              "minLength": 43,
+              "maxLength": 43
+            }
+          ]
+        },
+        "has_more": {"type": "boolean"}
+      }
+    },
+    "devices_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["devices"],
+      "properties": {
+        "devices": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/device"}
+        }
+      }
+    },
+    "revoke_device_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "allow_zero_active"],
+      "properties": {
+        "request_id": {"$ref": "#/$defs/uuid"},
+        "allow_zero_active": {"type": "boolean"}
+      }
+    },
+    "token_rotation_request": {
+      "type": "object",
+      "description": "Self-only rotation: device_id MUST equal the bearer-authenticated device ID or the server returns authenticated_device_mismatch.",
+      "additionalProperties": false,
+      "required": ["rotation_id", "device_id", "new_device_token"],
+      "properties": {
+        "rotation_id": {"$ref": "#/$defs/uuid"},
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "new_device_token": {
+          "allOf": [{"$ref": "#/$defs/base64url"}],
+          "minLength": 43,
+          "maxLength": 43
+        }
+      }
+    },
+    "error_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "retryable", "request_id"],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "counter_conflict",
+                "counter_exhausted",
+                "cursor_expired",
+                "authenticated_device_mismatch",
+                "device_not_found",
+                "enrollment_replay_mismatch",
+                "envelope_missing",
+                "generation_conflict",
+                "grant_consumed",
+                "grant_expired",
+                "instance_mismatch",
+                "internal_error",
+                "invalid_request",
+                "limit_exceeded",
+                "rate_limited",
+                "request_id_reused",
+                "revision_equivocation",
+                "scope_denied",
+                "server_cursor_exhausted",
+                "snapshot_expired",
+                "snapshot_not_found",
+                "stale_after_collection",
+                "token_revoked",
+                "too_many_siblings",
+                "unauthorized",
+                "unsupported_capability",
+                "unsupported_protocol",
+                "zero_active_confirmation_required"
+              ]
+            },
+            "message": {"type": "string", "maxLength": 512},
+            "retryable": {"type": "boolean"},
+            "request_id": {"$ref": "#/$defs/uuid"}
+          }
+        }
+      }
+    }
+  }
+}

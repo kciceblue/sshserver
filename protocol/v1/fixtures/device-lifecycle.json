@@ -1,0 +1,53 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-semantics",
+  "device_id": "00000000-0000-4000-8000-000000000003",
+  "token_rotation": {
+    "rotation_id": "00000000-0000-4000-8000-000000000031",
+    "old_device_token": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "request": {
+      "rotation_id": "00000000-0000-4000-8000-000000000031",
+      "device_id": "00000000-0000-4000-8000-000000000003",
+      "new_device_token": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+    },
+    "states": [
+      {"name": "pending_local_keychain", "old_auth": true, "new_auth": false},
+      {"name": "server_committed_response_lost", "old_auth": false, "new_auth": true},
+      {"name": "client_confirmed_new_token", "old_auth": false, "new_auth": true}
+    ],
+    "retry_with_matching_rotation_id_and_new_token": "success",
+    "retry_with_mismatched_new_token": "request_id_reused",
+    "self_only": true,
+    "body_device_id_must_equal_bearer_device_id": true,
+    "different_body_device_id_error": "authenticated_device_mismatch",
+    "different_body_device_id_http_status": 403
+  },
+  "revocation": {
+    "ordinary_device_result": "revoked_before_response_commit",
+    "last_device_without_confirmation": "zero_active_confirmation_required",
+    "last_device_with_allow_zero_active": "revoked_and_collection_frozen",
+    "revocation_erases_cached_plaintext_or_vmk": false
+  },
+  "instance_secret_rotation": {
+    "active_generation": "1",
+    "pending_generation": "2",
+    "states": [
+      "active_only",
+      "active_plus_pending_secret",
+      "new_envelope_committed_for_pending_generation",
+      "pending_secret_promoted_with_old_recovery_slot",
+      "new_generation_verified_and_recovery_slot_removed"
+    ],
+    "interruption_before_envelope": "discard_pending_only",
+    "interruption_after_envelope": "resume_promotion_with_both_secrets_recoverable",
+    "rotation_without_device_held_vmk": "forbidden",
+    "backup_while_active_only": "allowed_with_stable_manifest",
+    "backup_while_pending_or_recovery_slot_exists": "refused_rotation_in_progress"
+  },
+  "version_negotiation": [
+    {"client_min": "1", "client_max": "1", "server_min": "1", "server_max": "1", "result": "protocol_1"},
+    {"client_min": "2", "client_max": "2", "server_min": "1", "server_max": "1", "result": "unsupported_protocol", "http_status": 426},
+    {"client_min": "1", "client_max": "1", "missing_required_capability": "envelope-cas-v1", "result": "unsupported_capability", "http_status": 426},
+    {"client_min": "1", "client_max": "1", "unknown_crypto_suite": "future-suite", "result": "preserve_opaque_and_block_write"}
+  ]
+}
