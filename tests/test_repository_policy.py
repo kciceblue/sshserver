@@ -58,7 +58,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("fetch-depth: 0", workflow)
         self.assertIn("ref: ${{ steps.pull_request.outputs.base_sha }}", workflow)
         self.assertIn("python3 scripts/check_dco.py", workflow)
-        self.assertIn('name="Signed-off commits"', workflow)
+        self.assertIn('context="Signed-off commits"', workflow)
 
     def test_all_workflows_are_manual_only(self) -> None:
         workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
@@ -75,8 +75,8 @@ class RepositoryPolicyTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("pull_request_number:", workflow)
-        self.assertIn('name="Repository policy"', workflow)
-        self.assertIn("checks: write", workflow)
+        self.assertIn('context="Repository policy"', workflow)
+        self.assertIn("statuses: write", workflow)
 
     def test_repository_uses_full_apache_2_license(self) -> None:
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
