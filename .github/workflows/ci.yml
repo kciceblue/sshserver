@@ -14,7 +14,7 @@ jobs:
     name: Repository policy
     runs-on: ubuntu-latest
     outputs:
-      validated_head_sha: ${{ steps.pull_request.outputs.head_sha }}
+      validated_head_sha: ${{ steps.checked_out.outputs.head_sha }}
     permissions:
       contents: read
       pull-requests: read
@@ -36,6 +36,16 @@ jobs:
         with:
           ref: ${{ steps.pull_request.outputs.checkout_ref || github.sha }}
           persist-credentials: false
+      - name: Record checked-out pull-request revision
+        if: inputs.pull_request_number > 0
+        id: checked_out
+        env:
+          EXPECTED_HEAD_SHA: ${{ steps.pull_request.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          test "$checked_out_sha" = "$EXPECTED_HEAD_SHA"
+          echo "head_sha=$checked_out_sha" >> "$GITHUB_OUTPUT"
       - name: Run policy checks and tests
         run: make check
 

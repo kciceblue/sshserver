@@ -92,6 +92,11 @@ class RepositoryPolicyTests(unittest.TestCase):
             "VALIDATED_HEAD_SHA: ${{ needs.policy.outputs.validated_head_sha }}",
             workflow,
         )
+        self.assertIn(
+            "validated_head_sha: ${{ steps.checked_out.outputs.head_sha }}",
+            workflow,
+        )
+        self.assertIn('test "$checked_out_sha" = "$EXPECTED_HEAD_SHA"', workflow)
 
     def test_repository_uses_full_apache_2_license(self) -> None:
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
