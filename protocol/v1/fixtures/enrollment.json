@@ -1,0 +1,58 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-shape-only",
+  "description": "Deterministic wire-shape fixture. All-zero test credentials are intentionally non-random and MUST NOT be used as cryptographic known-answer values or production secrets.",
+  "ssh_bootstrap": {
+    "protocol_version": "1",
+    "instance_id": "00000000-0000-4000-8000-000000000001",
+    "vault_id": "00000000-0000-4000-8000-000000000002",
+    "instance_secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "enrollment_grant": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "expires_at": "2026-07-19T12:05:00.000Z",
+    "loopback_port": 37421
+  },
+  "request": {
+    "protocol_version": "1",
+    "enrollment_id": "00000000-0000-4000-8000-000000000004",
+    "device_id": "00000000-0000-4000-8000-000000000003",
+    "device_token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "scopes": [
+      "devices:manage",
+      "devices:read",
+      "envelope:read",
+      "envelope:write",
+      "sync:read",
+      "sync:write"
+    ]
+  },
+  "created_response": {
+    "protocol_version": "1",
+    "instance_id": "00000000-0000-4000-8000-000000000001",
+    "vault_id": "00000000-0000-4000-8000-000000000002",
+    "device": {
+      "device_id": "00000000-0000-4000-8000-000000000003",
+      "scopes": [
+        "devices:manage",
+        "devices:read",
+        "envelope:read",
+        "envelope:write",
+        "sync:read",
+        "sync:write"
+      ],
+      "status": "active",
+      "created_at": "2026-07-19T12:00:00.000Z",
+      "revoked_at": null,
+      "last_sync_at": null,
+      "ack_cursor": "0",
+      "max_author_counter": "0"
+    },
+    "envelope_generation": "0",
+    "became_first_active_device": true
+  },
+  "idempotency": {
+    "byte_equivalent_retry_status": 200,
+    "mismatched_tuple_status": 409,
+    "mismatched_tuple_error": "enrollment_replay_mismatch",
+    "grant_consumed_after_success": true
+  }
+}

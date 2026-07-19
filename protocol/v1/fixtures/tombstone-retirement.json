@@ -1,0 +1,112 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-semantics",
+  "tombstone": {
+    "record_id": "00000000-0000-4000-8000-000000000020",
+    "revision_id": "00000000-0000-4000-8000-000000000022",
+    "cursor": "40",
+    "received_at": "2026-01-01T00:00:00.000Z",
+    "minimum_retention_seconds": "7776000",
+    "retention_clock": "durable_accumulated_daemon_monotonic_uptime"
+  },
+  "acknowledgement_barrier": {
+    "definition": "maximum change cursor of every retained revision for the record, recomputed and locked in the collection transaction",
+    "candidate_cursor": "40",
+    "later_concurrent_sibling": {
+      "revision_id": "00000000-0000-4000-8000-000000000021",
+      "cursor": "41",
+      "tombstone": false,
+      "vector": [
+        {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+      ]
+    },
+    "dominating_resolution": {
+      "revision_id": "00000000-0000-4000-8000-000000000023",
+      "cursor": "42",
+      "vector": [
+        {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
+        {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+      ]
+    },
+    "later_sibling_states": [
+      {
+        "name": "tombstone_acknowledged_but_not_collected",
+        "barrier_cursor": "40",
+        "active_device_ack_cursors": ["40", "40"],
+        "candidate_is_sole_undominated_revision": true,
+        "collection_eligible": true
+      },
+      {
+        "name": "later_concurrent_sibling_raises_barrier",
+        "barrier_cursor": "41",
+        "active_device_ack_cursors": ["40", "40"],
+        "candidate_is_sole_undominated_revision": false,
+        "collection_eligible": false
+      },
+      {
+        "name": "sibling_acknowledged_but_conflict_unresolved",
+        "barrier_cursor": "41",
+        "active_device_ack_cursors": ["41", "41"],
+        "candidate_is_sole_undominated_revision": false,
+        "collection_eligible": false
+      },
+      {
+        "name": "resolution_not_fully_acknowledged",
+        "barrier_cursor": "42",
+        "active_device_ack_cursors": ["42", "41"],
+        "candidate_is_dominated": true,
+        "collection_eligible": false
+      },
+      {
+        "name": "resolution_fully_acknowledged",
+        "barrier_cursor": "42",
+        "active_device_ack_cursors": ["42", "42"],
+        "candidate_is_dominated": true,
+        "collection_eligible": true
+      }
+    ],
+    "collection_marker_persists_joined_frontier": true,
+    "collection_marker": {
+      "record_id": "00000000-0000-4000-8000-000000000020",
+      "collected_revision_id": "00000000-0000-4000-8000-000000000022",
+      "frontier": [
+        {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
+        {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+      ],
+      "barrier_cursor": "42"
+    },
+    "later_mutation_must_dominate_persisted_frontier": true,
+    "stale_later_mutation_error": "stale_after_collection"
+  },
+  "states": [
+    {
+      "name": "active_device_has_not_acknowledged",
+      "retention_age_seconds": "7776000",
+      "active_device_ack_cursors": ["40", "39"],
+      "active_devices": 2,
+      "collection_eligible": false
+    },
+    {
+      "name": "all_active_acknowledged_after_retirement",
+      "retention_age_seconds": "7776000",
+      "active_device_ack_cursors": ["41"],
+      "retired_device_ack_cursors": ["39"],
+      "active_devices": 1,
+      "retired_device_id_reusable": false,
+      "collection_eligible": true
+    },
+    {
+      "name": "zero_active_devices_freezes_collection",
+      "retention_age_seconds": "31536000",
+      "active_device_ack_cursors": [],
+      "active_devices": 0,
+      "collection_eligible": false
+    }
+  ],
+  "returning_retired_device": {
+    "old_token_result": "token_revoked",
+    "must_enroll_with_new_device_id": true,
+    "stale_library_action": "explicit_import_only",
+    "implicit_resurrection_allowed": false
+  }
+}

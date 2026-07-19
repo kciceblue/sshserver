@@ -1,0 +1,61 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-shape-only",
+  "description": "Vector and conflict semantics. Ciphertexts are structural placeholders and are not valid AEAD outputs.",
+  "record_id": "00000000-0000-4000-8000-000000000020",
+  "device_a": "00000000-0000-4000-8000-000000000010",
+  "device_b": "00000000-0000-4000-8000-000000000011",
+  "concurrent_siblings": [
+    {
+      "record_id": "00000000-0000-4000-8000-000000000020",
+      "revision_id": "00000000-0000-4000-8000-000000000021",
+      "author_device_id": "00000000-0000-4000-8000-000000000010",
+      "author_counter": "1",
+      "version_vector": [
+        {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+      ],
+      "payload_schema": "1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "tombstone": false,
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "record_id": "00000000-0000-4000-8000-000000000020",
+      "revision_id": "00000000-0000-4000-8000-000000000022",
+      "author_device_id": "00000000-0000-4000-8000-000000000011",
+      "author_counter": "1",
+      "version_vector": [
+        {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+      ],
+      "payload_schema": "1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "tombstone": true,
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
+    }
+  ],
+  "deterministic_projection_revision_id": "00000000-0000-4000-8000-000000000022",
+  "projection_does_not_delete_sibling": true,
+  "resolution": {
+    "record_id": "00000000-0000-4000-8000-000000000020",
+    "revision_id": "00000000-0000-4000-8000-000000000023",
+    "author_device_id": "00000000-0000-4000-8000-000000000010",
+    "author_counter": "2",
+    "version_vector": [
+      {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
+      {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+    ],
+    "payload_schema": "1",
+    "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+    "tombstone": false,
+    "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "expected": {
+    "siblings_before_resolution": 2,
+    "undominated_after_resolution": 1,
+    "remote_identity_tombstone_local_key_action": "unlink_shared_record_and_quarantine_local_key_as_orphan",
+    "remote_identity_tombstone_may_delete_keychain_material": false
+  }
+}

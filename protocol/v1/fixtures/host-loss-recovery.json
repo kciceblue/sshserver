@@ -1,0 +1,60 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-semantics",
+  "strategy": "identity_preserving_recovery",
+  "description": "V1 preserves instance and vault IDs so every authenticated revision can be imported byte-for-byte. A migration to new IDs would require full decrypt and re-encrypt and is intentionally not implied by host recovery.",
+  "source_completed_snapshot": {
+    "instance_id": "00000000-0000-4000-8000-000000000001",
+    "vault_id": "00000000-0000-4000-8000-000000000002",
+    "cut_cursor": "50",
+    "envelope_generation": "1",
+    "all_undominated_siblings_present": true,
+    "live_siblings": 1,
+    "tombstone_siblings": 1,
+    "vectors_and_revision_ids_present": true
+  },
+  "recovered_instance": {
+    "instance_id": "00000000-0000-4000-8000-000000000001",
+    "vault_id": "00000000-0000-4000-8000-000000000002",
+    "ids_preserved": true,
+    "new_instance_secret_generation": "2",
+    "new_envelope_generation": "2",
+    "same_vmk_rewrapped_under_new_instance_secret": true,
+    "record_ciphertexts_byte_identical": true,
+    "record_ids_revision_ids_vectors_and_tombstone_flags_byte_identical": true
+  },
+  "atomic_import": {
+    "administrative_transport": "verified_ssh_stdin_json",
+    "requires_empty_staging_instance": true,
+    "manifest_binds_source_cut_cursor_count_and_sha256": true,
+    "pages_sorted_by": ["record_id_uuid_bytes", "revision_id_uuid_bytes"],
+    "all_source_device_ids_marked_retired": true,
+    "source_max_author_counters_reconstructed_from_vectors": true,
+    "source_acknowledgements_copied": false,
+    "source_tombstone_retention_age_copied": false,
+    "destination_tombstone_retention_age_seconds": "0",
+    "activation_is_all_or_nothing": true
+  },
+  "cursor_transition": {
+    "source_cut_cursor": "50",
+    "destination_cursor_floor": "50",
+    "imported_revision_cursors": ["51", "52"],
+    "source_per_revision_cursors_copied": false,
+    "destination_import_end_cursor": "52",
+    "recovering_device_resumes_delta_after_cursor": "52",
+    "collection_frozen_until_recovering_device_acknowledges": "52"
+  },
+  "post_import_enrollment": {
+    "new_device_id": "00000000-0000-4000-8000-000000000043",
+    "old_device_ids_reusable": false,
+    "fresh_ssh_enrollment_grant_required": true,
+    "old_tokens_valid_on_recovered_instance": false
+  },
+  "failure_rules": {
+    "incomplete_snapshot": "refuse_recovery_import",
+    "identity_mismatch": "instance_mismatch",
+    "missing_sibling_or_tombstone": "manifest_digest_mismatch",
+    "interrupted_import": "discard_or_resume_inert_staging_state",
+    "old_host_returns": "treat_as_abandoned_fork_and_never_sync_both"
+  }
+}

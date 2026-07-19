@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kciceblue/sshserver/protocol/v1/schemas/backup-manifest.schema.json",
+  "title": "JAT sync server backup manifest V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format_version",
+    "instance_id",
+    "vault_id",
+    "instance_secret_generation",
+    "secret_rotation_state",
+    "storage_schema",
+    "created_at",
+    "files"
+  ],
+  "properties": {
+    "format_version": {"const": 1},
+    "instance_id": {"$ref": "wire.schema.json#/$defs/uuid"},
+    "vault_id": {"$ref": "wire.schema.json#/$defs/uuid"},
+    "instance_secret_generation": {"$ref": "wire.schema.json#/$defs/uint64"},
+    "secret_rotation_state": {
+      "const": "stable",
+      "description": "V1 refuses to create a backup while a pending secret or old recovery slot exists."
+    },
+    "storage_schema": {"const": "1"},
+    "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
+    "files": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "mode", "size", "sha256"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+          "mode": {"const": "0600"},
+          "size": {"$ref": "wire.schema.json#/$defs/uint64"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

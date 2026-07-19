@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kciceblue/sshserver/protocol/v1/schemas/encrypted-payload.schema.json",
+  "title": "Decrypted JAT sync payload V1",
+  "description": "Allowlisted application payload. Device-local custody authority, settings, paths, and logging consent are intentionally absent.",
+  "oneOf": [
+    {"$ref": "#/$defs/host_payload"},
+    {"$ref": "#/$defs/snippet_payload"},
+    {"$ref": "#/$defs/forward_payload"},
+    {"$ref": "#/$defs/software_identity_payload"},
+    {"$ref": "#/$defs/secure_enclave_identity_payload"},
+    {"$ref": "#/$defs/known_host_payload"},
+    {"$ref": "#/$defs/tombstone_payload"}
+  ],
+  "$defs": {
+    "nullable_uuid": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "wire.schema.json#/$defs/uuid"}
+      ]
+    },
+    "nullable_string": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string"}
+      ]
+    },
+    "common_outer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_version", "record_type", "body"],
+      "properties": {
+        "payload_version": {"const": 1},
+        "record_type": {"type": "string"},
+        "body": {"type": "object"}
+      }
+    },
+    "host_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "hostname",
+        "port",
+        "username",
+        "proxy_jump",
+        "identity_id",
+        "forward_profile_ids",
+        "notes",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "hostname": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "username": {"type": "string", "maxLength": 1024},
+        "proxy_jump": {"$ref": "#/$defs/nullable_string"},
+        "identity_id": {"$ref": "#/$defs/nullable_uuid"},
+        "forward_profile_ids": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"$ref": "wire.schema.json#/$defs/uuid"}
+        },
+        "notes": {"type": "string", "maxLength": 65536},
+        "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
+        "updated_at": {"$ref": "wire.schema.json#/$defs/timestamp"}
+      }
+    },
+    "host_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_version", "record_type", "body"],
+      "properties": {
+        "payload_version": {"const": 1},
+        "record_type": {"const": "host"},
+        "body": {"$ref": "#/$defs/host_body"}
+      }
+    },
+    "snippet_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "command", "notes", "created_at", "updated_at"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "command": {"type": "string", "minLength": 1, "maxLength": 262144},
+        "notes": {"type": "string", "maxLength": 65536},
+        "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
+        "updated_at": {"$ref": "wire.schema.json#/$defs/timestamp"}
+      }
+    },
+    "snippet_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_version", "record_type", "body"],
+      "properties": {
+        "payload_version": {"const": 1},
+        "record_type": {"const": "snippet"},
+        "body": {"$ref": "#/$defs/snippet_body"}
+      }
+    },
+    "forward_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind",
+        "bind_host",
+        "listen_port",
+        "destination_host",
+        "destination_port",
+        "notes",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "kind": {"type": "string", "enum": ["local", "remote", "dynamic"]},
+        "bind_host": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "listen_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "destination_host": {"$ref": "#/$defs/nullable_string"},
+        "destination_port": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": 1, "maximum": 65535}
+          ]
+        },
+        "notes": {"type": "string", "maxLength": 65536},
+        "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
+        "updated_at": {"$ref": "wire.schema.json#/$defs/timestamp"}
+      }
+    },
+    "forward_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_version", "record_type", "body"],
+      "properties": {
+        "payload_version": {"const": 1},
+        "record_type": {"const": "forward_profile"},
+        "body": {"$ref": "#/$defs/forward_body"}
+      }
+    },
+    "software_identity_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "notes",
+        "key_kind",
+        "private_key_encoding",
+        "private_key",
+        "public_key",
+        "fingerprint",
+        "requested_biometric_policy",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "notes": {"type": "string", "maxLength": 65536},
+        "key_kind": {"type": "string", "enum": ["ed25519", "rsa"]},
+        "private_key_encoding": {"type": "string", "enum": ["ed25519-seed-v1", "rsa-pkcs8-der-v1"]},
+        "private_key": {"$ref": "wire.schema.json#/$defs/base64url"},
+        "public_key": {"$ref": "wire.schema.json#/$defs/base64url"},
+        "fingerprint": {"type": "string", "minLength": 1, "maxLength": 512},
+        "requested_biometric_policy": {"type": "string", "enum": ["none", "current_set"]},
+        "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
+        "updated_at": {"$ref": "wire.schema.json#/$defs/timestamp"}
+      }
+    },
+    "software_identity_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_version", "record_type", "body"],
+      "properties": {
+        "payload_version": {"const": 1},
+        "record_type": {"const": "software_identity"},
+        "body": {"$ref": "#/$defs/software_identity_body"}
+      }
+    },
+    "secure_enclave_identity_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "notes",
+        "key_kind",
+        "public_key",
+        "fingerprint",
+        "origin_device_id",
+        "availability",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "notes": {"type": "string", "maxLength": 65536},
+        "key_kind": {"const": "secure_enclave_p256"},
+        "public_key": {"$ref": "wire.schema.json#/$defs/base64url"},
+        "fingerprint": {"type": "string", "minLength": 1, "maxLength": 512},
+        "origin_device_id": {"$ref": "wire.schema.json#/$defs/uuid"},
+        "availability": {"const": "device_bound"},
+        "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
+        "updated_at": {"$ref": "wire.schema.json#/$defs/timestamp"}
+      }
+    },
+    "secure_enclave_identity_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_version", "record_type", "body"],
+      "properties": {
+        "payload_version": {"const": 1},
+        "record_type": {"const": "secure_enclave_identity"},
+        "body": {"$ref": "#/$defs/secure_enclave_identity_body"}
+      }
+    },
+    "known_host_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["patterns", "marker", "key_algorithm", "public_key", "comment", "created_at", "updated_at"],
+      "properties": {
+        "patterns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        },
+        "marker": {"type": "string", "enum": ["none", "cert_authority", "revoked"]},
+        "key_algorithm": {"type": "string", "minLength": 1, "maxLength": 512},
+        "public_key": {"$ref": "wire.schema.json#/$defs/base64url"},
+        "comment": {"$ref": "#/$defs/nullable_string"},
+        "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
+        "updated_at": {"$ref": "wire.schema.json#/$defs/timestamp"}
+      }
+    },
+    "known_host_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_version", "record_type", "body"],
+      "properties": {
+        "payload_version": {"const": 1},
+        "record_type": {"const": "known_host"},
+        "body": {"$ref": "#/$defs/known_host_body"}
+      }
+    },
+    "tombstone_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_version", "record_type", "body"],
+      "properties": {
+        "payload_version": {"const": 1},
+        "record_type": {"const": "tombstone"},
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "maxProperties": 0
+        }
+      }
+    }
+  }
+}
