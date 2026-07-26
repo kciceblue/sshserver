@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
+import hashlib
 import json
 from pathlib import Path
 import re
+import struct
 import unittest
 import uuid
 
@@ -115,6 +118,77 @@ def dominates(left: dict[str, int], right: dict[str, int]) -> bool:
     return all(left.get(key, 0) >= right.get(key, 0) for key in keys) and any(
         left.get(key, 0) > right.get(key, 0) for key in keys
     )
+
+
+def schema_matches(value: object, schema: dict, root: dict) -> bool:
+    reference = schema.get("$ref")
+    if reference is not None:
+        if not reference.startswith("#/"):
+            raise ValueError(f"external schema reference is unsupported: {reference}")
+        target: object = root
+        for component in reference.removeprefix("#/").split("/"):
+            if not isinstance(target, dict):
+                raise ValueError(f"invalid schema reference: {reference}")
+            target = target[component.replace("~1", "/").replace("~0", "~")]
+        if not isinstance(target, dict):
+            raise ValueError(f"schema reference is not an object: {reference}")
+        if not schema_matches(value, target, root):
+            return False
+
+    value_type = schema.get("type")
+    type_matches = {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "boolean": isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "null": value is None,
+    }
+    if value_type is not None and not type_matches[value_type]:
+        return False
+    if "const" in schema and value != schema["const"]:
+        return False
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    if "oneOf" in schema:
+        if sum(schema_matches(value, child, root) for child in schema["oneOf"]) != 1:
+            return False
+    if "allOf" in schema:
+        if not all(schema_matches(value, child, root) for child in schema["allOf"]):
+            return False
+    if "if" in schema and schema_matches(value, schema["if"], root):
+        if "then" in schema and not schema_matches(value, schema["then"], root):
+            return False
+
+    if isinstance(value, dict):
+        required = set(schema.get("required", []))
+        if not required.issubset(value):
+            return False
+        properties = schema.get("properties", {})
+        for key, child in properties.items():
+            if key in value and not schema_matches(value[key], child, root):
+                return False
+        if schema.get("additionalProperties") is False:
+            if not set(value).issubset(properties):
+                return False
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0):
+            return False
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            return False
+        if schema.get("uniqueItems") and len({json.dumps(item, sort_keys=True) for item in value}) != len(value):
+            return False
+        if "items" in schema:
+            if not all(schema_matches(item, schema["items"], root) for item in value):
+                return False
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0):
+            return False
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            return False
+        if "pattern" in schema and re.search(schema["pattern"], value) is None:
+            return False
+    return True
 
 
 class SyncProtocolSpecTests(unittest.TestCase):
@@ -298,6 +372,8 @@ class SyncProtocolSpecTests(unittest.TestCase):
             "snapshot_create_response",
             "snapshot_page_request",
             "snapshot_page_response",
+            "host_recovery_manifest",
+            "recovery_import_page",
             "error_response",
         ):
             with self.subTest(name=name):
@@ -672,6 +748,8 @@ class SyncProtocolSpecTests(unittest.TestCase):
         assert_uuid_v4(self, manifest["vault_id"])
         self.assertEqual({item["path"] for item in manifest["files"]}, {"sync.db", "instance-secret", "config.json"})
         self.assertEqual(manifest["secret_rotation_state"], "stable")
+        self.assertIn("collection_marker_count", self.backup_schema["required"])
+        self.assertEqual(parse_uint64(manifest["collection_marker_count"]), 1)
         self.assertEqual(
             self.backup_schema["properties"]["secret_rotation_state"]["const"],
             "stable",
@@ -683,6 +761,20 @@ class SyncProtocolSpecTests(unittest.TestCase):
         cases = {case["name"]: case["result"] for case in fixture["restore_cases"]}
         self.assertEqual(cases["database_secret_instance_mismatch"], "instance_mismatch")
         self.assertEqual(cases["missing_secret"], "restore_incompatible")
+        self.assertEqual(
+            cases["duplicate_manifest_path_with_different_checksum"],
+            "restore_incompatible",
+        )
+        duplicate_files = copy.deepcopy(manifest["files"])
+        duplicate_path = copy.deepcopy(duplicate_files[0])
+        duplicate_path["sha256"] = "f" * 64
+        duplicate_files.append(duplicate_path)
+        paths = [item["path"] for item in duplicate_files]
+        self.assertNotEqual(len(paths), len(set(paths)))
+        self.assertIn(
+            "Every path value MUST be unique",
+            self.backup_schema["properties"]["files"]["description"],
+        )
         backup_cases = {case["name"]: case["result"] for case in fixture["backup_cases"]}
         self.assertEqual(
             backup_cases["pending_secret_exists"],
@@ -700,6 +792,11 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(capabilities["protocol_min"], "1")
         self.assertEqual(capabilities["protocol_max"], "1")
         self.assertEqual(capabilities["crypto_suites"], ["jat-xchacha-hkdf-argon2id-draft1"])
+        self.assertEqual(capabilities["limits"]["max_snapshot_page_revisions"], 128)
+        self.assertEqual(
+            capabilities["limits"]["max_snapshot_page_collection_markers"],
+            128,
+        )
         request = fixture["empty_sync_request"]
         response = fixture["empty_sync_response"]
         assert_uuid_v4(self, request["device_id"])
@@ -739,10 +836,19 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(len(decode_base64url(create_response["first_page_token"])), 32)
 
         revisions: list[dict] = []
+        collection_markers: list[dict] = []
+        phases: list[str] = []
         expected_token = create_response["first_page_token"]
         for index, page in enumerate(fixture["pages"]):
             request_page = page["request"]
             response_page = page["response"]
+            self.assertTrue(
+                schema_matches(
+                    response_page,
+                    self.wire["$defs"]["snapshot_page_response"],
+                    self.wire,
+                )
+            )
             self.assertEqual(request_page["device_id"], create_request["device_id"])
             self.assertEqual(request_page["page_token"], expected_token)
             self.assertEqual(response_page["snapshot_id"], create_response["snapshot_id"])
@@ -751,10 +857,23 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 response_page["envelope_generation"],
                 create_response["envelope_generation"],
             )
+            self.assertFalse(
+                response_page["revisions"] and response_page["collection_markers"]
+            )
             revisions.extend(response_page["revisions"])
+            collection_markers.extend(response_page["collection_markers"])
+            if response_page["revisions"]:
+                phases.append("record_revisions")
+            elif response_page["collection_markers"]:
+                phases.append("collection_markers")
             expected_token = response_page["next_page_token"]
             self.assertEqual(response_page["has_more"], index < len(fixture["pages"]) - 1)
         self.assertIsNone(expected_token)
+        self.assertEqual(phases, fixture["expected"]["page_phases"])
+        self.assertEqual(
+            list(dict.fromkeys(phases)),
+            fixture["expected"]["snapshot_phases"],
+        )
 
         revision_keys = [
             (uuid.UUID(item["record_id"]).bytes, uuid.UUID(item["revision_id"]).bytes)
@@ -767,6 +886,23 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(sum(item["tombstone"] for item in revisions), 1)
         self.assertFalse(dominates(vector_map(revisions[0]), vector_map(revisions[1])))
         self.assertFalse(dominates(vector_map(revisions[1]), vector_map(revisions[0])))
+        marker_keys = [
+            (
+                uuid.UUID(item["record_id"]).bytes,
+                uuid.UUID(item["collected_revision_id"]).bytes,
+            )
+            for item in collection_markers
+        ]
+        self.assertEqual(marker_keys, sorted(marker_keys))
+        self.assertEqual(
+            len(collection_markers),
+            fixture["expected"]["collection_marker_count"],
+        )
+        self.assertTrue(fixture["expected"]["all_persistent_collection_markers_included"])
+        self.assertTrue(fixture["expected"]["collection_marker_frontiers_preserved"])
+        for marker in collection_markers:
+            self.assertLessEqual(parse_uint64(marker["barrier_cursor"]), cut)
+            self.assertTrue(vector_map({"version_vector": marker["frontier"]}))
 
         delta_request = fixture["delta_transition_request"]
         delta_response = fixture["delta_transition_response"]
@@ -776,9 +912,46 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertTrue(fixture["expected"]["all_undominated_siblings_included"])
         self.assertTrue(fixture["expected"]["partial_snapshot_must_be_discarded_on_expiry"])
 
+    def test_snapshot_and_recovery_page_schemas_reject_mixed_or_incomplete_phases(
+        self,
+    ) -> None:
+        fixture = self.fixtures["full-snapshot-recovery.json"]
+        schema = self.wire["$defs"]["snapshot_page_response"]
+        revision_page = fixture["pages"][0]["response"]
+        marker_page = fixture["pages"][-1]["response"]
+
+        mixed_page = copy.deepcopy(revision_page)
+        mixed_page["collection_markers"] = copy.deepcopy(
+            marker_page["collection_markers"]
+        )
+        self.assertFalse(schema_matches(mixed_page, schema, self.wire))
+
+        empty_nonterminal_page = copy.deepcopy(revision_page)
+        empty_nonterminal_page["revisions"] = []
+        self.assertFalse(schema_matches(empty_nonterminal_page, schema, self.wire))
+
+        null_nonterminal_token = copy.deepcopy(revision_page)
+        null_nonterminal_token["next_page_token"] = None
+        self.assertFalse(schema_matches(null_nonterminal_token, schema, self.wire))
+
+        token_on_final_page = copy.deepcopy(marker_page)
+        token_on_final_page["next_page_token"] = revision_page["next_page_token"]
+        self.assertFalse(schema_matches(token_on_final_page, schema, self.wire))
+
+        recovery_schema = self.wire["$defs"]["recovery_import_page"]
+        recovery_page = self.fixtures["host-loss-recovery.json"]["import_pages"][0]
+        self.assertTrue(schema_matches(recovery_page, recovery_schema, self.wire))
+        phase_payload_mismatch = copy.deepcopy(recovery_page)
+        phase_payload_mismatch["phase"] = "collection_markers"
+        self.assertFalse(
+            schema_matches(phase_payload_mismatch, recovery_schema, self.wire)
+        )
+
     def test_identity_preserving_host_recovery_preserves_records_and_rebuilds_cursors(self) -> None:
         fixture = self.fixtures["host-loss-recovery.json"]
         source = fixture["source_completed_snapshot"]
+        manifest = fixture["recovery_manifest"]
+        pages = fixture["import_pages"]
         recovered = fixture["recovered_instance"]
         imported = fixture["atomic_import"]
         cursors = fixture["cursor_transition"]
@@ -786,24 +959,195 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertTrue(source["all_undominated_siblings_present"])
         self.assertEqual(source["live_siblings"], 1)
         self.assertEqual(source["tombstone_siblings"], 1)
+        self.assertTrue(source["all_persistent_collection_markers_present"])
+        self.assertEqual(
+            parse_uint64(source["collection_marker_count"]),
+            len(source["collection_markers"]),
+        )
+        snapshot_fixture = self.fixtures["full-snapshot-recovery.json"]
+        snapshot_revisions = [
+            revision
+            for page in snapshot_fixture["pages"]
+            for revision in page["response"]["revisions"]
+        ]
+        snapshot_markers = [
+            marker
+            for page in snapshot_fixture["pages"]
+            for marker in page["response"]["collection_markers"]
+        ]
+        self.assertEqual(source["collection_markers"], snapshot_markers)
         self.assertEqual(recovered["instance_id"], source["instance_id"])
         self.assertEqual(recovered["vault_id"], source["vault_id"])
         self.assertTrue(recovered["record_ciphertexts_byte_identical"])
         self.assertTrue(
             recovered["record_ids_revision_ids_vectors_and_tombstone_flags_byte_identical"]
         )
+        self.assertTrue(recovered["collection_markers_and_frontiers_byte_identical"])
+        self.assertEqual(manifest["instance_id"], source["instance_id"])
+        self.assertEqual(manifest["vault_id"], source["vault_id"])
+        self.assertEqual(manifest["source_cut_cursor"], source["cut_cursor"])
+        self.assertEqual(manifest["envelope_generation"], source["envelope_generation"])
+        self.assertEqual(
+            set(manifest),
+            set(self.wire["$defs"]["host_recovery_manifest"]["required"]),
+        )
+        self.assertTrue(
+            schema_matches(
+                manifest,
+                self.wire["$defs"]["host_recovery_manifest"],
+                self.wire,
+            )
+        )
+        self.assertEqual(manifest["revision_count"], source["revision_count"])
+        self.assertEqual(
+            manifest["collection_marker_count"],
+            source["collection_marker_count"],
+        )
+        self.assertEqual(parse_uint64(manifest["page_count"]), len(pages))
+        digest = hashlib.sha256()
+        for page in pages:
+            self.assertEqual(
+                set(page),
+                set(self.wire["$defs"]["recovery_import_page"]["required"]),
+            )
+            self.assertTrue(
+                schema_matches(
+                    page,
+                    self.wire["$defs"]["recovery_import_page"],
+                    self.wire,
+                )
+            )
+            body = json.dumps(
+                page,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+            digest.update(struct.pack(">Q", len(body)))
+            digest.update(body)
+        self.assertEqual(digest.hexdigest(), manifest["pages_sha256"])
+        self.assertEqual(
+            [page["phase"] for page in pages],
+            imported["page_phases"],
+        )
+        self.assertEqual(
+            [parse_uint64(page["page_index"]) for page in pages],
+            list(range(len(pages))),
+        )
+        imported_revisions = [
+            revision for page in pages for revision in page["revisions"]
+        ]
+        imported_markers = [
+            marker for page in pages for marker in page["collection_markers"]
+        ]
+        self.assertEqual(
+            len(imported_revisions),
+            parse_uint64(manifest["revision_count"]),
+        )
+        self.assertEqual(imported_revisions, snapshot_revisions)
+        self.assertEqual(
+            len(imported_markers),
+            parse_uint64(manifest["collection_marker_count"]),
+        )
+        self.assertEqual(imported_markers, source["collection_markers"])
+        self.assertTrue(imported["collection_markers_imported_before_activation"])
+        self.assertEqual(
+            imported["conflicting_duplicate_marker"],
+            "refuse_recovery_import",
+        )
         self.assertTrue(imported["all_source_device_ids_marked_retired"])
+        self.assertTrue(
+            imported[
+                "source_max_author_counters_reconstructed_from_revision_vectors_and_marker_frontiers"
+            ]
+        )
+        reconstructed_counters: dict[str, int] = {}
+        for revision in imported_revisions:
+            for device_id, counter in vector_map(revision).items():
+                reconstructed_counters[device_id] = max(
+                    reconstructed_counters.get(device_id, 0),
+                    counter,
+                )
+        for marker in imported_markers:
+            for device_id, counter in vector_map(
+                {"version_vector": marker["frontier"]}
+            ).items():
+                reconstructed_counters[device_id] = max(
+                    reconstructed_counters.get(device_id, 0),
+                    counter,
+                )
+        expected_counters = {
+            item["device_id"]: parse_uint64(item["counter"])
+            for item in imported["reconstructed_source_max_author_counters"]
+        }
+        self.assertEqual(reconstructed_counters, expected_counters)
         self.assertFalse(imported["source_acknowledgements_copied"])
         self.assertFalse(imported["source_tombstone_retention_age_copied"])
         self.assertEqual(parse_uint64(imported["destination_tombstone_retention_age_seconds"]), 0)
         source_cut = parse_uint64(cursors["source_cut_cursor"])
         self.assertEqual(parse_uint64(cursors["destination_cursor_floor"]), source_cut)
-        imported_cursors = [parse_uint64(value) for value in cursors["imported_revision_cursors"]]
+        imported_cursors = [parse_uint64(value) for value in cursors["imported_item_cursors"]]
         self.assertEqual(imported_cursors, list(range(source_cut + 1, source_cut + 1 + len(imported_cursors))))
+        self.assertEqual(
+            len(imported_cursors),
+            len(imported_revisions) + len(imported_markers),
+        )
         self.assertEqual(parse_uint64(cursors["destination_import_end_cursor"]), imported_cursors[-1])
         self.assertEqual(
             cursors["recovering_device_resumes_delta_after_cursor"],
             cursors["destination_import_end_cursor"],
+        )
+        capacity = fixture["cursor_capacity"]
+        item_count = parse_uint64(capacity["imported_item_count"])
+        exact_fit = capacity["exact_fit"]
+        self.assertEqual(
+            parse_uint64(exact_fit["source_cut_cursor"]) + item_count,
+            parse_uint64(exact_fit["destination_import_end_cursor"]),
+        )
+        self.assertEqual(
+            parse_uint64(exact_fit["destination_import_end_cursor"]),
+            (1 << 64) - 1,
+        )
+        overflow = capacity["overflow"]
+        self.assertGreater(
+            parse_uint64(overflow["source_cut_cursor"]) + item_count,
+            (1 << 64) - 1,
+        )
+        self.assertEqual(overflow["result"], "server_cursor_exhausted")
+        self.assertFalse(overflow["staging_state_created"])
+        self.assertTrue(capacity["checked_at_recovery_begin_and_finalize"])
+        barrier = fixture["post_import_collection_barrier"]
+        persisted = vector_map({"version_vector": barrier["persisted_frontier"]})
+        self.assertEqual(
+            persisted,
+            vector_map({"version_vector": imported_markers[0]["frontier"]}),
+        )
+        equal_upload = vector_map(barrier["equal_frontier_upload"])
+        older_upload = vector_map(barrier["older_upload"])
+        dominating_upload = vector_map(barrier["dominating_upload"])
+        self.assertFalse(dominates(equal_upload, persisted))
+        self.assertFalse(dominates(older_upload, persisted))
+        self.assertTrue(dominates(dominating_upload, persisted))
+        self.assertEqual(
+            barrier["equal_frontier_upload"]["result"],
+            "stale_after_collection",
+        )
+        self.assertEqual(
+            barrier["older_upload"]["result"],
+            "stale_after_collection",
+        )
+        self.assertEqual(barrier["dominating_upload"]["result"], "accepted")
+        self.assertTrue(barrier["marker_active_at_destination_activation"])
+        self.assertFalse(barrier["stale_revision_resurrection_allowed"])
+        normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
+        normalized_threat = re.sub(r"\s+", " ", self.threat_text)
+        self.assertIn(
+            "every later mutation for that record must dominate every imported marker frontier",
+            normalized_protocol,
+        )
+        self.assertIn(
+            "recovery never resets the barrier",
+            normalized_threat,
         )
 
     def _assert_record_revision_shape(self, revision: dict) -> None:

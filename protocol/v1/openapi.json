@@ -279,7 +279,7 @@
         },
         "responses": {
           "200": {
-            "description": "One stable page containing every retained undominated sibling in key order",
+            "description": "One stable phase page containing retained undominated revisions or persistent collection markers in key order",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_page_response"}

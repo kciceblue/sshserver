@@ -301,12 +301,13 @@
         "limits": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["max_body_bytes", "max_mutations", "max_page_changes", "max_snapshot_page_revisions", "max_devices"],
+          "required": ["max_body_bytes", "max_mutations", "max_page_changes", "max_snapshot_page_revisions", "max_snapshot_page_collection_markers", "max_devices"],
           "properties": {
             "max_body_bytes": {"const": 4194304},
             "max_mutations": {"const": 256},
             "max_page_changes": {"const": 128},
             "max_snapshot_page_revisions": {"const": 128},
+            "max_snapshot_page_collection_markers": {"const": 128},
             "max_devices": {"const": 64}
           }
         }
@@ -455,9 +456,32 @@
         {
           "if": {"properties": {"has_more": {"const": false}}},
           "then": {"properties": {"next_page_token": {"type": "null"}}}
+        },
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "revisions": {"minItems": 1},
+                "collection_markers": {"maxItems": 0}
+              }
+            },
+            {
+              "properties": {
+                "revisions": {"maxItems": 0},
+                "collection_markers": {"minItems": 1}
+              }
+            },
+            {
+              "properties": {
+                "revisions": {"maxItems": 0},
+                "collection_markers": {"maxItems": 0},
+                "has_more": {"const": false}
+              }
+            }
+          ]
         }
       ],
-      "required": ["protocol_version", "snapshot_id", "cut_cursor", "envelope_generation", "revisions", "next_page_token", "has_more"],
+      "required": ["protocol_version", "snapshot_id", "cut_cursor", "envelope_generation", "revisions", "collection_markers", "next_page_token", "has_more"],
       "properties": {
         "protocol_version": {"const": "1"},
         "snapshot_id": {"$ref": "#/$defs/uuid"},
@@ -467,6 +491,11 @@
           "type": "array",
           "maxItems": 128,
           "items": {"$ref": "#/$defs/record_revision"}
+        },
+        "collection_markers": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {"$ref": "#/$defs/collection_marker"}
         },
         "next_page_token": {
           "oneOf": [
@@ -479,6 +508,75 @@
           ]
         },
         "has_more": {"type": "boolean"}
+      }
+    },
+    "host_recovery_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "instance_id",
+        "vault_id",
+        "source_cut_cursor",
+        "envelope_generation",
+        "revision_count",
+        "collection_marker_count",
+        "page_count",
+        "pages_sha256"
+      ],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "instance_id": {"$ref": "#/$defs/uuid"},
+        "vault_id": {"$ref": "#/$defs/uuid"},
+        "source_cut_cursor": {"$ref": "#/$defs/uint64"},
+        "envelope_generation": {"$ref": "#/$defs/uint64"},
+        "revision_count": {"$ref": "#/$defs/uint64"},
+        "collection_marker_count": {"$ref": "#/$defs/uint64"},
+        "page_count": {"$ref": "#/$defs/uint64"},
+        "pages_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "recovery_import_page": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"phase": {"const": "record_revisions"}}},
+          "then": {
+            "properties": {
+              "revisions": {"minItems": 1},
+              "collection_markers": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"phase": {"const": "collection_markers"}}},
+          "then": {
+            "properties": {
+              "revisions": {"maxItems": 0},
+              "collection_markers": {"minItems": 1}
+            }
+          }
+        }
+      ],
+      "required": ["protocol_version", "page_index", "phase", "revisions", "collection_markers"],
+      "properties": {
+        "protocol_version": {"const": "1"},
+        "page_index": {"$ref": "#/$defs/uint64"},
+        "phase": {
+          "type": "string",
+          "enum": ["record_revisions", "collection_markers"]
+        },
+        "revisions": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {"$ref": "#/$defs/record_revision"}
+        },
+        "collection_markers": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {"$ref": "#/$defs/collection_marker"}
+        }
       }
     },
     "devices_response": {

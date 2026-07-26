@@ -21,6 +21,7 @@
       "max_mutations": 256,
       "max_page_changes": 128,
       "max_snapshot_page_revisions": 128,
+      "max_snapshot_page_collection_markers": 128,
       "max_devices": 64
     }
   },
@@ -57,6 +58,7 @@
     "instance_secret_generation": "1",
     "secret_rotation_state": "stable",
     "storage_schema": "1",
+    "collection_marker_count": "1",
     "created_at": "2026-07-19T12:00:00.000Z",
     "files": [
       {"path": "sync.db", "mode": "0600", "size": "4096", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
@@ -69,7 +71,8 @@
     {"name": "database_secret_instance_mismatch", "result": "instance_mismatch"},
     {"name": "missing_secret", "result": "restore_incompatible"},
     {"name": "future_storage_schema", "result": "restore_incompatible"},
-    {"name": "checksum_mismatch", "result": "restore_incompatible"}
+    {"name": "checksum_mismatch", "result": "restore_incompatible"},
+    {"name": "duplicate_manifest_path_with_different_checksum", "result": "restore_incompatible"}
   ],
   "backup_cases": [
     {"name": "stable_secret_generation", "result": "complete_backup"},

@@ -89,8 +89,9 @@ but cannot erase data or keys already present on that device.
    previously observed.
 5. Retention and acknowledgement rules prevent an honest server from collecting
    a deletion before every active device has durably observed it.
-6. Stable full snapshots return every undominated sibling at one cut and move
-   to deltas without a pagination gap.
+6. Stable full snapshots return every undominated sibling and every persistent
+   collection-marker frontier at one cut, then move to deltas without a
+   pagination gap or resurrection window.
 
 These goals become claims only after Tom approves the exact construction and
 the Swift and Go conformance suites pass reviewed vectors.
@@ -135,14 +136,15 @@ V1 does not protect against:
 | Concurrent edit/edit | Vectors incomparable | Retain both; deterministic projection is not deletion. User resolution dominates both. |
 | Concurrent edit/delete | Vectors incomparable | Retain live and tombstone siblings; never silently delete the edit or local key. |
 | Later sibling after tombstone acknowledgement | Per-record collection barrier is recomputed from every retained revision cursor while the record is locked | Raise the barrier; an unresolved concurrent tombstone remains ineligible. After collection, reject writes that do not dominate the persisted frontier. |
+| Host loss after collection | The surviving completed snapshot contains every persistent collection marker and its frontier, even when no revision for that record remains | Import markers into inert staging and activate them atomically with revisions. A stale write that does not dominate every imported frontier fails with `stale_after_collection`; recovery never resets the barrier. |
 | Remote identity tombstone | Has no device-local custody generation or cleanup authority | Unlink shared record, preserve local key as orphan, require explicit local exact-generation cleanup. |
 | Lost one device | Other device or verified SSH path survives | Revoke token. Secure Enclave key on lost device is unrecoverable and must be replaced. |
-| Lost host, surviving device | Surviving client has VMK and a completed snapshot containing every sibling/tombstone/vector at cut C | Preserve instance/vault IDs, rewrap the same VMK under a new host secret, atomically import exact revisions, rebuild cursor floor C, retire old device IDs, and never sync the abandoned fork. A projection-only local store is insufficient. |
+| Lost host, surviving device | Surviving client has VMK and a completed snapshot containing every sibling/tombstone/vector and persistent collection-marker frontier at cut C | Preserve instance/vault IDs, rewrap the same VMK under a new host secret, atomically import exact revisions and markers, rebuild cursor floor C, retire old device IDs, and never sync the abandoned fork. A projection-only or marker-incomplete local store is insufficient. |
 | Lost instance secret, surviving device | Client still holds VMK | Create a new secret and conditionally rewrap. Never replace secret without a device-held VMK. |
 | Lost passphrase, surviving device | Device already holds VMK | After local authorization, set a new passphrase envelope. This proposed recovery requires Tom approval. |
 | Lost all devices, base mode | Host secret plus envelope can unwrap VMK | Enroll through verified SSH. Software identities recover; Secure Enclave private keys do not. |
 | Lost all devices, passphrase mode | Host alone cannot unwrap VMK | Enroll through SSH and supply passphrase. Losing passphrase too is intentionally unrecoverable. |
-| Partial backup/restore | Manifest, checksum, schema, IDs, and file-mode validation fail | Keep old instance untouched; restore only into isolation. |
+| Partial backup/restore | Manifest, checksum, schema, IDs, file-mode, and persistent collection-marker count validation fail | Keep old instance untouched; restore only into isolation. Never reconstruct or omit marker frontiers. |
 | Backup during instance-secret rotation | Pending or recovery secret slot makes the transition unstable | V1 refuses backup until rotation returns to `stable`; it never emits a partial transition archive. |
 | Database and secret from different instances | Instance/vault/generation mismatch | Fail closed with `instance_mismatch`; never try alternate derivations. |
 | Clock skew | Grants use a boot-bound monotonic deadline; collection age accrues only from durably checkpointed positive daemon monotonic uptime | Wall clocks are display metadata. Restart downtime and clock jumps can delay collection but cannot accelerate it or select a value. |
@@ -220,6 +222,10 @@ V1 also refuses to create a backup while a pending instance secret or old
 recovery slot exists. The stable manifest records that fact. Serializing only
 one side of the transition could pair an envelope with an unusable secret and
 turn an apparently complete archive into destructive recovery material.
+The manifest also records the persistent collection-marker row count covered
+by the database checksum. Restore compares the checked database with that
+count before activation and never treats missing marker rows as collectable
+history; otherwise a stale client could resurrect a record after host restore.
 
 ## 9. Operational controls
 
@@ -228,15 +234,16 @@ The implementation must eventually demonstrate:
 - loopback-only IPv4/IPv6 listeners and startup rejection of wildcard binds;
 - mode `0600` instance secret, config, database, and backup artifacts;
 - bounded HTTP parsing, request bodies, pages, sibling counts, and rate limits;
-- stable snapshot cuts, replayable page tokens, sibling-complete pagination,
-  expiry discard, and exact cut-to-delta transition;
+- stable snapshot cuts, replayable phase-bound page tokens, sibling- and
+  collection-marker-complete pagination, expiry discard, and exact
+  cut-to-delta transition;
 - constant-time grant/token-hash comparison;
 - structured log redaction tests covering every credential and ciphertext
   field;
 - transactional enrollment, token rotation/revocation, sync, envelope CAS,
   backup checkpoint, and restore replacement;
-- atomic identity-preserving host-recovery import with cursor-floor and vector
-  reconstruction tests;
+- atomic identity-preserving host-recovery import with cursor-floor, revision
+  vector, collection-marker frontier, and stale-after-collection tests;
 - crash/restart tests at each durable state-machine boundary; and
 - no server vault-crypto dependency or private-key parser.
 
@@ -259,8 +266,9 @@ Tom's recorded review must explicitly accept or revise:
    exact-generation actions may delete protected keys.
 8. Base/passphrase compromise wording, rollback limitation, recovery matrix,
    and intentional unrecoverability cases.
-9. Stable full-snapshot pagination, tombstone sibling barriers, and
-   identity-preserving host-loss recovery including cursor reconstruction.
+9. Stable full-snapshot pagination, persistent tombstone collection-marker
+   frontiers, and identity-preserving host-loss recovery including cursor and
+   stale-after-collection reconstruction.
 
 Until those answers and exact conformance results are recorded, this threat
 model is a review artifact rather than a completed security claim.

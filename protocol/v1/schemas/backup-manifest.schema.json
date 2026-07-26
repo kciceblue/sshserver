@@ -11,6 +11,7 @@
     "instance_secret_generation",
     "secret_rotation_state",
     "storage_schema",
+    "collection_marker_count",
     "created_at",
     "files"
   ],
@@ -24,9 +25,14 @@
       "description": "V1 refuses to create a backup while a pending secret or old recovery slot exists."
     },
     "storage_schema": {"const": "1"},
+    "collection_marker_count": {
+      "$ref": "wire.schema.json#/$defs/uint64",
+      "description": "The restore compares this count with the persistent collection-marker rows protected by the sync.db file checksum before activation."
+    },
     "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
     "files": {
       "type": "array",
+      "description": "Every path value MUST be unique; restore rejects duplicate paths even when the remaining item fields differ.",
       "minItems": 3,
       "uniqueItems": true,
       "items": {

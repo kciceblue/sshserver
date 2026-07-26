@@ -165,6 +165,7 @@ surface. HTTP proxy mode, absolute-form request targets, protocol upgrade, and
 | Mutations per sync request | 256 |
 | Returned changes per page | 128 |
 | Returned snapshot revisions per page | 128 |
+| Returned snapshot collection markers per page | 128 |
 | Ciphertext per record revision | 512 KiB |
 | Undominated siblings per record | 32 |
 | Enrollment attempts per instance | 5 per minute |
@@ -767,28 +768,37 @@ After `cursor_expired`, or when no trusted local checkpoint exists, the client
 uses the snapshot-read endpoints rather than guessing a new delta cursor.
 `POST /v1/snapshot-reads` atomically chooses `cut_cursor = C`, captures the
 exact envelope at C, and materializes the membership of every retained
-undominated revision at C. This includes every live and tombstone conflict
-sibling, never only the deterministic projection. Creation is idempotent by
-authenticated device and request ID.
+undominated revision and every persistent collection marker at C. Revisions
+include every live and tombstone conflict sibling, never only the deterministic
+projection. A marker remains in the cut even when no revision for its record
+remains, because its frontier is the durable barrier against resurrection.
+Creation is idempotent by authenticated device and request ID.
 
 Snapshot membership and page bytes remain fixed despite concurrent writes.
-Pages contain at most 128 revisions, strictly ordered by
-`(record_id UUID bytes, revision_id UUID bytes)`; siblings may cross a page
+The stream has two phases: pages of at most 128 revisions strictly ordered by
+`(record_id UUID bytes, revision_id UUID bytes)`, followed by pages of at most
+128 collection markers strictly ordered by
+`(record_id UUID bytes, collected_revision_id UUID bytes)`. Empty phases are
+skipped, and a page never mixes phases; siblings or markers may cross a page
 boundary. Each opaque 32-byte page token is bound to snapshot ID,
-authenticated device ID, cut cursor, and the next ordering key. Replaying a
-page token returns byte-equivalent JSON. The server pins included bytes against
-collection for the snapshot lease, proposed as 15 minutes of daemon monotonic
-uptime. `expires_at` is display metadata only.
+authenticated device ID, cut cursor, phase, and the next ordering key.
+Replaying a page token returns byte-equivalent JSON. The server pins included
+revision bytes against collection for the snapshot lease, proposed as 15
+minutes of daemon monotonic uptime. Collection markers are already persistent.
+`expires_at` is display metadata only.
 
 The client stages pages under one snapshot ID and atomically replaces its sync
-store only after all pages, the envelope, every AEAD value, and the final null
-page token validate. It then calls `/v1/sync` with `after_cursor = C` and may set
+store only after all pages, the envelope, every AEAD value, every collection
+marker and frontier, and the final null page token validate. A marker's
+`barrier_cursor` MUST be at most C. The client retains every marker separately;
+it never drops or weakens a frontier because the corresponding revision bytes
+are absent. It then calls `/v1/sync` with `after_cursor = C` and may set
 `ack_cursor = C` only after the complete snapshot is durable. The first delta
 therefore returns every change at C+1 or later, including envelope changes.
 `snapshot_expired` or `snapshot_not_found` requires discarding the entire
 partial snapshot and starting a new cut; pages from different snapshot IDs are
-never combined. The complete two-page conflict and delta transition are in
-`protocol/v1/fixtures/full-snapshot-recovery.json`.
+never combined. The complete conflict, collection-marker, and delta transition
+are in `protocol/v1/fixtures/full-snapshot-recovery.json`.
 
 ## 12. Error contract
 
@@ -875,7 +885,8 @@ The administration CLI creates a consistent user-owned backup containing:
 - loopback-only configuration;
 - device token hashes/scopes/status and acknowledgement metadata; and
 - a manifest with file sizes, SHA-256 checksums, and
-  `secret_rotation_state = stable`.
+  `secret_rotation_state = stable`, including the persistent collection-marker
+  row count protected by the ciphertext-database checksum.
 
 V1 does not serialize a partially completed instance-secret rotation. Backup
 holds the rotation lock and refuses with `backup_refused_rotation_in_progress`
@@ -891,9 +902,14 @@ passphrase guessing.
 
 Restore occurs into an isolated stopped instance. The CLI validates manifest,
 checksums, regular-file ownership/modes, schema compatibility, and matching
-instance/vault IDs before atomically replacing live state. A partial or mixed
-backup fails closed. The old instance remains recoverable until the restored
-service passes a loopback health check.
+instance/vault IDs before atomically replacing live state. Manifest file paths
+must be unique; two entries naming the same path are
+`restore_incompatible` even if their sizes or checksums differ. The CLI also
+compares the manifest collection-marker count with the marker rows loaded from
+the checked database and refuses any mismatch; restore never rebuilds or
+discards marker frontiers. A partial or mixed backup fails closed. The old
+instance remains recoverable until the restored service passes a loopback
+health check.
 
 ### 14.2 Recovery matrix
 
@@ -920,37 +936,61 @@ V1 uses identity-preserving recovery because record keys and associated data
 authenticate `instance_id` and `vault_id`. The precondition is a surviving
 client that holds the VMK and a durably completed snapshot at source cut C,
 including every undominated live/tombstone sibling and its exact revision ID,
-vector, nonce, and ciphertext. A local store containing only the deterministic
-projection is insufficient and the recovery command MUST refuse it.
+vector, nonce, and ciphertext, plus every persistent collection marker and its
+exact collected revision ID, frontier, and barrier cursor. A local store
+containing only the deterministic projection or omitting a marker is
+insufficient and the recovery command MUST refuse it.
 
 Through a newly verified SSH connection, the user runs an administrative
 `recovery begin` command naming the old instance ID, old vault ID, source cut C,
-and a manifest count and SHA-256 digest. The new server creates an inert staging
-instance with those same IDs, a fresh instance secret at generation old+1, and
-a random recovery ID. The client rewraps the same VMK in a new envelope at
-generation old+1. It streams JSON pages through verified SSH standard input to
-`recovery import-page`; pages are idempotent and strictly ordered by
-`(record_id UUID bytes, revision_id UUID bytes)`. `recovery finalize` checks the
-manifest, envelope IDs/generations, page order, count, digest, vector
-canonicality, revision uniqueness, and an otherwise empty staging instance,
-then activates all state in one transaction. Interrupted or invalid staging is
-inert and can only be resumed with the same recovery ID or discarded.
+and a strict recovery manifest with separate revision, collection-marker, and
+page counts plus a SHA-256 digest. The digest covers each exact UTF-8
+`recovery import-page` body, in page order, preceded by its unsigned 64-bit
+big-endian byte length. Before creating staging, the server uses checked
+unsigned arithmetic to require
+`C + revision_count + collection_marker_count <= UInt64.max`; overflow fails
+with `server_cursor_exhausted` and creates no recovery state. Finalization
+repeats this check against the verified imported counts. The new server creates
+an inert staging instance with those same IDs, a fresh instance secret at
+generation old+1, and a random recovery ID. The client rewraps the same VMK in
+a new envelope at generation old+1. It streams JSON pages through verified SSH standard input to
+`recovery import-page`. Revision pages come first and are strictly ordered by
+`(record_id UUID bytes, revision_id UUID bytes)`; collection-marker pages
+follow and are strictly ordered by
+`(record_id UUID bytes, collected_revision_id UUID bytes)`. Pages are
+idempotent only when the page index and exact body match. `recovery finalize`
+checks the manifest, envelope IDs/generations, phase and page order, both
+counts, digest, vector and frontier canonicality, revision and marker
+uniqueness, every marker `barrier_cursor <= C`, and an otherwise empty staging
+instance, then activates all state in one transaction. Conflicting duplicate
+markers fail closed rather than joining, replacing, or weakening a frontier.
+Interrupted or invalid staging is inert and can only be resumed with the same
+recovery ID or discarded.
 
 Because the instance/vault IDs and VMK are preserved, every imported record
 ciphertext, record/revision ID, version vector, author counter, and tombstone
-flag is byte-identical. Every source device ID is created as retired, its
-maximum counter is reconstructed from imported vectors, and it is never reused.
-The recovering client enrolls afterward with a fresh device ID and token. Old
-acknowledgements are not copied and tombstone retention ages restart at zero.
+flag is byte-identical. Every collection marker, including its collected
+revision ID, frontier, and source barrier cursor, is also preserved exactly.
+Every source device ID is created as retired, its maximum counter is
+reconstructed from both imported revision vectors and marker frontiers, and it
+is never reused. The recovering client enrolls afterward with a fresh device
+ID and token. Old acknowledgements are not copied and retained-tombstone
+retention ages restart at zero; collection markers are not retention
+candidates and remain persistent.
 
 The destination change cursor is initialized to floor C. Imported retained
-revisions receive new cursors C+1 onward in the same deterministic import order;
-source per-revision cursors are not copied because cursors are server transport
-state. If the last imported cursor is R, collection stays frozen until the new
-device has verified the import and acknowledged R, and delta sync starts with
-`after_cursor = R`. This preserves the surviving rollback checkpoint without
-pretending that old cursor-to-revision assignments survived. The executable
-state description is `protocol/v1/fixtures/host-loss-recovery.json`.
+revisions and collection markers receive new cursors C+1 onward in the same
+deterministic phase and item order; source change cursors are not copied because
+cursors are server transport state. The preserved marker `barrier_cursor` is
+historical source metadata, while its frontier is the active mutation barrier.
+Before the staging transaction becomes visible, every later mutation for that
+record must dominate every imported marker frontier or fail with
+`stale_after_collection`. If the last imported cursor is R, collection stays
+frozen until the new device has verified the import and acknowledged R, and
+delta sync starts with `after_cursor = R`. This preserves the surviving
+rollback checkpoint and tombstone barriers without pretending that old
+cursor-to-item assignments survived. The executable state description is
+`protocol/v1/fixtures/host-loss-recovery.json`.
 
 Creating different instance or vault IDs is not this recovery operation: every
 live sibling and tombstone would have to be decrypted, validated, and
