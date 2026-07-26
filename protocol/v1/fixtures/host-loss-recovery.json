@@ -7,7 +7,9 @@
     "instance_id": "00000000-0000-4000-8000-000000000001",
     "vault_id": "00000000-0000-4000-8000-000000000002",
     "cut_cursor": "50",
-    "envelope_generation": "1",
+    "envelope_generation": "2",
+    "instance_secret_generation": "1",
+    "envelope_and_instance_secret_generations_diverged_after_passphrase_rewrap": true,
     "all_undominated_siblings_present": true,
     "live_siblings": 1,
     "tombstone_siblings": 1,
@@ -32,7 +34,8 @@
     "instance_id": "00000000-0000-4000-8000-000000000001",
     "vault_id": "00000000-0000-4000-8000-000000000002",
     "source_cut_cursor": "50",
-    "envelope_generation": "1",
+    "source_envelope_generation": "2",
+    "source_instance_secret_generation": "1",
     "revision_count": "2",
     "collection_marker_count": "1",
     "page_count": "2",
@@ -99,7 +102,7 @@
     "vault_id": "00000000-0000-4000-8000-000000000002",
     "ids_preserved": true,
     "new_instance_secret_generation": "2",
-    "new_envelope_generation": "2",
+    "new_envelope_generation": "3",
     "same_vmk_rewrapped_under_new_instance_secret": true,
     "record_ciphertexts_byte_identical": true,
     "record_ids_revision_ids_vectors_and_tombstone_flags_byte_identical": true,
@@ -115,6 +118,9 @@
     "collection_marker_pages_sorted_by": ["record_id_uuid_bytes", "collected_revision_id_uuid_bytes"],
     "collection_markers_imported_before_activation": true,
     "conflicting_duplicate_marker": "refuse_recovery_import",
+    "staged_envelope_and_reconstructed_retired_devices_are_activation_baseline": true,
+    "activation_baseline_rows_receive_change_cursors": false,
+    "mandatory_post_recovery_enrollment_cursor_reserved": true,
     "all_source_device_ids_marked_retired": true,
     "source_max_author_counters_reconstructed_from_revision_vectors_and_marker_frontiers": true,
     "reconstructed_source_max_author_counters": [
@@ -132,22 +138,51 @@
     "imported_item_cursors": ["51", "52", "53"],
     "source_per_item_cursors_copied": false,
     "destination_import_end_cursor": "53",
+    "mandatory_post_recovery_enrollment_cursor": "54",
     "recovering_device_resumes_delta_after_cursor": "53",
     "collection_frozen_until_recovering_device_acknowledges": "53"
   },
   "cursor_capacity": {
     "imported_item_count": "3",
+    "reserved_enrollment_cursor_count": "1",
     "exact_fit": {
-      "source_cut_cursor": "18446744073709551612",
-      "destination_import_end_cursor": "18446744073709551615",
+      "source_cut_cursor": "18446744073709551611",
+      "destination_import_end_cursor": "18446744073709551614",
+      "mandatory_post_recovery_enrollment_cursor": "18446744073709551615",
       "result": "accepted"
     },
     "overflow": {
-      "source_cut_cursor": "18446744073709551613",
+      "source_cut_cursor": "18446744073709551612",
       "result": "server_cursor_exhausted",
       "staging_state_created": false
     },
     "checked_at_recovery_begin_and_finalize": true
+  },
+  "generation_capacity": {
+    "source_generations_diverge": true,
+    "checked_successors_at_recovery_begin_and_finalize": true,
+    "envelope_generation": {
+      "source": "2",
+      "destination": "3"
+    },
+    "instance_secret_generation": {
+      "source": "1",
+      "destination": "2"
+    },
+    "overflow_cases": [
+      {
+        "source_field": "source_envelope_generation",
+        "source_value": "18446744073709551615",
+        "result": "recovery_generation_exhausted",
+        "staging_state_created": false
+      },
+      {
+        "source_field": "source_instance_secret_generation",
+        "source_value": "18446744073709551615",
+        "result": "recovery_generation_exhausted",
+        "staging_state_created": false
+      }
+    ]
   },
   "post_import_collection_barrier": {
     "record_id": "00000000-0000-4000-8000-000000000030",
@@ -181,6 +216,7 @@
   },
   "post_import_enrollment": {
     "new_device_id": "00000000-0000-4000-8000-000000000043",
+    "device_state_change_cursor": "54",
     "old_device_ids_reusable": false,
     "fresh_ssh_enrollment_grant_required": true,
     "old_tokens_valid_on_recovered_instance": false
@@ -188,6 +224,7 @@
   "failure_rules": {
     "incomplete_snapshot": "refuse_recovery_import",
     "identity_mismatch": "instance_mismatch",
+    "source_generation_has_no_uint64_successor": "recovery_generation_exhausted",
     "missing_sibling_tombstone_or_collection_marker": "manifest_digest_mismatch",
     "interrupted_import": "discard_or_resume_inert_staging_state",
     "old_host_returns": "treat_as_abandoned_fork_and_never_sync_both"

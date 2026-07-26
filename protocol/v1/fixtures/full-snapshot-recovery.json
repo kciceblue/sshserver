@@ -11,17 +11,24 @@
     "protocol_version": "1",
     "snapshot_id": "00000000-0000-4000-8000-000000000041",
     "cut_cursor": "50",
-    "envelope_generation": "1",
+    "envelope_generation": "2",
     "envelope": {
       "protocol_version": "1",
       "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
       "instance_id": "00000000-0000-4000-8000-000000000001",
       "vault_id": "00000000-0000-4000-8000-000000000002",
-      "envelope_generation": "1",
+      "envelope_generation": "2",
       "instance_secret_generation": "1",
-      "mode": "base",
+      "mode": "passphrase",
       "hkdf_salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      "argon2": null,
+      "argon2": {
+        "version": 19,
+        "salt": "AAAAAAAAAAAAAAAAAAAAAA",
+        "memory_kib": 65536,
+        "iterations": 3,
+        "parallelism": 1,
+        "output_length": 32
+      },
       "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "wrapped_vmk": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     },
@@ -39,7 +46,7 @@
         "protocol_version": "1",
         "snapshot_id": "00000000-0000-4000-8000-000000000041",
         "cut_cursor": "50",
-        "envelope_generation": "1",
+        "envelope_generation": "2",
         "revisions": [
           {
             "record_id": "00000000-0000-4000-8000-000000000020",
@@ -71,7 +78,7 @@
         "protocol_version": "1",
         "snapshot_id": "00000000-0000-4000-8000-000000000041",
         "cut_cursor": "50",
-        "envelope_generation": "1",
+        "envelope_generation": "2",
         "revisions": [
           {
             "record_id": "00000000-0000-4000-8000-000000000020",
@@ -103,7 +110,7 @@
         "protocol_version": "1",
         "snapshot_id": "00000000-0000-4000-8000-000000000041",
         "cut_cursor": "50",
-        "envelope_generation": "1",
+        "envelope_generation": "2",
         "revisions": [],
         "collection_markers": [
           {
@@ -134,7 +141,7 @@
     "server_cursor": "51",
     "next_cursor": "51",
     "has_more": false,
-    "envelope_generation": "1",
+    "envelope_generation": "2",
     "changes": [
       {
         "cursor": "51",

@@ -295,6 +295,7 @@
         },
         "capabilities": {
           "type": "array",
+          "description": "Sorted advertised capabilities. Marker-aware snapshot responses require both snapshot-read-v1 and snapshot-collection-markers-v1.",
           "uniqueItems": true,
           "items": {"type": "string"}
         },
@@ -307,7 +308,10 @@
             "max_mutations": {"const": 256},
             "max_page_changes": {"const": 128},
             "max_snapshot_page_revisions": {"const": 128},
-            "max_snapshot_page_collection_markers": {"const": 128},
+            "max_snapshot_page_collection_markers": {
+              "const": 128,
+              "description": "Present only as part of the required snapshot-collection-markers-v1 contract."
+            },
             "max_devices": {"const": 64}
           }
         }
@@ -512,13 +516,15 @@
     },
     "host_recovery_manifest": {
       "type": "object",
+      "description": "Before staging, recovery checks independent successors for both source generations and reserves one cursor beyond all imported items for mandatory enrollment.",
       "additionalProperties": false,
       "required": [
         "protocol_version",
         "instance_id",
         "vault_id",
         "source_cut_cursor",
-        "envelope_generation",
+        "source_envelope_generation",
+        "source_instance_secret_generation",
         "revision_count",
         "collection_marker_count",
         "page_count",
@@ -529,7 +535,8 @@
         "instance_id": {"$ref": "#/$defs/uuid"},
         "vault_id": {"$ref": "#/$defs/uuid"},
         "source_cut_cursor": {"$ref": "#/$defs/uint64"},
-        "envelope_generation": {"$ref": "#/$defs/uint64"},
+        "source_envelope_generation": {"$ref": "#/$defs/uint64"},
+        "source_instance_secret_generation": {"$ref": "#/$defs/uint64"},
         "revision_count": {"$ref": "#/$defs/uint64"},
         "collection_marker_count": {"$ref": "#/$defs/uint64"},
         "page_count": {"$ref": "#/$defs/uint64"},

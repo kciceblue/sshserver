@@ -766,6 +766,11 @@ full-snapshot requirement; it is never silently interpreted as an empty delta.
 
 After `cursor_expired`, or when no trusted local checkpoint exists, the client
 uses the snapshot-read endpoints rather than guessing a new delta cursor.
+Marker-complete V1 snapshots require both `snapshot-read-v1` and
+`snapshot-collection-markers-v1`. A server emitting the required
+`collection_markers` response member and its advertised page limit MUST
+advertise the latter capability; a client MUST require it before creating a
+snapshot and fails closed with `unsupported_capability` when it is absent.
 `POST /v1/snapshot-reads` atomically chooses `cut_cursor = C`, captures the
 exact envelope at C, and materializes the membership of every retained
 undominated revision and every persistent collection marker at C. Revisions
@@ -849,9 +854,10 @@ localized `message`.
 | 500 | `internal_error` |
 | 507 | `server_cursor_exhausted` |
 
-The administration CLI uses `restore_incompatible` and
-`backup_refused_rotation_in_progress` as non-HTTP diagnostics. They are not
-members of the OpenAPI error schema or `x-jat-error-status-map`.
+The administration CLI uses `restore_incompatible`,
+`backup_refused_rotation_in_progress`, and
+`recovery_generation_exhausted` as non-HTTP diagnostics. They are not members
+of the OpenAPI error schema or `x-jat-error-status-map`.
 
 ## 13. Version negotiation and downgrade behavior
 
@@ -866,6 +872,9 @@ opaque data and block affected writes; they are never downgraded, deleted, or
 guessed. A server upgrade must read the immediately previous storage schema and
 perform a transactional migration. Rolling upgrade compatibility changes only
 through an explicit advertised capability and fixture update.
+`snapshot-collection-markers-v1` is required in addition to
+`snapshot-read-v1` for the marker-aware snapshot shape; reusing
+`snapshot-read-v1` alone for that required response member is forbidden.
 
 Protocol negotiation cannot prevent a malicious host from replaying an old but
 previously valid complete view. A surviving client compares the server view to
@@ -943,29 +952,42 @@ insufficient and the recovery command MUST refuse it.
 
 Through a newly verified SSH connection, the user runs an administrative
 `recovery begin` command naming the old instance ID, old vault ID, source cut C,
-and a strict recovery manifest with separate revision, collection-marker, and
-page counts plus a SHA-256 digest. The digest covers each exact UTF-8
-`recovery import-page` body, in page order, preceded by its unsigned 64-bit
-big-endian byte length. Before creating staging, the server uses checked
-unsigned arithmetic to require
-`C + revision_count + collection_marker_count <= UInt64.max`; overflow fails
-with `server_cursor_exhausted` and creates no recovery state. Finalization
-repeats this check against the verified imported counts. The new server creates
-an inert staging instance with those same IDs, a fresh instance secret at
-generation old+1, and a random recovery ID. The client rewraps the same VMK in
-a new envelope at generation old+1. It streams JSON pages through verified SSH standard input to
+and a strict recovery manifest with the source envelope generation, source
+instance-secret generation, separate revision, collection-marker, and page
+counts, plus a SHA-256 digest. The two source generations are independent:
+passphrase rewrap can advance the envelope generation without rotating the
+instance secret. The digest covers each exact UTF-8 `recovery import-page`
+body, in page order, preceded by its unsigned 64-bit big-endian byte length.
+
+Before creating staging, the server uses checked unsigned arithmetic to
+require both source generations to be less than `UInt64.max`. It computes the
+destination envelope and instance-secret generations as their respective
+checked successors. If either successor is unavailable, recovery fails with
+`recovery_generation_exhausted` and creates no recovery state. The server also
+reserves one change cursor for the mandatory post-recovery enrollment and
+requires
+`C + revision_count + collection_marker_count + 1 <= UInt64.max`; overflow
+fails with `server_cursor_exhausted` and creates no recovery state.
+Finalization repeats all three checks against the verified manifest and
+imported counts.
+
+The new server creates an inert staging instance with those same IDs, a fresh
+instance secret at `source_instance_secret_generation + 1`, and a random
+recovery ID. The client rewraps the same VMK in a new envelope at
+`source_envelope_generation + 1`, naming that new instance-secret generation.
+It streams JSON pages through verified SSH standard input to
 `recovery import-page`. Revision pages come first and are strictly ordered by
 `(record_id UUID bytes, revision_id UUID bytes)`; collection-marker pages
 follow and are strictly ordered by
 `(record_id UUID bytes, collected_revision_id UUID bytes)`. Pages are
 idempotent only when the page index and exact body match. `recovery finalize`
-checks the manifest, envelope IDs/generations, phase and page order, both
-counts, digest, vector and frontier canonicality, revision and marker
-uniqueness, every marker `barrier_cursor <= C`, and an otherwise empty staging
-instance, then activates all state in one transaction. Conflicting duplicate
-markers fail closed rather than joining, replacing, or weakening a frontier.
-Interrupted or invalid staging is inert and can only be resumed with the same
-recovery ID or discarded.
+checks the manifest, exact checked envelope and instance-secret successors,
+phase and page order, both counts, digest, vector and frontier canonicality,
+revision and marker uniqueness, every marker `barrier_cursor <= C`, and an
+otherwise empty staging instance, then activates all state in one transaction.
+Conflicting duplicate markers fail closed rather than joining, replacing, or
+weakening a frontier. Interrupted or invalid staging is inert and can only be
+resumed with the same recovery ID or discarded.
 
 Because the instance/vault IDs and VMK are preserved, every imported record
 ciphertext, record/revision ID, version vector, author counter, and tombstone
@@ -983,11 +1005,17 @@ revisions and collection markers receive new cursors C+1 onward in the same
 deterministic phase and item order; source change cursors are not copied because
 cursors are server transport state. The preserved marker `barrier_cursor` is
 historical source metadata, while its frontier is the active mutation barrier.
+The staged envelope and reconstructed retired-device rows are activation
+baseline, not post-activation changes, and receive no change cursors. This is a
+narrow recovery-only exception; the mandatory fresh enrollment remains a
+normal cursor-bearing device-state change. Let R be C when the import has no
+items and otherwise the final imported-item cursor; enrollment receives the
+reserved cursor R+1.
 Before the staging transaction becomes visible, every later mutation for that
 record must dominate every imported marker frontier or fail with
-`stale_after_collection`. If the last imported cursor is R, collection stays
-frozen until the new device has verified the import and acknowledged R, and
-delta sync starts with `after_cursor = R`. This preserves the surviving
+`stale_after_collection`. Collection stays frozen until the new device has
+verified the import and acknowledged R, and delta sync starts with
+`after_cursor = R`. This preserves the surviving
 rollback checkpoint and tombstone barriers without pretending that old
 cursor-to-item assignments survived. The executable state description is
 `protocol/v1/fixtures/host-loss-recovery.json`.
@@ -1055,14 +1083,17 @@ Before this draft becomes approved:
    fixtures and agree byte-for-byte.
 4. Wire fixtures must demonstrate enrollment retry, self-only token rotation,
    deterministic mutation order, sibling-complete snapshot pagination and delta
-   transition, conflict retention, later-sibling tombstone barriers,
-   identity-preserving host recovery, last-device retirement, rotation-safe
-   backup refusal, restore mismatch, and version downgrade rejection.
+   transition, marker-capability negotiation, conflict retention, later-sibling
+   tombstone barriers, identity-preserving host recovery with independent
+   generation successors and reserved enrollment cursor, last-device retirement,
+   rotation-safe backup refusal, semantic duplicate-path restore rejection,
+   restore mismatch, and version downgrade rejection.
 5. Policy checks must confirm that the server has no vault-crypto or private-key
    parser and that all implementation inputs satisfy the permissive-license
    allowlist.
-6. Boundary tests must accept `18446744073709551615` and reject
-   `18446744073709551616` before any cursor/counter arithmetic.
+6. Boundary tests must accept `18446744073709551615`, reject
+   `18446744073709551616` before any cursor/counter arithmetic, and reject a
+   recovery source generation at `UInt64.max` before attempting its successor.
 7. The coordinator records the reviewed exact commits and evidence before task
    2.0 is acknowledged. Until then task 2.1 and cryptographic implementation
    remain downstream work.

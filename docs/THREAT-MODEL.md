@@ -139,7 +139,7 @@ V1 does not protect against:
 | Host loss after collection | The surviving completed snapshot contains every persistent collection marker and its frontier, even when no revision for that record remains | Import markers into inert staging and activate them atomically with revisions. A stale write that does not dominate every imported frontier fails with `stale_after_collection`; recovery never resets the barrier. |
 | Remote identity tombstone | Has no device-local custody generation or cleanup authority | Unlink shared record, preserve local key as orphan, require explicit local exact-generation cleanup. |
 | Lost one device | Other device or verified SSH path survives | Revoke token. Secure Enclave key on lost device is unrecoverable and must be replaced. |
-| Lost host, surviving device | Surviving client has VMK and a completed snapshot containing every sibling/tombstone/vector and persistent collection-marker frontier at cut C | Preserve instance/vault IDs, rewrap the same VMK under a new host secret, atomically import exact revisions and markers, rebuild cursor floor C, retire old device IDs, and never sync the abandoned fork. A projection-only or marker-incomplete local store is insufficient. |
+| Lost host, surviving device | Surviving client has VMK and a completed snapshot containing every sibling/tombstone/vector, both source generations, and every persistent collection-marker frontier at cut C | Preserve instance/vault IDs, take checked independent successors of the envelope and instance-secret generations, rewrap the same VMK under a new host secret, atomically import exact revisions and markers, rebuild cursor floor C while reserving the mandatory enrollment cursor, retire old device IDs as activation baseline, and never sync the abandoned fork. A projection-only or marker-incomplete local store is insufficient; generation or cursor exhaustion fails before staging. |
 | Lost instance secret, surviving device | Client still holds VMK | Create a new secret and conditionally rewrap. Never replace secret without a device-held VMK. |
 | Lost passphrase, surviving device | Device already holds VMK | After local authorization, set a new passphrase envelope. This proposed recovery requires Tom approval. |
 | Lost all devices, base mode | Host secret plus envelope can unwrap VMK | Enroll through verified SSH. Software identities recover; Secure Enclave private keys do not. |
@@ -152,7 +152,7 @@ V1 does not protect against:
 | Interrupted passphrase rewrap | Envelope generation CAS leaves one committed envelope | Reload winner; records are unchanged. |
 | Interrupted secret rotation | Active and pending generations remain recoverable until envelope and secret agree | Resume or discard pending state according to two-phase state machine. |
 | Snapshot expires mid-page | Snapshot ID/token is missing or lease expires | Discard all staged pages and begin a fresh cut; never combine snapshots or fall back to an empty delta. |
-| Incompatible protocol/crypto version | Negotiation has no compatible required capability | Preserve opaque data and block affected writes; never downgrade or reset. |
+| Incompatible protocol/crypto version | Negotiation has no compatible required capability, including `snapshot-collection-markers-v1` for marker-aware snapshot pages | Preserve opaque data and block affected writes; never downgrade or reset. |
 
 ## 6. Mode guarantees
 
@@ -242,8 +242,10 @@ The implementation must eventually demonstrate:
   field;
 - transactional enrollment, token rotation/revocation, sync, envelope CAS,
   backup checkpoint, and restore replacement;
-- atomic identity-preserving host-recovery import with cursor-floor, revision
-  vector, collection-marker frontier, and stale-after-collection tests;
+- atomic identity-preserving host-recovery import with independent checked
+  generation successors, cursor-floor and reserved-enrollment capacity,
+  revision vector, collection-marker frontier, and stale-after-collection
+  tests;
 - crash/restart tests at each durable state-machine boundary; and
 - no server vault-crypto dependency or private-key parser.
 
@@ -267,8 +269,9 @@ Tom's recorded review must explicitly accept or revise:
 8. Base/passphrase compromise wording, rollback limitation, recovery matrix,
    and intentional unrecoverability cases.
 9. Stable full-snapshot pagination, persistent tombstone collection-marker
-   frontiers, and identity-preserving host-loss recovery including cursor and
-   stale-after-collection reconstruction.
+   frontiers, marker-capability negotiation, and identity-preserving host-loss
+   recovery including independent generation successors, reserved enrollment
+   cursor capacity, and stale-after-collection reconstruction.
 
 Until those answers and exact conformance results are recorded, this threat
 model is a review artifact rather than a completed security claim.

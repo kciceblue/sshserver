@@ -13,6 +13,7 @@
       "conflict-siblings-v1",
       "device-token-rotation-v1",
       "envelope-cas-v1",
+      "snapshot-collection-markers-v1",
       "snapshot-read-v1",
       "tombstone-ack-v1"
     ],

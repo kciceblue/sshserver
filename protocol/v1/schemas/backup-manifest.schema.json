@@ -32,7 +32,7 @@
     "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
     "files": {
       "type": "array",
-      "description": "Every path value MUST be unique; restore rejects duplicate paths even when the remaining item fields differ.",
+      "description": "Semantic post-schema invariant: Every path value MUST be unique; restore rejects duplicate paths even when the remaining item fields differ because JSON Schema uniqueItems compares complete objects.",
       "minItems": 3,
       "uniqueItems": true,
       "items": {

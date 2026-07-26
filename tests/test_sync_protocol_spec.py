@@ -120,6 +120,16 @@ def dominates(left: dict[str, int], right: dict[str, int]) -> bool:
     )
 
 
+def validate_backup_manifest_paths(manifest: dict) -> None:
+    """Enforce path-key uniqueness after structural JSON Schema validation."""
+    seen: set[str] = set()
+    for item in manifest["files"]:
+        path = item["path"]
+        if path in seen:
+            raise ValueError(f"duplicate backup manifest path: {path}")
+        seen.add(path)
+
+
 def schema_matches(value: object, schema: dict, root: dict) -> bool:
     reference = schema.get("$ref")
     if reference is not None:
@@ -303,6 +313,10 @@ class SyncProtocolSpecTests(unittest.TestCase):
             self.openapi["paths"]["/v1/device-token-rotations"]["post"]["responses"]
         )
         self.assertIn("403", rotation_statuses)
+        enrollment_statuses = set(
+            self.openapi["paths"]["/v1/enrollments"]["post"]["responses"]
+        )
+        self.assertIn("507", enrollment_statuses)
         snapshot_statuses = set(
             self.openapi["paths"]["/v1/snapshot-reads/{snapshot_id}/pages"]["post"]["responses"]
         )
@@ -712,7 +726,18 @@ class SyncProtocolSpecTests(unittest.TestCase):
         )
         version_results = {case["result"]: case for case in fixture["version_negotiation"]}
         self.assertEqual(version_results["unsupported_protocol"]["http_status"], 426)
-        self.assertEqual(version_results["unsupported_capability"]["http_status"], 426)
+        unsupported_capabilities = [
+            case
+            for case in fixture["version_negotiation"]
+            if case["result"] == "unsupported_capability"
+        ]
+        self.assertEqual(
+            {case["missing_required_capability"] for case in unsupported_capabilities},
+            {"envelope-cas-v1", "snapshot-collection-markers-v1"},
+        )
+        self.assertTrue(
+            all(case["http_status"] == 426 for case in unsupported_capabilities)
+        )
         self.assertIn("preserve_opaque_and_block_write", version_results)
 
     def test_payload_schema_is_allowlisted_and_excludes_device_local_authority(self) -> None:
@@ -754,6 +779,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
             self.backup_schema["properties"]["secret_rotation_state"]["const"],
             "stable",
         )
+        validate_backup_manifest_paths(manifest)
         for item in manifest["files"]:
             self.assertEqual(item["mode"], "0600")
             parse_uint64(item["size"])
@@ -765,12 +791,17 @@ class SyncProtocolSpecTests(unittest.TestCase):
             cases["duplicate_manifest_path_with_different_checksum"],
             "restore_incompatible",
         )
-        duplicate_files = copy.deepcopy(manifest["files"])
-        duplicate_path = copy.deepcopy(duplicate_files[0])
+        duplicate_manifest = copy.deepcopy(manifest)
+        duplicate_path = copy.deepcopy(duplicate_manifest["files"][0])
         duplicate_path["sha256"] = "f" * 64
-        duplicate_files.append(duplicate_path)
-        paths = [item["path"] for item in duplicate_files]
+        duplicate_manifest["files"].append(duplicate_path)
+        paths = [item["path"] for item in duplicate_manifest["files"]]
         self.assertNotEqual(len(paths), len(set(paths)))
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^duplicate backup manifest path: sync\.db$",
+        ):
+            validate_backup_manifest_paths(duplicate_manifest)
         self.assertIn(
             "Every path value MUST be unique",
             self.backup_schema["properties"]["files"]["description"],
@@ -792,6 +823,15 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(capabilities["protocol_min"], "1")
         self.assertEqual(capabilities["protocol_max"], "1")
         self.assertEqual(capabilities["crypto_suites"], ["jat-xchacha-hkdf-argon2id-draft1"])
+        self.assertEqual(
+            capabilities["capabilities"],
+            sorted(capabilities["capabilities"]),
+        )
+        self.assertTrue(
+            {"snapshot-read-v1", "snapshot-collection-markers-v1"}.issubset(
+                capabilities["capabilities"]
+            )
+        )
         self.assertEqual(capabilities["limits"]["max_snapshot_page_revisions"], 128)
         self.assertEqual(
             capabilities["limits"]["max_snapshot_page_collection_markers"],
@@ -834,6 +874,14 @@ class SyncProtocolSpecTests(unittest.TestCase):
         assert_uuid_v4(self, create_response["snapshot_id"])
         cut = parse_uint64(create_response["cut_cursor"])
         self.assertEqual(len(decode_base64url(create_response["first_page_token"])), 32)
+        self.assertEqual(
+            create_response["envelope_generation"],
+            create_response["envelope"]["envelope_generation"],
+        )
+        self.assertNotEqual(
+            create_response["envelope"]["envelope_generation"],
+            create_response["envelope"]["instance_secret_generation"],
+        )
 
         revisions: list[dict] = []
         collection_markers: list[dict] = []
@@ -976,6 +1024,36 @@ class SyncProtocolSpecTests(unittest.TestCase):
             for marker in page["response"]["collection_markers"]
         ]
         self.assertEqual(source["collection_markers"], snapshot_markers)
+        snapshot_envelope = snapshot_fixture["create_response"]["envelope"]
+        passphrase_rewrap_envelope = self.fixtures["vault-envelope.json"][
+            "passphrase_rewrap"
+        ]["envelope"]
+        self.assertEqual(snapshot_envelope, passphrase_rewrap_envelope)
+        self.assertEqual(
+            source["envelope_generation"],
+            snapshot_envelope["envelope_generation"],
+        )
+        self.assertEqual(
+            source["instance_secret_generation"],
+            snapshot_envelope["instance_secret_generation"],
+        )
+        self.assertEqual(
+            source["envelope_generation"],
+            passphrase_rewrap_envelope["envelope_generation"],
+        )
+        self.assertEqual(
+            source["instance_secret_generation"],
+            passphrase_rewrap_envelope["instance_secret_generation"],
+        )
+        self.assertTrue(
+            source[
+                "envelope_and_instance_secret_generations_diverged_after_passphrase_rewrap"
+            ]
+        )
+        self.assertNotEqual(
+            source["envelope_generation"],
+            source["instance_secret_generation"],
+        )
         self.assertEqual(recovered["instance_id"], source["instance_id"])
         self.assertEqual(recovered["vault_id"], source["vault_id"])
         self.assertTrue(recovered["record_ciphertexts_byte_identical"])
@@ -986,7 +1064,22 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(manifest["instance_id"], source["instance_id"])
         self.assertEqual(manifest["vault_id"], source["vault_id"])
         self.assertEqual(manifest["source_cut_cursor"], source["cut_cursor"])
-        self.assertEqual(manifest["envelope_generation"], source["envelope_generation"])
+        self.assertEqual(
+            manifest["source_envelope_generation"],
+            source["envelope_generation"],
+        )
+        self.assertEqual(
+            manifest["source_instance_secret_generation"],
+            source["instance_secret_generation"],
+        )
+        self.assertEqual(
+            parse_uint64(recovered["new_envelope_generation"]),
+            parse_uint64(manifest["source_envelope_generation"]) + 1,
+        )
+        self.assertEqual(
+            parse_uint64(recovered["new_instance_secret_generation"]),
+            parse_uint64(manifest["source_instance_secret_generation"]) + 1,
+        )
         self.assertEqual(
             set(manifest),
             set(self.wire["$defs"]["host_recovery_manifest"]["required"]),
@@ -1055,6 +1148,13 @@ class SyncProtocolSpecTests(unittest.TestCase):
             imported["conflicting_duplicate_marker"],
             "refuse_recovery_import",
         )
+        self.assertTrue(
+            imported[
+                "staged_envelope_and_reconstructed_retired_devices_are_activation_baseline"
+            ]
+        )
+        self.assertFalse(imported["activation_baseline_rows_receive_change_cursors"])
+        self.assertTrue(imported["mandatory_post_recovery_enrollment_cursor_reserved"])
         self.assertTrue(imported["all_source_device_ids_marked_retired"])
         self.assertTrue(
             imported[
@@ -1097,25 +1197,105 @@ class SyncProtocolSpecTests(unittest.TestCase):
             cursors["recovering_device_resumes_delta_after_cursor"],
             cursors["destination_import_end_cursor"],
         )
+        enrollment_cursor = parse_uint64(
+            cursors["mandatory_post_recovery_enrollment_cursor"]
+        )
+        self.assertEqual(
+            enrollment_cursor,
+            parse_uint64(cursors["destination_import_end_cursor"]) + 1,
+        )
+        self.assertEqual(
+            fixture["post_import_enrollment"]["device_state_change_cursor"],
+            cursors["mandatory_post_recovery_enrollment_cursor"],
+        )
         capacity = fixture["cursor_capacity"]
         item_count = parse_uint64(capacity["imported_item_count"])
+        reserved_enrollment_count = parse_uint64(
+            capacity["reserved_enrollment_cursor_count"]
+        )
+        self.assertEqual(reserved_enrollment_count, 1)
         exact_fit = capacity["exact_fit"]
         self.assertEqual(
             parse_uint64(exact_fit["source_cut_cursor"]) + item_count,
             parse_uint64(exact_fit["destination_import_end_cursor"]),
         )
         self.assertEqual(
-            parse_uint64(exact_fit["destination_import_end_cursor"]),
+            parse_uint64(exact_fit["destination_import_end_cursor"])
+            + reserved_enrollment_count,
+            parse_uint64(exact_fit["mandatory_post_recovery_enrollment_cursor"]),
+        )
+        self.assertEqual(
+            parse_uint64(exact_fit["mandatory_post_recovery_enrollment_cursor"]),
             (1 << 64) - 1,
         )
+        self.assertEqual(exact_fit["result"], "accepted")
         overflow = capacity["overflow"]
-        self.assertGreater(
+        self.assertEqual(
             parse_uint64(overflow["source_cut_cursor"]) + item_count,
+            (1 << 64) - 1,
+        )
+        self.assertGreater(
+            parse_uint64(overflow["source_cut_cursor"])
+            + item_count
+            + reserved_enrollment_count,
             (1 << 64) - 1,
         )
         self.assertEqual(overflow["result"], "server_cursor_exhausted")
         self.assertFalse(overflow["staging_state_created"])
         self.assertTrue(capacity["checked_at_recovery_begin_and_finalize"])
+        generation_capacity = fixture["generation_capacity"]
+        self.assertTrue(generation_capacity["source_generations_diverge"])
+        self.assertTrue(
+            generation_capacity["checked_successors_at_recovery_begin_and_finalize"]
+        )
+        for fixture_name, source_field, destination_field in (
+            (
+                "envelope_generation",
+                "source_envelope_generation",
+                "new_envelope_generation",
+            ),
+            (
+                "instance_secret_generation",
+                "source_instance_secret_generation",
+                "new_instance_secret_generation",
+            ),
+        ):
+            transition = generation_capacity[fixture_name]
+            source_generation = parse_uint64(transition["source"])
+            destination_generation = parse_uint64(transition["destination"])
+            self.assertEqual(
+                transition["source"],
+                manifest[source_field],
+            )
+            self.assertEqual(
+                transition["destination"],
+                recovered[destination_field],
+            )
+            self.assertEqual(destination_generation, source_generation + 1)
+        self.assertEqual(
+            {
+                overflow_case["source_field"]
+                for overflow_case in generation_capacity["overflow_cases"]
+            },
+            {
+                "source_envelope_generation",
+                "source_instance_secret_generation",
+            },
+        )
+        for overflow_case in generation_capacity["overflow_cases"]:
+            self.assertEqual(
+                parse_uint64(overflow_case["source_value"]),
+                (1 << 64) - 1,
+            )
+            self.assertEqual(
+                overflow_case["result"],
+                "recovery_generation_exhausted",
+            )
+            self.assertFalse(overflow_case["staging_state_created"])
+        self.assertEqual(
+            fixture["failure_rules"]["source_generation_has_no_uint64_successor"],
+            "recovery_generation_exhausted",
+        )
         barrier = fixture["post_import_collection_barrier"]
         persisted = vector_map({"version_vector": barrier["persisted_frontier"]})
         self.assertEqual(
@@ -1149,6 +1329,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
             "recovery never resets the barrier",
             normalized_threat,
         )
+        self.assertIn("recovery_generation_exhausted", normalized_protocol)
 
     def _assert_record_revision_shape(self, revision: dict) -> None:
         for field in ("record_id", "revision_id", "author_device_id"):

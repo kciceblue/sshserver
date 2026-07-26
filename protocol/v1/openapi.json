@@ -119,7 +119,8 @@
           "410": {"$ref": "#/components/responses/Error"},
           "426": {"$ref": "#/components/responses/Error"},
           "429": {"$ref": "#/components/responses/Error"},
-          "500": {"$ref": "#/components/responses/Error"}
+          "500": {"$ref": "#/components/responses/Error"},
+          "507": {"$ref": "#/components/responses/Error"}
         }
       }
     },
@@ -228,7 +229,7 @@
         },
         "responses": {
           "201": {
-            "description": "Stable snapshot cut and first page token created",
+            "description": "Stable snapshot cut and first page token created; requires snapshot-read-v1 and snapshot-collection-markers-v1",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_create_response"}
@@ -236,7 +237,7 @@
             }
           },
           "200": {
-            "description": "Idempotent snapshot creation retry",
+            "description": "Idempotent snapshot creation retry; requires snapshot-read-v1 and snapshot-collection-markers-v1",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_create_response"}
@@ -279,7 +280,7 @@
         },
         "responses": {
           "200": {
-            "description": "One stable phase page containing retained undominated revisions or persistent collection markers in key order",
+            "description": "One stable phase page containing retained undominated revisions or persistent collection markers in key order; requires snapshot-read-v1 and snapshot-collection-markers-v1",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_page_response"}

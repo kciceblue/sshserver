@@ -48,6 +48,7 @@
     {"client_min": "1", "client_max": "1", "server_min": "1", "server_max": "1", "result": "protocol_1"},
     {"client_min": "2", "client_max": "2", "server_min": "1", "server_max": "1", "result": "unsupported_protocol", "http_status": 426},
     {"client_min": "1", "client_max": "1", "missing_required_capability": "envelope-cas-v1", "result": "unsupported_capability", "http_status": 426},
+    {"client_min": "1", "client_max": "1", "missing_required_capability": "snapshot-collection-markers-v1", "operation": "snapshot_read", "result": "unsupported_capability", "http_status": 426},
     {"client_min": "1", "client_max": "1", "unknown_crypto_suite": "future-suite", "result": "preserve_opaque_and_block_write"}
   ]
 }
