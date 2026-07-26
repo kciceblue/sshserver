@@ -507,6 +507,70 @@ def dominates(left: dict[str, int], right: dict[str, int]) -> bool:
     )
 
 
+def snapshot_has_single_revision_continuity_witness(
+    prior_revision: dict,
+    incoming_revisions: list[dict],
+    incoming_markers: list[dict],
+) -> bool:
+    """Require one authenticated item to cover one retained prior sibling."""
+    record_id = prior_revision["record_id"]
+    prior_vector = canonical_vector_map(prior_revision["version_vector"])
+    same_id_revisions = [
+        incoming
+        for incoming in incoming_revisions
+        if incoming["record_id"] == record_id
+        and incoming["revision_id"] == prior_revision["revision_id"]
+    ]
+    if any(incoming != prior_revision for incoming in same_id_revisions):
+        return False
+    if same_id_revisions:
+        return True
+    for incoming in incoming_revisions:
+        if incoming["record_id"] != record_id:
+            continue
+        if dominates(
+            canonical_vector_map(incoming["version_vector"]),
+            prior_vector,
+        ):
+            return True
+    verified_markers = [
+        marker
+        for marker in incoming_markers
+        if marker["record_id"] == record_id
+        and marker.get("verified") is True
+    ]
+    same_witness_markers = [
+        marker
+        for marker in verified_markers
+        if marker["witness_revision_id"] == prior_revision["revision_id"]
+    ]
+    prior_authenticator = prior_revision.get(
+        "collection_witness_authenticator"
+    )
+    for marker in same_witness_markers:
+        marker_authenticator = marker.get(
+            "collection_witness_authenticator"
+        )
+        marker_is_exact = (
+            prior_authenticator is not None
+            and canonical_vector_map(marker["frontier"]) == prior_vector
+            and marker_authenticator is not None
+            and hmac.compare_digest(
+                marker_authenticator,
+                prior_authenticator,
+            )
+        )
+        if not marker_is_exact:
+            return False
+    if same_witness_markers:
+        return True
+    for marker in verified_markers:
+        marker_vector = canonical_vector_map(marker["frontier"])
+        if dominates(marker_vector, prior_vector):
+            return True
+    return False
+
+
 def should_emit_collection_witness_authenticator(
     tombstone: bool,
     revision_vector: list[dict],
@@ -2862,7 +2926,219 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertTrue(
             ordinary["incoming_revision_aggregate_covers_prior_frontier"]
         )
+        self.assertTrue(
+            ordinary["every_prior_sibling_has_one_incoming_witness"]
+        )
+        revisions_by_id = {
+            revision["revision_id"]: revision
+            for revision in ordinary_revisions
+        }
+        self.assertEqual(
+            set(ordinary["prior_retained_revision_ids"]),
+            set(revisions_by_id),
+        )
+        for witness in ordinary["individual_continuity_witnesses"]:
+            self.assertEqual(witness["kind"], "byte_identical_revision")
+            self.assertEqual(
+                witness["prior_revision_id"],
+                witness["incoming_revision_id"],
+            )
+            prior_revision = copy.deepcopy(
+                revisions_by_id[witness["prior_revision_id"]]
+            )
+            self.assertTrue(
+                snapshot_has_single_revision_continuity_witness(
+                    prior_revision,
+                    ordinary_revisions,
+                    collection_markers,
+                )
+            )
+        same_id_modified_bytes = copy.deepcopy(ordinary_revisions[0])
+        same_id_modified_bytes["ciphertext"] = (
+            "AQAAAAAAAAAAAAAAAAAAAA"
+        )
+        self.assertFalse(
+            snapshot_has_single_revision_continuity_witness(
+                ordinary_revisions[0],
+                [same_id_modified_bytes, ordinary_revisions[1]],
+                collection_markers,
+            )
+        )
+        same_id_modified_and_higher = copy.deepcopy(
+            ordinary_revisions[0]
+        )
+        same_id_modified_and_higher["author_counter"] = "2"
+        same_id_modified_and_higher["version_vector"][0]["counter"] = "2"
+        same_id_modified_and_higher["ciphertext"] = (
+            "AQAAAAAAAAAAAAAAAAAAAA"
+        )
+        different_id_dominating = copy.deepcopy(
+            same_id_modified_and_higher
+        )
+        different_id_dominating["revision_id"] = (
+            "00000000-0000-4000-8000-000000000098"
+        )
+        self.assertFalse(
+            snapshot_has_single_revision_continuity_witness(
+                ordinary_revisions[0],
+                [
+                    different_id_dominating,
+                    same_id_modified_and_higher,
+                ],
+                [],
+            )
+        )
+        prior_tombstone = ordinary_revisions[1]
+        exact_witness_marker = {
+            "record_id": prior_tombstone["record_id"],
+            "witness_revision_id": prior_tombstone["revision_id"],
+            "frontier": prior_tombstone["version_vector"],
+            "collection_witness_authenticator": prior_tombstone[
+                "collection_witness_authenticator"
+            ],
+            "verified": True,
+        }
+        self.assertTrue(
+            snapshot_has_single_revision_continuity_witness(
+                prior_tombstone,
+                [],
+                [exact_witness_marker],
+            )
+        )
+        equal_vector_different_witness = copy.deepcopy(
+            exact_witness_marker
+        )
+        equal_vector_different_witness["witness_revision_id"] = (
+            "00000000-0000-4000-8000-000000000099"
+        )
+        self.assertFalse(
+            snapshot_has_single_revision_continuity_witness(
+                prior_tombstone,
+                [],
+                [equal_vector_different_witness],
+            )
+        )
+        same_witness_changed_tuple = copy.deepcopy(
+            exact_witness_marker
+        )
+        same_witness_changed_tuple["frontier"] = [
+            {
+                "device_id": "00000000-0000-4000-8000-000000000010",
+                "counter": "1",
+            },
+            {
+                "device_id": "00000000-0000-4000-8000-000000000011",
+                "counter": "2",
+            },
+        ]
+        same_witness_changed_tuple[
+            "collection_witness_authenticator"
+        ] = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        different_witness_dominating = copy.deepcopy(
+            same_witness_changed_tuple
+        )
+        different_witness_dominating["witness_revision_id"] = (
+            "00000000-0000-4000-8000-000000000097"
+        )
+        self.assertFalse(
+            snapshot_has_single_revision_continuity_witness(
+                prior_tombstone,
+                [],
+                [
+                    different_witness_dominating,
+                    same_witness_changed_tuple,
+                ],
+            )
+        )
         self.assertEqual(ordinary["result"], "accepted")
+        aggregate_only = checkpoint_coverage[
+            "aggregate_only_sibling_omission"
+        ]
+        aggregate_only_prior = [
+            {**revision, "record_id": aggregate_only["record_id"]}
+            for revision in aggregate_only["prior_retained_revisions"]
+        ]
+        aggregate_only_incoming = [
+            {**revision, "record_id": aggregate_only["record_id"]}
+            for revision in aggregate_only[
+                "incoming_authenticated_revisions"
+            ]
+        ]
+        prior_aggregate: dict[str, int] = {}
+        for revision in aggregate_only_prior:
+            for device_id, counter in vector_map(revision).items():
+                prior_aggregate[device_id] = max(
+                    prior_aggregate.get(device_id, 0),
+                    counter,
+                )
+        incoming_aggregate: dict[str, int] = {}
+        for revision in aggregate_only_incoming:
+            for device_id, counter in vector_map(revision).items():
+                incoming_aggregate[device_id] = max(
+                    incoming_aggregate.get(device_id, 0),
+                    counter,
+                )
+        self.assertEqual(
+            aggregate_only["aggregate_frontier_relation"],
+            "equal",
+        )
+        self.assertEqual(incoming_aggregate, prior_aggregate)
+        self.assertFalse(
+            aggregate_only[
+                "every_prior_sibling_has_one_incoming_witness"
+            ]
+        )
+        self.assertFalse(
+            any(
+                snapshot_has_single_revision_continuity_witness(
+                    prior_revision,
+                    aggregate_only_incoming,
+                    [],
+                )
+                for prior_revision in aggregate_only_prior
+            )
+        )
+        self.assertEqual(
+            aggregate_only["result"],
+            "rollback_or_fork_rejected",
+        )
+        one_item_each = checkpoint_coverage[
+            "one_item_per_prior_sibling"
+        ]
+        one_item_prior = [
+            {**revision, "record_id": one_item_each["record_id"]}
+            for revision in one_item_each["prior_retained_revisions"]
+        ]
+        one_item_revisions = [
+            {**revision, "record_id": one_item_each["record_id"]}
+            for revision in one_item_each[
+                "incoming_authenticated_revisions"
+            ]
+        ]
+        one_item_markers = [
+            {**marker, "record_id": one_item_each["record_id"]}
+            for marker in one_item_each["incoming_verified_markers"]
+        ]
+        self.assertTrue(
+            one_item_each[
+                "every_prior_sibling_has_one_incoming_witness"
+            ]
+        )
+        self.assertTrue(
+            all(
+                snapshot_has_single_revision_continuity_witness(
+                    prior_revision,
+                    one_item_revisions,
+                    one_item_markers,
+                )
+                for prior_revision in one_item_prior
+            )
+        )
+        self.assertEqual(one_item_each["result"], "accepted")
+        self.assertIn(
+            "vectors from multiple incoming items MUST NOT be joined to cover one prior sibling",
+            " ".join(self.protocol_text.split()),
+        )
         prior_marker_case = checkpoint_coverage["prior_marker_checkpoint"]
         incoming_prior_marker = next(
             marker

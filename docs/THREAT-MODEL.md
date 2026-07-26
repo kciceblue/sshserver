@@ -87,10 +87,11 @@ but cannot erase data or keys already present on that device.
    guessing.
 3. Per-device bearer credentials provide independently revocable server
    access without storing token plaintext server-side.
-4. Durable client checkpoints, including the complete per-record causal
-   frontier from every authenticated revision and marker plus the latest
-   authenticated monotonic marker tuple, detect rollback relative to state
-   that device has previously observed.
+4. Durable client checkpoints, including every still-retained exact
+   authenticated sibling, the complete per-record causal frontier from every
+   authenticated revision and marker, and the latest authenticated monotonic
+   marker tuple, detect rollback or selective sibling omission relative to
+   state that device has previously observed.
 5. Retention and acknowledgement rules prevent an honest server from collecting
    a deletion before every active device has durably observed it.
 6. Stable full snapshots return every undominated sibling, the single
@@ -135,7 +136,7 @@ V1 does not protect against:
 | Record swapping | Record/revision/vault IDs are authenticated as associated data | Reject and quarantine. |
 | Visible vector/frontier/tombstone/authorization alteration | Revision vectors, tombstone fields, and the null/non-null collection-witness authorization kind and bytes are bound by AEAD associated data; a non-null authorization is additionally a VMK-derived per-record witness HMAC that can survive as the marker certificate | Reject empty, duplicate, out-of-order, zero-valued, author-mismatched, noncanonical, or HMAC/AEAD-invalid input before comparison or local activation. Initial and non-dominating live revisions carry null and cannot authorize collection. The HMAC proves explicit authorization and tuple integrity, not server completeness or maximality; server-owned cursor/time remain non-authoritative. |
 | Replay of an older individual revision | Durable vectors/counters retain newer siblings | Ignore dominated replay and record diagnostic evidence. |
-| Selective or coherent valid-certificate rollback | Surviving device retains the complete durable causal frontier from all authenticated revisions and markers, plus the latest marker tuple and change checkpoint | Before accepting a marker, require its verified frontier to cover the full causal checkpoint; reject a valid but older revision/marker certificate, missing marker, weaker/incomparable frontier, or equal-vector/different-witness tuple. Acknowledgement alone never discards the evidence. A fresh device with no checkpoint cannot prove freshness. |
+| Selective or coherent valid-certificate rollback | Surviving device retains each still-retained exact authenticated sibling, the complete durable causal frontier from all authenticated revisions and markers, plus the latest marker tuple and change checkpoint | Before snapshot replacement, require every retained prior sibling to reappear with the same ID and authenticated bytes or have one different authenticated revision or verified marker that individually witnesses or strictly dominates it; never join several incoming vectors as a substitute. Same-ID changed bytes and same-witness-ID changed marker tuples are equivocation even with a higher vector. A marker permits pruning only after that one marker individually covers every retained sibling as well as the aggregate frontier. Separately require prior-marker continuity and aggregate causal-frontier coverage, rejecting valid but older certificates, selective sibling omission, missing markers, weaker/incomparable frontiers, or equal-vector/different-identity tuples. Acknowledgement alone never discards the evidence. A fresh device with no checkpoint cannot prove freshness. |
 | Server equivocation/fork | Different clients can receive different valid histories | V1 has no transparency log. It can detect contradictions when histories meet but cannot guarantee timely fork detection. |
 | Version-vector inflation by host | Host cannot forge valid record AD | Reject altered records. It can omit data or deny service. |
 | Version-vector inflation by enrolled malicious device | Device with VMK can create valid data; server enforces sequential author counters | Limit prevents large jumps but not deliberate valid churn. Revoke device; availability impact remains. |
@@ -265,7 +266,8 @@ The implementation must eventually demonstrate:
   projection copied independently of live rows, content-addressed immutable
   revision references, bounded active metadata/allocation rate, live-state
   authentication on every page, expiry discard, and exact cut-to-delta
-  transition;
+  transition, with per-prior-sibling continuity checks that cannot be replaced
+  by aggregate-vector coverage;
 - constant-time grant/token-hash comparison;
 - structured log redaction tests covering every credential and ciphertext
   field;

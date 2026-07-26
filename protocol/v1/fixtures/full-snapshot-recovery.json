@@ -343,10 +343,105 @@
         "record_id": "00000000-0000-4000-8000-000000000020",
         "prior_marker_checkpoint_present": false,
         "prior_durable_frontier": [
-          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"},
+          {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+        ],
+        "prior_retained_revision_ids": [
+          "00000000-0000-4000-8000-000000000021",
+          "00000000-0000-4000-8000-000000000022"
         ],
         "incoming_marker_present": false,
+        "individual_continuity_witnesses": [
+          {
+            "prior_revision_id": "00000000-0000-4000-8000-000000000021",
+            "kind": "byte_identical_revision",
+            "incoming_revision_id": "00000000-0000-4000-8000-000000000021"
+          },
+          {
+            "prior_revision_id": "00000000-0000-4000-8000-000000000022",
+            "kind": "byte_identical_revision",
+            "incoming_revision_id": "00000000-0000-4000-8000-000000000022"
+          }
+        ],
         "incoming_revision_aggregate_covers_prior_frontier": true,
+        "every_prior_sibling_has_one_incoming_witness": true,
+        "result": "accepted"
+      },
+      "aggregate_only_sibling_omission": {
+        "record_id": "00000000-0000-4000-8000-000000000060",
+        "prior_retained_revisions": [
+          {
+            "revision_id": "00000000-0000-4000-8000-000000000061",
+            "version_vector": [
+              {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
+              {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+            ]
+          },
+          {
+            "revision_id": "00000000-0000-4000-8000-000000000062",
+            "version_vector": [
+              {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"},
+              {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "2"}
+            ]
+          }
+        ],
+        "incoming_authenticated_revisions": [
+          {
+            "revision_id": "00000000-0000-4000-8000-000000000063",
+            "version_vector": [
+              {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"}
+            ]
+          },
+          {
+            "revision_id": "00000000-0000-4000-8000-000000000064",
+            "version_vector": [
+              {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "2"}
+            ]
+          }
+        ],
+        "incoming_verified_markers": [],
+        "aggregate_frontier_relation": "equal",
+        "every_prior_sibling_has_one_incoming_witness": false,
+        "result": "rollback_or_fork_rejected"
+      },
+      "one_item_per_prior_sibling": {
+        "record_id": "00000000-0000-4000-8000-000000000060",
+        "prior_retained_revisions": [
+          {
+            "revision_id": "00000000-0000-4000-8000-000000000061",
+            "version_vector": [
+              {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
+              {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+            ]
+          },
+          {
+            "revision_id": "00000000-0000-4000-8000-000000000062",
+            "version_vector": [
+              {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"},
+              {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "2"}
+            ]
+          }
+        ],
+        "incoming_authenticated_revisions": [
+          {
+            "revision_id": "00000000-0000-4000-8000-000000000065",
+            "version_vector": [
+              {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "3"},
+              {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+            ]
+          }
+        ],
+        "incoming_verified_markers": [
+          {
+            "witness_revision_id": "00000000-0000-4000-8000-000000000066",
+            "frontier": [
+              {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"},
+              {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "3"}
+            ],
+            "verified": true
+          }
+        ],
+        "every_prior_sibling_has_one_incoming_witness": true,
         "result": "accepted"
       },
       "prior_marker_checkpoint": {

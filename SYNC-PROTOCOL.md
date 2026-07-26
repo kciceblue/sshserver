@@ -803,11 +803,18 @@ synthesize a collection-marker frontier.
 The client also persists that component-wise maximum as the complete durable
 per-record causal frontier across every authenticated revision and verified
 marker it has ever accepted. Acknowledging a server cursor does not erase this
-causal evidence. The client retains the authenticated revision bytes and
-frontier at least until it has verified and durably checkpointed a marker whose
-frontier equals or strictly dominates the complete durable frontier. It may
-then prune local revision bytes under its local policy, but the causal frontier
-and latest marker tuple remain durable rollback evidence.
+causal evidence. While revision bytes remain locally retained, the checkpoint
+also retains the exact authenticated wire object for every undominated sibling;
+the component-wise aggregate is not a substitute for any one sibling. The
+client retains those authenticated revision bytes and frontiers at least until
+it has verified and durably checkpointed one marker whose frontier equals or
+strictly dominates the complete durable frontier and which, for every retained
+sibling, either names that exact revision ID/vector/authenticator as its
+witness or strictly dominates that sibling's vector. Only then may it prune
+local revision bytes under its local policy; the causal frontier and latest
+marker tuple remain durable rollback evidence. Reusing a retained sibling's
+revision ID with a changed marker vector or authenticator is equivocation, not
+strict domination.
 
 Counters never wrap. A device at `UInt64.max` receives `counter_exhausted`, is
 made read-only, and must enroll with a new device ID before creating further
@@ -966,16 +973,35 @@ followed by delayed stale upload cannot resurrect collected state. A surviving
 client durably checkpoints the latest verified marker tuple and the complete
 causal frontier from all authenticated revisions and markers per record.
 Before accepting any marker, its verified frontier MUST equal or strictly
-dominate that complete durable frontier. Delta processing then accepts only an
-exact marker replay or a valid strictly dominating replacement, and rejects a
-missing, weaker, incomparable, or equal-vector/different-witness marker. For
+dominate that complete durable frontier and the one marker MUST individually
+cover every still-retained sibling: it either names that sibling's exact
+revision ID/vector/authenticator as its witness or strictly dominates that
+sibling's vector. A marker that reuses a retained sibling's revision ID with a
+changed vector or authenticator is equivocation and is rejected before
+dominance comparison. Delta processing then accepts only an exact marker replay
+or a valid strictly dominating replacement, and rejects a missing, weaker,
+incomparable, aggregate-only, or equal-vector/different-witness marker. For
 every prior marker checkpoint, a full snapshot MUST contain that exact marker
 or a valid strictly dominating replacement, even when its cut cursor is newer.
-Independently, the aggregate causal frontier formed from every authenticated
-snapshot revision and verified snapshot marker for each record MUST equal or
-strictly dominate that record's complete durable causal frontier. No marker is
-required for an ordinary record that had no prior marker checkpoint when the
-snapshot revisions alone cover its durable frontier. A valid older revision
+For every exact authenticated revision object still retained in the local
+checkpoint, one same-record incoming item MUST independently prove continuity:
+either the same `revision_id` reappears with every authenticated field, nonce,
+and ciphertext byte unchanged, one authenticated incoming revision strictly
+dominates its vector, or one verified incoming marker names it as the exact
+witness with the same vector and authenticator or strictly dominates its
+vector. Reuse of the same `revision_id` with any changed authenticated field,
+nonce, or ciphertext is revision equivocation and fails activation even if its
+changed vector would dominate. Likewise, a marker that names the same witness
+revision ID with a changed vector or authenticator is equivocation and cannot
+use the strict-domination branch. Equal-vector/different-ID revisions do not
+cover one another, and vectors from multiple incoming items MUST NOT be joined
+to cover one prior sibling. Independently, the aggregate
+causal frontier formed from every authenticated snapshot revision and verified
+snapshot marker for each record MUST equal or strictly dominate that record's
+complete durable causal frontier, including causal evidence whose revision
+bytes were already pruned. No marker is required for an ordinary record that
+had no prior marker checkpoint when the snapshot revisions alone provide both
+per-sibling continuity and aggregate coverage. A valid older revision
 certificate or marker can therefore be replayed only as selective omission or
 coherent full-state rollback, which a surviving checkpoint detects. A newly
 enrolled device with no independent checkpoint cannot prove that a coherent
@@ -1147,14 +1173,25 @@ MUST appear in `source_devices`, and each referenced counter MUST be at most
 that entry's `max_author_counter`. Before activation, every prior marker
 checkpoint MUST have an exact incoming marker or a valid strictly dominating
 replacement; missing, weaker, incomparable, or equal-vector/different-witness
-input is rollback/fork evidence. Separately, for every locally checkpointed
-record, the aggregate frontier from all authenticated incoming revisions and
-verified incoming markers MUST equal or strictly dominate the complete durable
-causal frontier. An ordinary record with no prior marker needs no marker when
-its incoming revisions provide that coverage. The client retains every marker
-and source device separately; it never drops or weakens a frontier because the
-corresponding revision bytes are absent, and never infers that an absent device
-ID is reusable. It then calls `/v1/sync` with `after_cursor = C` and may set
+input is rollback/fork evidence. Each exact authenticated prior sibling still
+retained in the local checkpoint MUST also have one same-record continuity
+witness: the same-ID revision with every authenticated field, nonce, and
+ciphertext byte unchanged, one authenticated revision that strictly dominates
+it, or one verified marker that exactly witnesses it or strictly dominates it.
+A same-ID revision with any changed authenticated field, nonce, or ciphertext
+is revision equivocation and fails activation before other witnesses are
+considered. A marker that reuses that revision ID with a changed vector or
+authenticator is the same kind of equivocation and cannot count as a strictly
+dominating marker. Combining several incoming vectors to cover one prior
+sibling is forbidden. Separately, for every locally checkpointed record, the
+aggregate frontier from all authenticated incoming revisions and verified
+incoming markers MUST equal or strictly dominate the complete durable causal
+frontier. An ordinary record with no prior marker needs no marker when its
+incoming revisions satisfy both individual sibling continuity and aggregate
+coverage. The client retains every marker and source device separately; it
+never drops or weakens a frontier because the corresponding revision bytes are
+absent, and never infers that an absent device ID is reusable. It then calls
+`/v1/sync` with `after_cursor = C` and may set
 `ack_cursor = C` only after the complete snapshot is durable. The first delta
 therefore returns every change at C+1 or later, including envelope changes.
 `snapshot_expired` or `snapshot_not_found` requires discarding the entire
@@ -1490,7 +1527,8 @@ Before this draft becomes approved:
    fixtures and agree byte-for-byte.
 4. Wire fixtures must demonstrate enrollment retry, self-only token rotation,
    deterministic mutation order, sibling-complete snapshot pagination and delta
-   transition, marker- and device-registry-capability negotiation, bounded
+   transition, per-prior-sibling snapshot continuity without aggregate-vector
+   substitution, marker- and device-registry-capability negotiation, bounded
    snapshot allocation with fail-before-retain behavior, conflict retention,
    later-sibling tombstone barriers, identity-preserving host recovery with
    independent generation successors, raw-body digest sensitivity, complete
