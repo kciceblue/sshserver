@@ -85,6 +85,7 @@
     "/v1/enrollments": {
       "post": {
         "operationId": "createEnrollment",
+        "description": "Transactional enrollment. A valid replacement grant with the exact retained enrollment tuple recovers a recorded success without creating or updating a second device.",
         "security": [{"enrollmentGrant": []}],
         "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
         "requestBody": {
@@ -105,7 +106,7 @@
             }
           },
           "200": {
-            "description": "Byte-equivalent idempotent retry",
+            "description": "Exact-tuple recovery of the recorded result with no device state change",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/enrollment_response"}

@@ -15,6 +15,7 @@
     },
     "base64url": {
       "type": "string",
+      "description": "Unpadded RFC 4648 base64url. After this structural schema match, implementations MUST strictly decode, re-encode without padding, and require byte-for-byte equality to reject noncanonical unused trailing bits.",
       "pattern": "^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2,3})?$"
     },
     "timestamp": {

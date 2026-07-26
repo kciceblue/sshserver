@@ -123,9 +123,13 @@ Unsigned 64-bit values are canonical JSON decimal strings in the inclusive
 range `0` through `18446744073709551615`. The wire schema rejects larger
 strings, and every implementation MUST additionally use checked unsigned
 64-bit parsing before arithmetic or comparison. Binary values use unpadded RFC
-4648 base64url. Times are UTC RFC 3339 strings with exactly millisecond
-precision; server times are informational and MUST NOT resolve conflicts or
-authorize an operation.
+4648 base64url. A schema match is not sufficient to establish canonicality:
+readers MUST decode with a strict base64url decoder, re-encode the decoded
+bytes as unpadded base64url, and reject the value with `invalid_request` unless
+the re-encoding is byte-for-byte equal to the input. This rejects non-zero
+unused bits in a final two- or three-character quantum. Times are UTC RFC 3339
+strings with exactly millisecond precision; server times are informational and
+MUST NOT resolve conflicts or authorize an operation.
 
 Every request sends:
 
@@ -219,9 +223,11 @@ The grant expires five minutes after creation. The grant authorizes exactly one
 state-changing enrollment transaction. That first successful transaction
 consumes it. A later byte-equivalent retry may retrieve the recorded result as
 described in section 6, but the consumed grant cannot authorize another state
-change. The command MUST suppress shell tracing and MUST NOT put secrets in
-command-line arguments, environment variables, persistent logs, or
-service-manager configuration.
+change. Exact recovery with a replacement grant also consumes that grant, but
+does not exercise or preserve its authority to create enrollment state. The
+command MUST suppress shell tracing and MUST NOT put secrets in command-line
+arguments, environment variables, persistent logs, or service-manager
+configuration.
 
 Grant lifetime is measured with the daemon's monotonic clock and is bound to a
 random daemon boot ID. An unconsumed grant becomes invalid when that daemon
@@ -243,9 +249,13 @@ The proposed retry-safe enrollment is client-token-generated:
    JSON library.
 3. Through the SSH forward, it calls `POST /v1/enrollments` with the grant,
    IDs, token, and the fixed V1 scope set.
-4. In one database transaction the server validates and consumes the grant,
-   stores the token hash, creates the device, and records the enrollment ID,
-   request fingerprint, and result against the consumed grant hash.
+4. In one database transaction the server validates the grant, looks up the
+   enrollment ID before attempting any insert, and either performs the new
+   enrollment or recovers an exact prior enrollment as described below. A new
+   enrollment consumes the grant, stores the token hash, creates the device,
+   and records the enrollment ID, request fingerprint, and result against the
+   consumed grant hash. Enrollment IDs and device IDs are independently unique
+   within the instance and vault.
 5. When that consumed grant is presented again, a byte-equivalent retry with
    the same enrollment ID, device ID, token hash, and fixed scope set returns
    the original success. The server returns the recorded success without
@@ -254,8 +264,28 @@ The proposed retry-safe enrollment is client-token-generated:
    matching recorded enrollment returns `grant_consumed`.
 6. After success the client promotes the pending token to active Keychain
    state. If it never receives success, it may repeat the same request until
-   grant expiry, then use SSH to create a new grant while retaining the same
-   enrollment tuple.
+   grant expiry. It MUST retain the pending tuple until the outcome is known.
+7. After expiry or a daemon restart, the client creates a replacement grant
+   through verified SSH and submits the exact same enrollment ID, device ID,
+   token, and scopes. In one transaction the server looks up the enrollment ID
+   before inserting a device:
+   - If no enrollment or device uses either retained ID, the original request
+     did not commit. The server consumes the replacement grant, creates exactly
+     one device and enrollment record, and returns `201`.
+   - If the enrollment ID, device ID, token hash, and scopes exactly match the
+     durable enrollment record, the original request committed. The server
+     consumes the replacement grant, associates its hash with that record, and
+     returns the recorded original result with `200`; it does not insert or
+     update a device, change the active-device count, or reapply any enrollment
+     side effect.
+   - If either retained ID exists but the full tuple does not match, the server
+     returns `enrollment_replay_mismatch` without consuming the replacement
+     grant or changing state.
+
+This lookup-before-insert rule makes the two possible lost-response outcomes
+converge without allowing a fresh grant to duplicate an already committed
+device. Subsequent exact retries with the replacement grant retrieve the same
+recorded result under the consumed-grant rule in step 5.
 
 ### 6.1 First vault and later-device state machine
 

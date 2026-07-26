@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 from pathlib import Path
 import re
@@ -76,7 +77,18 @@ def assert_uuid_v4(test: unittest.TestCase, value: str) -> None:
 def decode_base64url(value: str) -> bytes:
     if "=" in value or re.search(r"[^A-Za-z0-9_-]", value):
         raise ValueError("not canonical unpadded base64url")
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    try:
+        decoded = base64.b64decode(
+            value + "=" * (-len(value) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("not canonical unpadded base64url") from error
+    reencoded = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+    if reencoded != value:
+        raise ValueError("not canonical unpadded base64url")
+    return decoded
 
 
 def parse_uint64(value: str) -> int:
@@ -354,16 +366,54 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_uint64(value)
 
-    def test_base64url_schema_rejects_impossible_unpadded_lengths(self) -> None:
+    def test_base64url_schema_and_semantic_parser_require_canonical_bits(
+        self,
+    ) -> None:
         pattern = re.compile(self.wire["$defs"]["base64url"]["pattern"])
-        accepted = ("", "AA", "AAA", "AAAA", "AAAAAA", "AAAAAAA", "AAAAAAAA")
-        rejected = ("A", "AAAAA", "AAAAAAAAA", "AA=", "AA+")
-        for value in accepted:
+        structurally_valid = (
+            "",
+            "AA",
+            "AQ",
+            "_w",
+            "AAA",
+            "AAE",
+            "__8",
+            "AAAA",
+            "AAAAAA",
+            "AAAAAAA",
+            "AAAAAAAA",
+        )
+        structurally_invalid = ("A", "AAAAA", "AAAAAAAAA", "AA=", "AA+")
+        noncanonical_trailing_bits = (
+            "AB",
+            "A_",
+            "AAB",
+            "AA_",
+            "AAAAAB",
+            "AAAAAAB",
+        )
+        for value in structurally_valid:
             with self.subTest(value=value, result="accepted"):
                 self.assertIsNotNone(pattern.fullmatch(value))
-        for value in rejected:
+                decoded = decode_base64url(value)
+                self.assertEqual(
+                    base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii"),
+                    value,
+                )
+        for value in structurally_invalid:
             with self.subTest(value=value, result="rejected"):
                 self.assertIsNone(pattern.fullmatch(value))
+                with self.assertRaises(ValueError):
+                    decode_base64url(value)
+        for value in noncanonical_trailing_bits:
+            with self.subTest(value=value, result="noncanonical-trailing-bits"):
+                self.assertIsNotNone(pattern.fullmatch(value))
+                with self.assertRaises(ValueError):
+                    decode_base64url(value)
+        self.assertIn(
+            "strictly decode, re-encode without padding, and require byte-for-byte equality",
+            self.wire["$defs"]["base64url"]["description"],
+        )
 
     def test_enrollment_grant_is_consumed_once_but_exact_retry_returns_result(
         self,
@@ -385,6 +435,36 @@ class SyncProtocolSpecTests(unittest.TestCase):
         idempotency = self.fixtures["enrollment.json"]["idempotency"]
         self.assertTrue(idempotency["grant_consumed_after_success"])
         self.assertEqual(idempotency["byte_equivalent_retry_status"], 200)
+        recovery = idempotency["lost_response_recovery"]
+        self.assertEqual(recovery["lookup_before_insert"], "enrollment_id")
+        self.assertTrue(recovery["retains_original_tuple"])
+        self.assertTrue(recovery["requires_valid_replacement_grant_after_expiry"])
+        self.assertEqual(recovery["original_did_not_commit_status"], 201)
+        self.assertEqual(recovery["original_committed_status"], 200)
+        self.assertEqual(recovery["original_committed_device_rows_created"], 0)
+        self.assertEqual(recovery["original_committed_device_rows_updated"], 0)
+        self.assertTrue(recovery["replacement_grant_consumed_on_success"])
+        self.assertEqual(recovery["retained_id_mismatch_status"], 409)
+        self.assertEqual(
+            recovery["retained_id_mismatch_error"],
+            "enrollment_replay_mismatch",
+        )
+        self.assertFalse(
+            recovery["retained_id_mismatch_consumes_replacement_grant"]
+        )
+        enrollment_api = self.openapi["paths"]["/v1/enrollments"]["post"]
+        self.assertIn("valid replacement grant", enrollment_api["description"])
+        self.assertIn(
+            "no device state change",
+            enrollment_api["responses"]["200"]["description"],
+        )
+        for claim in (
+            "The server consumes the replacement grant, associates its hash with that record, and returns the recorded original result with `200`",
+            "it does not insert or update a device, change the active-device count, or reapply any enrollment side effect",
+            "returns `enrollment_replay_mismatch` without consuming the replacement grant or changing state",
+        ):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, normalized_protocol)
 
     def test_enrollment_fixture_is_retry_safe_and_has_exact_sizes(self) -> None:
         fixture = self.fixtures["enrollment.json"]

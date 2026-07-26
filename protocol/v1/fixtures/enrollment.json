@@ -53,6 +53,19 @@
     "byte_equivalent_retry_status": 200,
     "mismatched_tuple_status": 409,
     "mismatched_tuple_error": "enrollment_replay_mismatch",
-    "grant_consumed_after_success": true
+    "grant_consumed_after_success": true,
+    "lost_response_recovery": {
+      "lookup_before_insert": "enrollment_id",
+      "retains_original_tuple": true,
+      "requires_valid_replacement_grant_after_expiry": true,
+      "original_did_not_commit_status": 201,
+      "original_committed_status": 200,
+      "original_committed_device_rows_created": 0,
+      "original_committed_device_rows_updated": 0,
+      "replacement_grant_consumed_on_success": true,
+      "retained_id_mismatch_status": 409,
+      "retained_id_mismatch_error": "enrollment_replay_mismatch",
+      "retained_id_mismatch_consumes_replacement_grant": false
+    }
   }
 }
