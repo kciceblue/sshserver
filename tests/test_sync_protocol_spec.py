@@ -4,6 +4,7 @@ import base64
 import binascii
 import copy
 import hashlib
+import hmac
 import json
 from pathlib import Path
 import re
@@ -58,7 +59,11 @@ DEVICE_LOCAL_FIELDS = {
 BACKUP_MANIFEST_PATHS = frozenset({"config.json", "instance-secret", "sync.db"})
 ED25519_PKCS8_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+P256_SPKI_PREFIX = bytes.fromhex(
+    "3059301306072a8648ce3d020106082a8648ce3d030107034200"
+)
 SNAPSHOT_REQUIRED_CAPABILITIES = [
+    "authenticated-collection-frontiers-v2",
     "snapshot-collection-markers-v1",
     "snapshot-device-registry-v1",
     "snapshot-read-v1",
@@ -101,6 +106,105 @@ def decode_base64url(value: str) -> bytes:
     if reencoded != value:
         raise ValueError("not canonical unpadded base64url")
     return decoded
+
+
+def lp(value: bytes) -> bytes:
+    return struct.pack(">I", len(value)) + value
+
+
+def hkdf_sha256_extract(salt: bytes, ikm: bytes) -> bytes:
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def hkdf_sha256_expand_32(prk: bytes, info: bytes) -> bytes:
+    return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+
+
+def collection_witness_key(
+    vmk: bytes,
+    instance_id: str,
+    vault_id: str,
+    record_id: str,
+    crypto_suite_id: int = 2,
+) -> bytes:
+    prk = hkdf_sha256_extract(uuid.UUID(record_id).bytes, vmk)
+    info = (
+        lp(b"JAT collection witness key v1")
+        + struct.pack(">HH", 1, crypto_suite_id)
+        + uuid.UUID(instance_id).bytes
+        + uuid.UUID(vault_id).bytes
+        + uuid.UUID(record_id).bytes
+    )
+    return hkdf_sha256_expand_32(prk, info)
+
+
+def compute_collection_witness_authenticator(
+    vmk: bytes,
+    instance_id: str,
+    vault_id: str,
+    record_id: str,
+    witness_revision_id: str,
+    frontier: list[dict],
+    crypto_suite_id: int = 2,
+) -> bytes:
+    vector = canonical_vector_map(frontier)
+    vector_bytes = b"".join(
+        uuid.UUID(device_id).bytes + struct.pack(">Q", counter)
+        for device_id, counter in vector.items()
+    )
+    message = (
+        lp(b"JAT collection witness authenticator v1")
+        + struct.pack(">HH", 1, crypto_suite_id)
+        + uuid.UUID(instance_id).bytes
+        + uuid.UUID(vault_id).bytes
+        + uuid.UUID(record_id).bytes
+        + uuid.UUID(witness_revision_id).bytes
+        + struct.pack(">H", len(vector))
+        + vector_bytes
+    )
+    return hmac.new(
+        collection_witness_key(
+            vmk,
+            instance_id,
+            vault_id,
+            record_id,
+            crypto_suite_id,
+        ),
+        message,
+        hashlib.sha256,
+    ).digest()
+
+
+def verify_marker_collection_witness_authenticator(
+    marker: dict,
+    vmk: bytes,
+    instance_id: str,
+    vault_id: str,
+    crypto_suite_id: int = 2,
+) -> None:
+    supplied = decode_base64url(marker["collection_witness_authenticator"])
+    if len(supplied) != 32:
+        raise ValueError("collection witness authenticator must be exactly 32 bytes")
+    expected = compute_collection_witness_authenticator(
+        vmk,
+        instance_id,
+        vault_id,
+        marker["record_id"],
+        marker["witness_revision_id"],
+        marker["frontier"],
+        crypto_suite_id,
+    )
+    if not hmac.compare_digest(supplied, expected):
+        raise ValueError("collection_witness_authenticator_mismatch")
+
+
+def collection_witness_ad_component(authenticator: str | None) -> bytes:
+    if authenticator is None:
+        return b"\x00"
+    decoded = decode_base64url(authenticator)
+    if len(decoded) != 32:
+        raise ValueError("collection witness authenticator must be exactly 32 bytes")
+    return b"\x01" + decoded
 
 
 def openssl_transform(arguments: list[str], input_bytes: bytes) -> bytes:
@@ -196,6 +300,71 @@ def validate_software_identity_keypair(body: dict) -> None:
         return
 
     raise ValueError(f"unsupported software identity key kind: {key_kind}")
+
+
+def ssh_fingerprint_p256(public_key: bytes) -> str:
+    def ssh_string(value: bytes) -> bytes:
+        return struct.pack(">I", len(value)) + value
+
+    public_blob = (
+        ssh_string(b"ecdsa-sha2-nistp256")
+        + ssh_string(b"nistp256")
+        + ssh_string(public_key)
+    )
+    digest = hashlib.sha256(public_blob).digest()
+    return "SHA256:" + base64.b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def validate_secure_enclave_public_key(body: dict) -> None:
+    """Enforce the V1 canonical public-only Secure Enclave identity shape."""
+    if body["key_kind"] != "secure_enclave_p256":
+        raise ValueError("wrong Secure Enclave key kind")
+    if body["public_key_encoding"] != "p256-x963-uncompressed-v1":
+        raise ValueError("wrong Secure Enclave public-key encoding")
+    public_key = decode_base64url(body["public_key"])
+    if len(public_key) != 65 or public_key[0] != 0x04:
+        raise ValueError("P-256 public key must be 65-byte uncompressed X9.63")
+    spki = P256_SPKI_PREFIX + public_key
+    canonical_spki = openssl_transform(
+        ["pkey", "-pubin", "-inform", "DER", "-pubout", "-outform", "DER"],
+        spki,
+    )
+    if canonical_spki != spki:
+        raise ValueError("P-256 point is invalid or not canonically encoded")
+    if ssh_fingerprint_p256(public_key) != body["fingerprint"]:
+        raise ValueError("Secure Enclave public-key fingerprint mismatch")
+
+
+def self_revocation_body_fingerprint(
+    instance_id: str,
+    vault_id: str,
+    target_device_id: str,
+    raw_body: bytes,
+) -> bytes:
+    return hashlib.sha256(
+        lp(b"JAT self revocation body fingerprint v1")
+        + uuid.UUID(instance_id).bytes
+        + uuid.UUID(vault_id).bytes
+        + uuid.UUID(target_device_id).bytes
+        + lp(raw_body)
+    ).digest()
+
+
+def self_revocation_replay_outcome(case: dict) -> tuple[str, int]:
+    exact = all(
+        case[field]
+        for field in (
+            "same_endpoint",
+            "same_token",
+            "same_target_device",
+            "same_header_request_id",
+            "same_body_request_id",
+            "same_exact_raw_body",
+        )
+    )
+    if exact:
+        return ("recorded_self_revocation_response", 200)
+    return ("token_revoked", 401)
 
 
 def parse_uint64(value: str) -> int:
@@ -336,6 +505,79 @@ def dominates(left: dict[str, int], right: dict[str, int]) -> bool:
     return all(left.get(key, 0) >= right.get(key, 0) for key in keys) and any(
         left.get(key, 0) > right.get(key, 0) for key in keys
     )
+
+
+def should_emit_collection_witness_authenticator(
+    tombstone: bool,
+    revision_vector: list[dict],
+    complete_durable_frontier: list[dict] | None,
+) -> bool:
+    if tombstone:
+        return True
+    if complete_durable_frontier is None:
+        return False
+    return dominates(
+        canonical_vector_map(revision_vector),
+        canonical_vector_map(complete_durable_frontier),
+    )
+
+
+def record_revision_ad(
+    revision: dict,
+    instance_id: str,
+    vault_id: str,
+    crypto_suite_id: int = 2,
+) -> bytes:
+    vector = canonical_vector_map(revision["version_vector"])
+    vector_bytes = b"".join(
+        uuid.UUID(device_id).bytes + struct.pack(">Q", counter)
+        for device_id, counter in vector.items()
+    )
+    return (
+        lp(b"JAT record revision AD v1")
+        + struct.pack(">HH", 1, crypto_suite_id)
+        + uuid.UUID(instance_id).bytes
+        + uuid.UUID(vault_id).bytes
+        + uuid.UUID(revision["record_id"]).bytes
+        + uuid.UUID(revision["revision_id"]).bytes
+        + uuid.UUID(revision["author_device_id"]).bytes
+        + struct.pack(">Q", parse_uint64(revision["author_counter"]))
+        + struct.pack(">H", parse_uint64(revision["payload_schema"]))
+        + bytes([1 if revision["tombstone"] else 0])
+        + struct.pack(">H", len(vector))
+        + vector_bytes
+        + collection_witness_ad_component(
+            revision["collection_witness_authenticator"]
+        )
+    )
+
+
+def marker_transition_outcome(
+    current_marker: dict | None,
+    proposed_marker: dict,
+) -> str:
+    if current_marker is None:
+        return "create"
+    if proposed_marker == current_marker:
+        return "idempotent_no_cursor"
+    current = canonical_vector_map(current_marker["frontier"])
+    proposed = canonical_vector_map(proposed_marker["frontier"])
+    if proposed == current:
+        return "revision_equivocation"
+    if dominates(proposed, current):
+        return "replace_same_record_row"
+    return "collection_ineligible"
+
+
+def marker_covers_durable_frontier(
+    marker: dict | None,
+    durable_frontier: list[dict],
+) -> bool:
+    if marker is None:
+        return False
+    marker_vector = canonical_vector_map(marker["frontier"])
+    checkpoint = canonical_vector_map(durable_frontier)
+    return marker_vector == checkpoint or dominates(marker_vector, checkpoint)
 
 
 def validate_backup_manifest_paths(
@@ -511,6 +753,65 @@ class SyncProtocolSpecTests(unittest.TestCase):
         for path in json_paths:
             with self.subTest(path=path.relative_to(ROOT)):
                 self.assertIsInstance(read_json(path), dict)
+
+    def test_every_fixture_revision_and_marker_has_draft2_collection_witness_authenticator(self) -> None:
+        revision_count = 0
+        null_revision_authenticator_count = 0
+        non_null_revision_authenticator_count = 0
+        marker_count = 0
+
+        def visit(value: object) -> None:
+            nonlocal revision_count
+            nonlocal null_revision_authenticator_count
+            nonlocal non_null_revision_authenticator_count
+            nonlocal marker_count
+            if isinstance(value, dict):
+                if {
+                    "record_id",
+                    "revision_id",
+                    "version_vector",
+                    "crypto_suite",
+                }.issubset(value):
+                    revision_count += 1
+                    self.assertEqual(
+                        value["crypto_suite"],
+                        "jat-xchacha-hkdf-argon2id-draft2",
+                    )
+                    self.assertIn("collection_witness_authenticator", value)
+                    authenticator = value["collection_witness_authenticator"]
+                    if authenticator is None:
+                        null_revision_authenticator_count += 1
+                        self.assertFalse(value["tombstone"])
+                    else:
+                        non_null_revision_authenticator_count += 1
+                        self.assertEqual(len(decode_base64url(authenticator)), 32)
+                if {
+                    "record_id",
+                    "witness_revision_id",
+                    "frontier",
+                    "barrier_cursor",
+                }.issubset(value):
+                    marker_count += 1
+                    self.assertEqual(
+                        len(
+                            decode_base64url(
+                                value["collection_witness_authenticator"]
+                            )
+                        ),
+                        32,
+                    )
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        for fixture in self.fixtures.values():
+            visit(fixture)
+        self.assertGreaterEqual(revision_count, 8)
+        self.assertGreaterEqual(null_revision_authenticator_count, 3)
+        self.assertGreaterEqual(non_null_revision_authenticator_count, 5)
+        self.assertGreaterEqual(marker_count, 4)
 
     def test_review_status_is_unambiguous_and_does_not_claim_approval(self) -> None:
         self.assertIn("not approved for implementation or release", self.protocol_text)
@@ -746,6 +1047,37 @@ class SyncProtocolSpecTests(unittest.TestCase):
         ):
             self.assertEqual(field_schema["minItems"], 1)
             self.assertTrue(field_schema["uniqueItems"])
+        revision_authenticator_schema = defs["record_revision"]["properties"][
+            "collection_witness_authenticator"
+        ]
+        self.assertEqual(
+            revision_authenticator_schema["oneOf"][0],
+            {"type": "null"},
+        )
+        revision_exact_shape = revision_authenticator_schema["oneOf"][1][
+            "allOf"
+        ][1]
+        self.assertEqual(revision_exact_shape["minLength"], 43)
+        self.assertEqual(revision_exact_shape["maxLength"], 43)
+        marker_exact_shape = defs["collection_marker"]["properties"][
+            "collection_witness_authenticator"
+        ]["allOf"][1]
+        self.assertEqual(marker_exact_shape["minLength"], 43)
+        self.assertEqual(marker_exact_shape["maxLength"], 43)
+        self.assertIn(
+            "collection_witness_authenticator",
+            defs["record_revision"]["required"],
+        )
+        self.assertEqual(
+            set(defs["collection_marker"]["required"]),
+            {
+                "record_id",
+                "witness_revision_id",
+                "frontier",
+                "collection_witness_authenticator",
+                "barrier_cursor",
+            },
+        )
 
     def test_uint64_schema_and_semantic_parser_enforce_the_exact_maximum(self) -> None:
         pattern = re.compile(self.wire["$defs"]["uint64"]["pattern"])
@@ -949,6 +1281,49 @@ class SyncProtocolSpecTests(unittest.TestCase):
 
         crypto = self.fixtures["crypto-review-vectors.json"]
         self.assertEqual(crypto["proposed_argon2id"]["version"], 19)
+        self.assertEqual(crypto["inputs"]["protocol_major"], 1)
+        self.assertEqual(crypto["inputs"]["crypto_suite_id"], 2)
+        self.assertEqual(
+            crypto["proposed_suite"],
+            "jat-xchacha-hkdf-argon2id-draft2",
+        )
+        self.assertIn(
+            "collection_witness_key_hex",
+            crypto["expected"],
+        )
+        self.assertIn(
+            "authorized_collection_witness_authenticator_base64url",
+            crypto["expected"],
+        )
+        self.assertIn(
+            "initial_live_record_ad_hex",
+            crypto["expected"],
+        )
+        self.assertIn("authorized_superseding_record_ad_hex", crypto["expected"])
+        self.assertTrue(all(value is None for value in crypto["expected"].values()))
+        record_cases = crypto["inputs"]["record_cases"]
+        initial_live = record_cases["initial_live_null_authorization"]
+        self.assertEqual(initial_live["collection_witness_authenticator_kind"], 0)
+        self.assertIsNone(initial_live["collection_witness_authenticator"])
+        self.assertIsNone(initial_live["complete_durable_frontier_before_revision"])
+        self.assertFalse(
+            should_emit_collection_witness_authenticator(
+                initial_live["tombstone"],
+                initial_live["version_vector"],
+                initial_live["complete_durable_frontier_before_revision"],
+            )
+        )
+        authorized = record_cases["authorized_superseding_live"]
+        self.assertEqual(authorized["collection_witness_authenticator_kind"], 1)
+        self.assertTrue(
+            should_emit_collection_witness_authenticator(
+                authorized["tombstone"],
+                authorized["version_vector"],
+                authorized["complete_durable_frontier_before_revision"],
+            )
+        )
+        for case in record_cases.values():
+            self.assertEqual(len(bytes.fromhex(case["record_nonce_hex"])), 24)
         self.assertIn("version = 0x13 (decimal 19)", self.protocol_text)
         self.assertIn("u32be(argon2_version_or_zero)", self.protocol_text)
         plaintext = json.loads(bytes.fromhex(crypto["inputs"]["record_plaintext_utf8_hex"]))
@@ -1002,6 +1377,69 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertTrue(validate_revision_vector(first))
         structurally_rejected = {"empty_vector", "zero_component"}
         record_schema = self.wire["$defs"]["record_revision"]
+        self.assertIsNone(first["collection_witness_authenticator"])
+        self.assertTrue(schema_matches(first, record_schema, self.wire))
+        missing_required_authenticator = copy.deepcopy(first)
+        del missing_required_authenticator["collection_witness_authenticator"]
+        self.assertFalse(
+            schema_matches(missing_required_authenticator, record_schema, self.wire)
+        )
+        authorization = vector_validation["collection_witness_authorization"]
+        self.assertTrue(
+            authorization[
+                "complete_durable_frontier_includes_all_verified_revisions_and_prior_marker"
+            ]
+        )
+        self.assertFalse(
+            authorization["acknowledgement_alone_discards_frontier_input"]
+        )
+        authorization_cases = {
+            case["name"]: case for case in authorization["cases"]
+        }
+        self.assertEqual(
+            set(authorization_cases),
+            {
+                "initial_live_revision",
+                "incomparable_live_sibling",
+                "stale_live_revision",
+                "strictly_dominating_resolution",
+                "tombstone_authorization_before_collection_eligibility",
+            },
+        )
+        for name, case in authorization_cases.items():
+            with self.subTest(collection_witness_authorization=name):
+                should_emit = should_emit_collection_witness_authenticator(
+                    case["tombstone"],
+                    case["revision_vector"],
+                    case["complete_durable_frontier"],
+                )
+                self.assertEqual(
+                    should_emit,
+                    case["collection_witness_authenticator"] is not None,
+                )
+        initial_ad = record_revision_ad(
+            first,
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+        )
+        self.assertEqual(initial_ad[-1:], b"\x00")
+        illegally_tagged_initial = copy.deepcopy(first)
+        illegally_tagged_initial["collection_witness_authenticator"] = (
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )
+        tagged_initial_ad = record_revision_ad(
+            illegally_tagged_initial,
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+        )
+        self.assertEqual(tagged_initial_ad[-33:-32], b"\x01")
+        self.assertNotEqual(initial_ad, tagged_initial_ad)
+        self.assertEqual(
+            authorization[
+                "initial_live_null_replaced_with_resolution_tag_result"
+            ],
+            "aead_or_collection_witness_authenticator_mismatch",
+        )
         self.assertEqual(
             {case["name"] for case in vector_validation["malformed_cases"]},
             {
@@ -1045,6 +1483,15 @@ class SyncProtocolSpecTests(unittest.TestCase):
         )
         self.assertTrue(canonical_vector_map(canonical_marker["frontier"]))
         marker_schema = self.wire["$defs"]["collection_marker"]
+        null_marker_authenticator = copy.deepcopy(canonical_marker)
+        null_marker_authenticator["collection_witness_authenticator"] = None
+        self.assertFalse(
+            schema_matches(null_marker_authenticator, marker_schema, self.wire)
+        )
+        self.assertEqual(
+            authorization["marker_null_authenticator_result"],
+            "invalid_request",
+        )
         structurally_rejected_frontiers = {
             "empty_frontier",
             "zero_component_frontier",
@@ -1083,6 +1530,246 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     canonical_vector_map(recovery_marker["frontier"])
 
+        runtime_vmk = bytes(range(32))
+        runtime_instance = "00000000-0000-4000-8000-000000000001"
+        runtime_vault = "00000000-0000-4000-8000-000000000002"
+        authenticated_marker = copy.deepcopy(canonical_marker)
+        authenticated_marker["collection_witness_authenticator"] = (
+            base64.urlsafe_b64encode(
+                compute_collection_witness_authenticator(
+                    runtime_vmk,
+                    runtime_instance,
+                    runtime_vault,
+                    authenticated_marker["record_id"],
+                    authenticated_marker["witness_revision_id"],
+                    authenticated_marker["frontier"],
+                )
+            )
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        verify_marker_collection_witness_authenticator(
+            authenticated_marker,
+            runtime_vmk,
+            runtime_instance,
+            runtime_vault,
+        )
+        self.assertEqual(
+            len(
+                decode_base64url(
+                    authenticated_marker["collection_witness_authenticator"]
+                )
+            ),
+            32,
+        )
+
+        smaller_frontier = copy.deepcopy(authenticated_marker)
+        smaller_frontier["frontier"][0]["counter"] = "2"
+        self.assertTrue(
+            schema_matches(smaller_frontier, marker_schema, self.wire)
+        )
+        self.assertTrue(canonical_vector_map(smaller_frontier["frontier"]))
+        with self.assertRaisesRegex(
+            ValueError,
+            "^collection_witness_authenticator_mismatch$",
+        ):
+            verify_marker_collection_witness_authenticator(
+                smaller_frontier,
+                runtime_vmk,
+                runtime_instance,
+                runtime_vault,
+            )
+        self.assertEqual(
+            vector_validation[
+                "smaller_structurally_valid_frontier_with_unchanged_authenticator_result"
+            ],
+            "collection_witness_authenticator_mismatch",
+        )
+        self.assertTrue(
+            vector_validation[
+                "non_null_collection_witness_authenticator_placeholder_is_not_reviewed_crypto_output"
+            ]
+        )
+
+        resolution = fixture["resolution"]
+        resolution_authenticator = base64.urlsafe_b64encode(
+            compute_collection_witness_authenticator(
+                runtime_vmk,
+                runtime_instance,
+                runtime_vault,
+                resolution["record_id"],
+                resolution["revision_id"],
+                resolution["version_vector"],
+            )
+        ).rstrip(b"=").decode("ascii")
+        initial_with_resolution_tag = {
+            "record_id": first["record_id"],
+            "witness_revision_id": first["revision_id"],
+            "frontier": first["version_vector"],
+            "collection_witness_authenticator": resolution_authenticator,
+            "barrier_cursor": "1",
+        }
+        self.assertTrue(
+            schema_matches(initial_with_resolution_tag, marker_schema, self.wire)
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "^collection_witness_authenticator_mismatch$",
+        ):
+            verify_marker_collection_witness_authenticator(
+                initial_with_resolution_tag,
+                runtime_vmk,
+                runtime_instance,
+                runtime_vault,
+            )
+
+        mismatch_cases: list[tuple[str, dict, str, str, int]] = []
+        wrong_record = copy.deepcopy(authenticated_marker)
+        wrong_record["record_id"] = "00000000-0000-4000-8000-000000000032"
+        mismatch_cases.append(
+            (
+                "record",
+                wrong_record,
+                runtime_instance,
+                runtime_vault,
+                2,
+            )
+        )
+        wrong_witness = copy.deepcopy(authenticated_marker)
+        wrong_witness["witness_revision_id"] = (
+            "00000000-0000-4000-8000-000000000033"
+        )
+        mismatch_cases.append(
+            (
+                "witness",
+                wrong_witness,
+                runtime_instance,
+                runtime_vault,
+                2,
+            )
+        )
+        shorter_vector = copy.deepcopy(authenticated_marker)
+        shorter_vector["frontier"] = shorter_vector["frontier"][:1]
+        mismatch_cases.append(
+            (
+                "vector_count",
+                shorter_vector,
+                runtime_instance,
+                runtime_vault,
+                2,
+            )
+        )
+        wrong_tag = copy.deepcopy(authenticated_marker)
+        wrong_tag["collection_witness_authenticator"] = (
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )
+        mismatch_cases.extend(
+            [
+                (
+                    "instance",
+                    authenticated_marker,
+                    "00000000-0000-4000-8000-000000000004",
+                    runtime_vault,
+                    2,
+                ),
+                (
+                    "vault",
+                    authenticated_marker,
+                    runtime_instance,
+                    "00000000-0000-4000-8000-000000000005",
+                    2,
+                ),
+                (
+                    "suite",
+                    authenticated_marker,
+                    runtime_instance,
+                    runtime_vault,
+                    1,
+                ),
+                (
+                    "tag",
+                    wrong_tag,
+                    runtime_instance,
+                    runtime_vault,
+                    2,
+                ),
+            ]
+        )
+        for name, candidate, instance_id, vault_id, suite_id in mismatch_cases:
+            with self.subTest(collection_witness_hmac_domain=name):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^collection_witness_authenticator_mismatch$",
+                ):
+                    verify_marker_collection_witness_authenticator(
+                        candidate,
+                        runtime_vmk,
+                        instance_id,
+                        vault_id,
+                        suite_id,
+                    )
+
+        changed_barrier = copy.deepcopy(authenticated_marker)
+        changed_barrier["barrier_cursor"] = "1"
+        verify_marker_collection_witness_authenticator(
+            changed_barrier,
+            runtime_vmk,
+            runtime_instance,
+            runtime_vault,
+        )
+        durable_revision_frontier = copy.deepcopy(
+            authenticated_marker["frontier"]
+        )
+        self.assertTrue(
+            marker_covers_durable_frontier(
+                authenticated_marker,
+                durable_revision_frontier,
+            )
+        )
+        older_valid_marker = copy.deepcopy(authenticated_marker)
+        older_valid_marker["witness_revision_id"] = (
+            "00000000-0000-4000-8000-000000000030"
+        )
+        older_valid_marker["frontier"][0]["counter"] = "2"
+        older_valid_marker["collection_witness_authenticator"] = (
+            base64.urlsafe_b64encode(
+                compute_collection_witness_authenticator(
+                    runtime_vmk,
+                    runtime_instance,
+                    runtime_vault,
+                    older_valid_marker["record_id"],
+                    older_valid_marker["witness_revision_id"],
+                    older_valid_marker["frontier"],
+                )
+            )
+            .rstrip(b"=")
+            .decode("ascii")
+        )
+        verify_marker_collection_witness_authenticator(
+            older_valid_marker,
+            runtime_vmk,
+            runtime_instance,
+            runtime_vault,
+        )
+        self.assertFalse(
+            marker_covers_durable_frontier(
+                older_valid_marker,
+                durable_revision_frontier,
+            )
+        )
+        self.assertFalse(
+            marker_covers_durable_frontier(None, durable_revision_frontier)
+        )
+        normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
+        self.assertIn(
+            "u8(collection_witness_authenticator_kind)",
+            normalized_protocol,
+        )
+        self.assertIn(
+            "The witness HMAC proves only that a VMK holder explicitly authorized that exact revision ID and vector",
+            normalized_protocol,
+        )
+
     def test_tombstone_fixture_requires_ack_retention_and_zero_device_freeze(self) -> None:
         fixture = self.fixtures["tombstone-retirement.json"]
         self.assertEqual(parse_uint64(fixture["tombstone"]["minimum_retention_seconds"]), 90 * 24 * 60 * 60)
@@ -1109,12 +1796,209 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(parse_uint64(waiting["barrier_cursor"]), 42)
         self.assertFalse(waiting["collection_eligible"])
         self.assertTrue(resolved["collection_eligible"])
-        self.assertTrue(barrier["collection_marker_persists_joined_frontier"])
+        self.assertTrue(
+            barrier["collection_requires_single_authenticated_witness"]
+        )
+        self.assertTrue(barrier["server_componentwise_join_for_marker_forbidden"])
+        self.assertEqual(barrier["collection_marker_key"], ["record_id"])
+        self.assertEqual(barrier["maximum_collection_markers_per_record"], 1)
+        self.assertTrue(
+            barrier["collection_marker_is_monotonic_exact_witness_certificate"]
+        )
+        self.assertIsNone(
+            barrier["later_concurrent_sibling"][
+                "collection_witness_authenticator"
+            ]
+        )
+        self.assertEqual(
+            len(
+                decode_base64url(
+                    barrier["dominating_resolution"][
+                        "collection_witness_authenticator"
+                    ]
+                )
+            ),
+            32,
+        )
+        self_witness_collection = barrier[
+            "sole_tombstone_self_witness_collection"
+        ]
+        self_witness_marker = self_witness_collection["marker"]
+        self.assertEqual(
+            self_witness_marker["witness_revision_id"],
+            fixture["tombstone"]["revision_id"],
+        )
+        self.assertEqual(
+            canonical_vector_map(self_witness_marker["frontier"]),
+            canonical_vector_map(fixture["tombstone"]["vector"]),
+        )
+        self.assertEqual(
+            self_witness_marker["collection_witness_authenticator"],
+            fixture["tombstone"]["collection_witness_authenticator"],
+        )
+        self.assertTrue(self_witness_collection["candidate_bytes_removed"])
+        self.assertTrue(
+            self_witness_collection["marker_persists_after_candidate_removal"]
+        )
+        self.assertTrue(
+            self_witness_collection[
+                "later_strictly_dominating_witness_replaces_marker"
+            ]
+        )
         marker = barrier["collection_marker"]
+        self.assertEqual(
+            marker_transition_outcome(self_witness_marker, marker),
+            "replace_same_record_row",
+        )
         self.assertEqual(marker["barrier_cursor"], resolved["barrier_cursor"])
+        self.assertEqual(
+            marker["witness_revision_id"],
+            barrier["dominating_resolution"]["revision_id"],
+        )
         self.assertEqual(
             vector_map({"version_vector": marker["frontier"]}),
             vector_map({"version_vector": barrier["dominating_resolution"]["vector"]}),
+        )
+        self.assertEqual(
+            marker["collection_witness_authenticator"],
+            barrier["dominating_resolution"]["collection_witness_authenticator"],
+        )
+        unchanged_prune = barrier[
+            "later_aged_candidate_prune_under_unchanged_marker"
+        ]
+        persisted_marker = unchanged_prune["persisted_marker"]
+        now_eligible = unchanged_prune["now_eligible_candidate"]
+        self.assertTrue(
+            schema_matches(
+                persisted_marker,
+                self.wire["$defs"]["collection_marker"],
+                self.wire,
+            )
+        )
+        self.assertFalse(unchanged_prune["original_witness_revision_bytes_present"])
+        self.assertTrue(
+            dominates(
+                canonical_vector_map(persisted_marker["frontier"]),
+                canonical_vector_map(now_eligible["vector"]),
+            )
+        )
+        self.assertTrue(
+            unchanged_prune[
+                "candidate_strictly_dominated_by_persisted_marker"
+            ]
+        )
+        self.assertFalse(unchanged_prune["retained_witness_selected"])
+        self.assertEqual(
+            parse_uint64(
+                unchanged_prune[
+                    "barrier_recomputed_across_current_retained_revisions"
+                ]
+            ),
+            61,
+        )
+        self.assertTrue(
+            all(
+                parse_uint64(cursor) >= 61
+                for cursor in unchanged_prune["active_device_ack_cursors"]
+            )
+        )
+        self.assertTrue(unchanged_prune["candidate_bytes_removed"])
+        self.assertTrue(
+            unchanged_prune["marker_tuple_byte_identical_after_prune"]
+        )
+        self.assertFalse(unchanged_prune["marker_change_cursor_consumed"])
+        transitions = barrier["marker_transition_rules"]
+        self.assertEqual(
+            transitions,
+            {
+                "no_existing_marker": "create",
+                "exact_tuple_retry": "idempotent_no_cursor",
+                "strictly_dominating_witness": "replace_same_record_row",
+                "equal_vector_different_witness": "revision_equivocation",
+                "weaker_or_incomparable_witness": "collection_ineligible",
+                "physical_prune_covered_by_unchanged_marker": (
+                    "no_marker_change_no_cursor"
+                ),
+            },
+        )
+        self.assertEqual(marker_transition_outcome(None, marker), "create")
+        self.assertEqual(
+            marker_transition_outcome(marker, copy.deepcopy(marker)),
+            "idempotent_no_cursor",
+        )
+        stronger_marker = copy.deepcopy(marker)
+        stronger_marker["witness_revision_id"] = (
+            "00000000-0000-4000-8000-000000000024"
+        )
+        stronger_marker["frontier"][0]["counter"] = "3"
+        self.assertEqual(
+            marker_transition_outcome(marker, stronger_marker),
+            "replace_same_record_row",
+        )
+        equal_different_witness = copy.deepcopy(marker)
+        equal_different_witness["witness_revision_id"] = (
+            "00000000-0000-4000-8000-000000000024"
+        )
+        self.assertEqual(
+            marker_transition_outcome(marker, equal_different_witness),
+            "revision_equivocation",
+        )
+        weaker_marker = copy.deepcopy(marker)
+        weaker_marker["frontier"][0]["counter"] = "1"
+        self.assertEqual(
+            marker_transition_outcome(marker, weaker_marker),
+            "collection_ineligible",
+        )
+        incomparable_marker = copy.deepcopy(marker)
+        incomparable_marker["frontier"] = [
+            {
+                "device_id": "00000000-0000-4000-8000-000000000010",
+                "counter": "3",
+            }
+        ]
+        self.assertEqual(
+            marker_transition_outcome(marker, incomparable_marker),
+            "collection_ineligible",
+        )
+        cycle = barrier["delete_recreate_delete_cycle"]
+        self.assertEqual(cycle["marker_rows_before"], 1)
+        self.assertTrue(
+            cycle["recreation_vector_includes_verified_marker_frontier"]
+        )
+        self.assertTrue(cycle["recreation_must_strictly_dominate_marker"])
+        self.assertTrue(
+            cycle[
+                "second_tombstone_witness_strictly_dominates_recreation_and_old_marker"
+            ]
+        )
+        self.assertEqual(cycle["marker_rows_after"], 1)
+        self.assertTrue(cycle["same_record_marker_replaced"])
+        selective_replay = barrier["selective_valid_certificate_replay"]
+        self.assertTrue(selective_replay["older_certificate_hmac_valid"])
+        self.assertTrue(
+            selective_replay[
+                "durable_frontier_includes_newer_authenticated_revision"
+            ]
+        )
+        self.assertEqual(
+            selective_replay["result"],
+            "rollback_or_fork_rejected",
+        )
+        self.assertTrue(
+            selective_replay[
+                "revision_causal_bytes_retained_until_covering_marker"
+            ]
+        )
+        self.assertFalse(
+            selective_replay["acknowledgement_alone_allows_discard"]
+        )
+        initial_state = later_states[
+            "tombstone_acknowledged_but_not_collected"
+        ]
+        self.assertTrue(initial_state["candidate_witnesses_itself"])
+        self.assertEqual(
+            initial_state["witness_revision_id"],
+            fixture["tombstone"]["revision_id"],
         )
         self.assertTrue(barrier["later_mutation_must_dominate_persisted_frontier"])
         self.assertEqual(barrier["stale_later_mutation_error"], "stale_after_collection")
@@ -1154,6 +2038,110 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(
             revocation["revoked_snapshot_owner_page_http_status"],
             401,
+        )
+        replay = revocation["self_revocation_receipt_replay"]
+        self.assertEqual(
+            replay["header_request_id"],
+            replay["body"]["request_id"],
+        )
+        raw_body = replay["exact_raw_body_utf8"].encode("utf-8")
+        self.assertEqual(
+            json.loads(raw_body, object_pairs_hook=reject_duplicate_keys),
+            replay["body"],
+        )
+        fingerprint = self_revocation_body_fingerprint(
+            replay["instance_id"],
+            replay["vault_id"],
+            replay["target_device_id"],
+            raw_body,
+        )
+        reordered_body = (
+            '{"allow_zero_active":false,"request_id":'
+            '"00000000-0000-4000-8000-000000000032"}'
+        ).encode("utf-8")
+        self.assertEqual(json.loads(reordered_body), replay["body"])
+        self.assertNotEqual(
+            fingerprint,
+            self_revocation_body_fingerprint(
+                replay["instance_id"],
+                replay["vault_id"],
+                replay["target_device_id"],
+                reordered_body,
+            ),
+        )
+        self.assertEqual(
+            set(replay["retained_for_life_of_retired_row"]),
+            {
+                "self_revocation_request_id",
+                "exact_authenticated_body_fingerprint",
+                "pre_revocation_token_hash",
+                "byte_equivalent_200_response",
+            },
+        )
+        recorded_body_bytes = replay["recorded_response_body_utf8"].encode(
+            "utf-8"
+        )
+        self.assertIn(
+            f"Content-Length: {len(recorded_body_bytes)}",
+            replay["recorded_response_headers_in_order"],
+        )
+        self.assertTrue(
+            schema_matches(
+                json.loads(
+                    recorded_body_bytes,
+                    object_pairs_hook=reject_duplicate_keys,
+                ),
+                self.wire["$defs"]["device"],
+                self.wire,
+            )
+        )
+        self.assertIn(
+            f"JAT-Request-ID: {replay['header_request_id']}",
+            replay["recorded_response_headers_in_order"],
+        )
+        self.assertTrue(
+            replay[
+                "lookup_before_ordinary_revoked_token_rejection_on_this_endpoint_only"
+            ]
+        )
+        self.assertFalse(replay["mismatch_reveals_receipt_details"])
+        self.assertEqual(
+            {case["name"] for case in replay["cases"]},
+            {
+                "exact_lost_response_retry",
+                "different_token",
+                "different_target_device",
+                "different_header_request_id",
+                "different_body_request_id",
+                "semantically_equal_reordered_body",
+                "same_tuple_on_other_endpoint",
+            },
+        )
+        for case in replay["cases"]:
+            with self.subTest(self_revocation_case=case["name"]):
+                self.assertEqual(
+                    self_revocation_replay_outcome(case),
+                    (case["result"], case["http_status"]),
+                )
+                if case["http_status"] == 200:
+                    self.assertTrue(case["response_byte_equivalent"])
+        side_effects = replay["receipt_lookup_side_effects"]
+        self.assertTrue(side_effects["retired_receipt_row_lookup"])
+        self.assertTrue(
+            all(
+                value is False
+                for key, value in side_effects.items()
+                if key != "retired_receipt_row_lookup"
+            )
+        )
+        normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
+        self.assertIn(
+            "On this endpoint only, receipt lookup for a retired row occurs before the ordinary revoked-token rejection",
+            normalized_protocol,
+        )
+        self.assertIn(
+            "Any token, target, header, or body mismatch returns the same HTTP 401 `token_revoked` response",
+            normalized_protocol,
         )
         secret_rotation = fixture["instance_secret_rotation"]
         self.assertEqual(secret_rotation["rotation_without_device_held_vmk"], "forbidden")
@@ -1286,6 +2274,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
             {case["missing_required_capability"] for case in unsupported_capabilities},
             {
                 "envelope-cas-v1",
+                "authenticated-collection-frontiers-v2",
                 "snapshot-collection-markers-v1",
                 "snapshot-device-registry-v1",
             },
@@ -1320,6 +2309,96 @@ class SyncProtocolSpecTests(unittest.TestCase):
         host_fields = set(defs["host_body"]["properties"])
         self.assertNotIn("identity_files", host_fields)
         self.assertNotIn("session_logging_enabled", host_fields)
+
+    def test_secure_enclave_identity_uses_canonical_public_only_p256_fixture(self) -> None:
+        body_schema = self.payload["$defs"]["secure_enclave_identity_body"]
+        self.assertIn("public_key_encoding", body_schema["required"])
+        self.assertEqual(
+            body_schema["properties"]["public_key_encoding"]["const"],
+            "p256-x963-uncompressed-v1",
+        )
+        public_shape = body_schema["properties"]["public_key"]["allOf"][1]
+        self.assertEqual(public_shape["minLength"], 87)
+        self.assertEqual(public_shape["maxLength"], 87)
+
+        fixture = self.fixtures["secure-enclave-identity.json"]
+        self.assertEqual(
+            fixture["status"],
+            "review-pending-executable-public-only-secure-enclave-fixture",
+        )
+        canonical = fixture["canonical_identity"]
+        external_roots = {"wire.schema.json": self.wire}
+        self.assertTrue(
+            schema_matches(
+                canonical,
+                self.payload,
+                self.payload,
+                external_roots,
+            )
+        )
+        public_key = decode_base64url(canonical["body"]["public_key"])
+        self.assertEqual(
+            len(public_key),
+            fixture["expected"]["decoded_public_key_bytes"],
+        )
+        self.assertEqual(public_key[0], 0x04)
+        validate_secure_enclave_public_key(canonical["body"])
+        self.assertFalse(fixture["expected"]["private_key_committed"])
+        self.assertNotIn("private_key", canonical["body"])
+
+        expected_negative_cases = {
+            "missing-public-key-encoding",
+            "wrong-public-key-encoding",
+            "empty-public-key",
+            "compressed-sec1-public-key",
+            "spki-der-public-key",
+            "wrong-uncompressed-prefix",
+            "off-curve-point",
+            "noncanonical-base64url",
+            "fingerprint-mismatch",
+        }
+        self.assertEqual(
+            {case["name"] for case in fixture["negative_cases"]},
+            expected_negative_cases,
+        )
+        for case in fixture["negative_cases"]:
+            with self.subTest(case=case["name"]):
+                candidate = copy.deepcopy(canonical)
+                mutation = case["mutation"]
+                if mutation["operation"] == "remove":
+                    del candidate["body"][mutation["field"]]
+                else:
+                    self.assertEqual(mutation["operation"], "replace")
+                    candidate["body"][mutation["field"]] = mutation["value"]
+                matches_schema = schema_matches(
+                    candidate,
+                    self.payload,
+                    self.payload,
+                    external_roots,
+                )
+                if case["rejected_by"] == "schema":
+                    self.assertFalse(matches_schema)
+                else:
+                    self.assertEqual(case["rejected_by"], "key_validation")
+                    self.assertTrue(matches_schema)
+                    with self.assertRaises(ValueError):
+                        validate_secure_enclave_public_key(candidate["body"])
+
+        normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
+        normalized_threat = re.sub(r"\s+", " ", self.threat_text)
+        for claim in (
+            "public_key_encoding = p256-x963-uncompressed-v1",
+            "0x04 || X32 || Y32",
+            "exactly 65 decoded bytes and 87 unpadded base64url characters",
+            "recompute the OpenSSH `ecdsa-sha2-nistp256` SHA-256 fingerprint",
+            "Before any persistent local import or custody mutation",
+        ):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, normalized_protocol)
+        self.assertIn(
+            "compressed, DER/SPKI, wrong-length, wrong-prefix, off-curve, non-canonical",
+            normalized_threat,
+        )
 
     def test_software_identity_schema_and_fixture_enforce_canonical_keypairs(self) -> None:
         body_schema = self.payload["$defs"]["software_identity_body"]
@@ -1560,13 +2639,14 @@ class SyncProtocolSpecTests(unittest.TestCase):
         capabilities = fixture["capabilities"]
         self.assertEqual(capabilities["protocol_min"], "1")
         self.assertEqual(capabilities["protocol_max"], "1")
-        self.assertEqual(capabilities["crypto_suites"], ["jat-xchacha-hkdf-argon2id-draft1"])
+        self.assertEqual(capabilities["crypto_suites"], ["jat-xchacha-hkdf-argon2id-draft2"])
         self.assertEqual(
             capabilities["capabilities"],
             sorted(capabilities["capabilities"]),
         )
         self.assertTrue(
             {
+                "authenticated-collection-frontiers-v2",
                 "snapshot-read-v1",
                 "snapshot-collection-markers-v1",
                 "snapshot-device-registry-v1",
@@ -1740,22 +2820,73 @@ class SyncProtocolSpecTests(unittest.TestCase):
             )
         )
         marker_keys = [
-            (
-                uuid.UUID(item["record_id"]).bytes,
-                uuid.UUID(item["collected_revision_id"]).bytes,
-            )
+            uuid.UUID(item["record_id"]).bytes
             for item in collection_markers
         ]
         self.assertEqual(marker_keys, sorted(marker_keys))
+        self.assertEqual(len(marker_keys), len(set(marker_keys)))
         self.assertEqual(
             len(collection_markers),
             fixture["expected"]["collection_marker_count"],
         )
         self.assertTrue(fixture["expected"]["all_persistent_collection_markers_included"])
         self.assertTrue(fixture["expected"]["collection_marker_frontiers_preserved"])
+        self.assertTrue(
+            fixture["expected"][
+                "collection_marker_witness_certificates_preserved"
+            ]
+        )
+        checkpoint_coverage = fixture["expected"]["checkpoint_coverage"]
+        ordinary = checkpoint_coverage[
+            "ordinary_revision_checkpoint_without_prior_marker"
+        ]
+        self.assertFalse(ordinary["prior_marker_checkpoint_present"])
+        self.assertFalse(ordinary["incoming_marker_present"])
+        self.assertNotIn(
+            ordinary["record_id"],
+            {marker["record_id"] for marker in collection_markers},
+        )
+        ordinary_revisions = [
+            revision
+            for revision in revisions
+            if revision["record_id"] == ordinary["record_id"]
+        ]
+        aggregate: dict[str, int] = {}
+        for revision in ordinary_revisions:
+            for device_id, counter in validate_revision_vector(revision).items():
+                aggregate[device_id] = max(aggregate.get(device_id, 0), counter)
+        prior_ordinary = canonical_vector_map(ordinary["prior_durable_frontier"])
+        self.assertTrue(
+            aggregate == prior_ordinary or dominates(aggregate, prior_ordinary)
+        )
+        self.assertTrue(
+            ordinary["incoming_revision_aggregate_covers_prior_frontier"]
+        )
+        self.assertEqual(ordinary["result"], "accepted")
+        prior_marker_case = checkpoint_coverage["prior_marker_checkpoint"]
+        incoming_prior_marker = next(
+            marker
+            for marker in collection_markers
+            if marker["record_id"] == prior_marker_case["record_id"]
+        )
+        self.assertEqual(
+            canonical_vector_map(incoming_prior_marker["frontier"]),
+            canonical_vector_map(prior_marker_case["prior_marker_frontier"]),
+        )
+        self.assertEqual(prior_marker_case["incoming_marker_relation"], "exact")
+        self.assertEqual(prior_marker_case["result"], "accepted")
+        self.assertEqual(
+            prior_marker_case["missing_incoming_marker_result"],
+            "rollback_or_fork_rejected",
+        )
         for marker in collection_markers:
             self.assertLessEqual(parse_uint64(marker["barrier_cursor"]), cut)
             self.assertTrue(vector_map({"version_vector": marker["frontier"]}))
+            assert_uuid_v4(self, marker["witness_revision_id"])
+            self.assertEqual(
+                len(decode_base64url(marker["collection_witness_authenticator"])),
+                32,
+            )
         source_counters = source_device_counter_map(source_devices)
         self.assertEqual(
             len(source_devices),
@@ -2046,13 +3177,33 @@ class SyncProtocolSpecTests(unittest.TestCase):
             source["envelope_generation"],
             source["instance_secret_generation"],
         )
+        self.assertTrue(
+            source[
+                "surviving_client_verified_revision_aead_and_every_non_null_collection_witness_authenticator"
+            ]
+        )
+        self.assertTrue(
+            source["surviving_client_verified_marker_authenticators"]
+        )
         self.assertEqual(recovered["instance_id"], source["instance_id"])
         self.assertEqual(recovered["vault_id"], source["vault_id"])
         self.assertTrue(recovered["record_ciphertexts_byte_identical"])
         self.assertTrue(
             recovered["record_ids_revision_ids_vectors_and_tombstone_flags_byte_identical"]
         )
-        self.assertTrue(recovered["collection_markers_and_frontiers_byte_identical"])
+        self.assertTrue(
+            recovered[
+                "collection_marker_witness_certificates_and_frontiers_byte_identical"
+            ]
+        )
+        self.assertTrue(
+            recovered[
+                "recovering_client_readback_reverified_before_completion"
+            ]
+        )
+        self.assertTrue(
+            recovered["source_abandoned_only_after_destination_reverification"]
+        )
         self.assertTrue(
             recovered["source_device_ids_and_max_author_counters_preserved"]
         )
@@ -2259,6 +3410,29 @@ class SyncProtocolSpecTests(unittest.TestCase):
             parse_uint64(manifest["collection_marker_count"]),
         )
         self.assertEqual(imported_markers, source["collection_markers"])
+        imported_marker_keys = [
+            uuid.UUID(marker["record_id"]).bytes
+            for marker in imported_markers
+        ]
+        self.assertEqual(imported_marker_keys, sorted(imported_marker_keys))
+        self.assertEqual(
+            len(imported_marker_keys),
+            len(set(imported_marker_keys)),
+        )
+        self.assertEqual(
+            imported["collection_marker_pages_sorted_by"],
+            ["record_id_uuid_bytes"],
+        )
+        self.assertTrue(
+            imported[
+                "server_has_no_vmk_and_does_not_verify_aead_or_collection_witness_hmac"
+            ]
+        )
+        self.assertTrue(
+            imported[
+                "server_enforces_canonical_shape_order_uniqueness_and_counter_bounds"
+            ]
+        )
         self.assertEqual(
             len(imported_source_devices),
             parse_uint64(manifest["source_device_count"]),
@@ -2557,9 +3731,32 @@ class SyncProtocolSpecTests(unittest.TestCase):
         equal_upload = vector_map(barrier["equal_frontier_upload"])
         older_upload = vector_map(barrier["older_upload"])
         dominating_upload = vector_map(barrier["dominating_upload"])
+        self.assertTrue(
+            barrier[
+                "new_mutation_causal_context_includes_verified_marker_frontiers"
+            ]
+        )
         self.assertFalse(dominates(equal_upload, persisted))
         self.assertFalse(dominates(older_upload, persisted))
         self.assertTrue(dominates(dominating_upload, persisted))
+        self.assertEqual(
+            barrier["dominating_upload"]["author_device_id"],
+            fixture["post_import_enrollment"]["new_device_id"],
+        )
+        self.assertEqual(
+            dominating_upload[
+                barrier["dominating_upload"]["author_device_id"]
+            ],
+            parse_uint64(barrier["dominating_upload"]["author_counter"]),
+        )
+        self.assertTrue(
+            barrier["dominating_upload"][
+                "causal_context_from_verified_marker_frontiers"
+            ]
+        )
+        self.assertTrue(
+            set(persisted.items()).issubset(dominating_upload.items())
+        )
         self.assertEqual(
             barrier["equal_frontier_upload"]["result"],
             "stale_after_collection",
@@ -2574,7 +3771,11 @@ class SyncProtocolSpecTests(unittest.TestCase):
         normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
         normalized_threat = re.sub(r"\s+", " ", self.threat_text)
         self.assertIn(
-            "every later mutation for that record must dominate every imported marker frontier",
+            "every later mutation for that record must dominate its imported marker frontier",
+            normalized_protocol,
+        )
+        self.assertIn(
+            "component-wise maximum of every durable revision vector and every retained, cryptographically verified collection-marker frontier",
             normalized_protocol,
         )
         self.assertIn(
@@ -2587,6 +3788,9 @@ class SyncProtocolSpecTests(unittest.TestCase):
     def _assert_record_revision_shape(self, revision: dict) -> None:
         for field in ("record_id", "revision_id", "author_device_id"):
             assert_uuid_v4(self, revision[field])
+        authenticator = revision["collection_witness_authenticator"]
+        if authenticator is not None:
+            self.assertEqual(len(decode_base64url(authenticator)), 32)
         self.assertEqual(len(decode_base64url(revision["nonce"])), 24)
         self.assertGreaterEqual(len(decode_base64url(revision["ciphertext"])), 16)
         self.assertTrue(validate_revision_vector(revision))

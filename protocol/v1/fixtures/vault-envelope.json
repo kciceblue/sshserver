@@ -7,7 +7,7 @@
     "new_generation": "1",
     "envelope": {
       "protocol_version": "1",
-      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
       "instance_id": "00000000-0000-4000-8000-000000000001",
       "vault_id": "00000000-0000-4000-8000-000000000002",
       "envelope_generation": "1",
@@ -24,7 +24,7 @@
     "new_generation": "2",
     "envelope": {
       "protocol_version": "1",
-      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
       "instance_id": "00000000-0000-4000-8000-000000000001",
       "vault_id": "00000000-0000-4000-8000-000000000002",
       "envelope_generation": "2",

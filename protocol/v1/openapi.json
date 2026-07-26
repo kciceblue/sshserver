@@ -185,6 +185,7 @@
     "/v1/sync": {
       "post": {
         "operationId": "syncVault",
+        "description": "Draft2 record revisions carry a required nullable collection_witness_authenticator. Null explicitly denies use as a collection witness; an honest client emits a 32-byte HMAC only for a tombstone or a revision that strictly dominates its complete durable same-record frontier. The null/non-null kind and present bytes are bound into record AEAD associated data. A marker requires the witness revision's exact non-null HMAC. The server stores opaque authenticators and enforces structural vector/counter and collection ordering rules; clients verify non-null revision and marker authenticators and include every verified monotonic per-record marker frontier in later mutation causal context. A mutation that does not strictly dominate the current marker frontier returns 409 stale_after_collection.",
         "security": [{"deviceBearer": []}],
         "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
         "requestBody": {
@@ -220,7 +221,7 @@
     "/v1/snapshot-reads": {
       "post": {
         "operationId": "createSnapshotRead",
-        "description": "The request must declare exactly the canonical sorted required-capability trio snapshot-collection-markers-v1, snapshot-device-registry-v1, and snapshot-read-v1. Missing, incomplete, duplicate, additional, or noncanonical declarations return 426 unsupported_capability before snapshot allocation. An exact device/request-ID retry returns the existing snapshot without refreshing its lease or consuming rate/capacity. New unique requests are limited to 5 per rolling minute per device, 1 active snapshot per device, 8 active snapshots per instance, and 67108864 bytes of active snapshot metadata per instance. Rate excess returns 429 rate_limited; count or metadata excess returns 413 limit_exceeded before metadata allocation or revision-object retention. Creation copies the envelope, marker/device projection, membership, and paging metadata while retaining content-addressed references to existing immutable revision payloads; it never duplicates full-vault payload bytes or pins live device rows.",
+        "description": "The request must declare exactly the canonical sorted required-capability quartet authenticated-collection-frontiers-v2, snapshot-collection-markers-v1, snapshot-device-registry-v1, and snapshot-read-v1. Missing, incomplete, duplicate, additional, or noncanonical declarations return 426 unsupported_capability before snapshot allocation. The snapshot contains at most one monotonic exact-witness marker per record, keyed and ordered by record_id; witness revision ID, vector, and authenticator are copied exactly while barrier_cursor remains unauthenticated operational metadata. An exact device/request-ID retry returns the existing snapshot without refreshing its lease or consuming rate/capacity. New unique requests are limited to 5 per rolling minute per device, 1 active snapshot per device, 8 active snapshots per instance, and 67108864 bytes of active snapshot metadata per instance. Rate excess returns 429 rate_limited; count or metadata excess returns 413 limit_exceeded before metadata allocation or revision-object retention. Creation copies the envelope, marker/device projection, membership, and paging metadata while retaining content-addressed references to existing immutable revision payloads; it never duplicates full-vault payload bytes or pins live device rows.",
         "security": [{"deviceBearer": []}],
         "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
         "requestBody": {
@@ -233,7 +234,7 @@
         },
         "responses": {
           "201": {
-            "description": "Stable recovery-complete snapshot cut and first page token created; requires snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1",
+            "description": "Stable recovery-complete snapshot cut and first page token created; requires authenticated-collection-frontiers-v2, snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_create_response"}
@@ -241,7 +242,7 @@
             }
           },
           "200": {
-            "description": "Idempotent recovery-complete snapshot creation retry; requires snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1",
+            "description": "Idempotent recovery-complete snapshot creation retry; requires authenticated-collection-frontiers-v2, snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_create_response"}
@@ -285,7 +286,7 @@
         },
         "responses": {
           "200": {
-            "description": "One stable phase page containing retained undominated revisions, persistent collection markers, or complete source-device registry entries in key order; requires snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1",
+            "description": "One stable phase page containing retained undominated revisions, persistent collection markers, or complete source-device registry entries in key order; requires authenticated-collection-frontiers-v2, snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_page_response"}
@@ -329,7 +330,7 @@
     "/v1/devices/{device_id}/revoke": {
       "post": {
         "operationId": "revokeDevice",
-        "description": "Cursor-bearing durable revocation. Live device state changes immediately and is never blocked by a snapshot lease. A new revocation at server cursor UInt64.max returns 507 server_cursor_exhausted before mutation; an exact idempotent retry returns the recorded device result without consuming another cursor.",
+        "description": "Cursor-bearing durable revocation. Live device state changes immediately and is never blocked by a snapshot lease. A new revocation at server cursor UInt64.max returns 507 server_cursor_exhausted before mutation. Self-revocation retains its request ID, exact authenticated raw-body fingerprint, pre-revocation token hash, and byte-equivalent 200 response for the life of the retired row. On this endpoint only, receipt lookup precedes ordinary revoked-token rejection: that same revoked bearer may retrieve only the exact committed self-revocation response when target device, JAT-Request-ID, body request ID, and exact raw body all match after the bearer is matched to the retired row. Any mismatch returns 401 token_revoked without receipt detail; beyond the constant-time retired-receipt row lookup, the path performs no general device, vault, ciphertext, snapshot, or lease read, no mutation or authority grant, and no timing or lifetime refresh. Other exact idempotent retries return the recorded device result without consuming another cursor.",
         "security": [{"deviceBearer": []}],
         "parameters": [
           {"$ref": "#/components/parameters/ProtocolVersion"},

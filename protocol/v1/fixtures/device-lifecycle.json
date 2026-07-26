@@ -29,7 +29,125 @@
     "revocation_erases_cached_plaintext_or_vmk": false,
     "snapshot_lease_may_delay_or_block_revocation": false,
     "revoked_snapshot_owner_page_result": "token_revoked",
-    "revoked_snapshot_owner_page_http_status": 401
+    "revoked_snapshot_owner_page_http_status": 401,
+    "self_revocation_receipt_replay": {
+      "instance_id": "00000000-0000-4000-8000-000000000001",
+      "vault_id": "00000000-0000-4000-8000-000000000002",
+      "target_device_id": "00000000-0000-4000-8000-000000000003",
+      "pre_revocation_device_token": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "header_request_id": "00000000-0000-4000-8000-000000000032",
+      "body": {
+        "request_id": "00000000-0000-4000-8000-000000000032",
+        "allow_zero_active": false
+      },
+      "exact_raw_body_utf8": "{\"request_id\":\"00000000-0000-4000-8000-000000000032\",\"allow_zero_active\":false}",
+      "recorded_http_status": 200,
+      "recorded_response_headers_in_order": [
+        "Content-Type: application/json; charset=utf-8",
+        "JAT-Protocol-Version: 1",
+        "JAT-Request-ID: 00000000-0000-4000-8000-000000000032",
+        "Content-Length: 314"
+      ],
+      "recorded_response_body_utf8": "{\"device_id\":\"00000000-0000-4000-8000-000000000003\",\"scopes\":[\"devices:manage\",\"devices:read\",\"envelope:read\",\"envelope:write\",\"sync:read\",\"sync:write\"],\"status\":\"revoked\",\"created_at\":\"2026-07-27T00:00:00.000Z\",\"revoked_at\":\"2026-07-27T00:01:00.000Z\",\"last_sync_at\":null,\"ack_cursor\":\"0\",\"max_author_counter\":\"0\"}",
+      "retained_for_life_of_retired_row": [
+        "self_revocation_request_id",
+        "exact_authenticated_body_fingerprint",
+        "pre_revocation_token_hash",
+        "byte_equivalent_200_response"
+      ],
+      "lookup_before_ordinary_revoked_token_rejection_on_this_endpoint_only": true,
+      "cases": [
+        {
+          "name": "exact_lost_response_retry",
+          "same_endpoint": true,
+          "same_token": true,
+          "same_target_device": true,
+          "same_header_request_id": true,
+          "same_body_request_id": true,
+          "same_exact_raw_body": true,
+          "result": "recorded_self_revocation_response",
+          "http_status": 200,
+          "response_byte_equivalent": true
+        },
+        {
+          "name": "different_token",
+          "same_endpoint": true,
+          "same_token": false,
+          "same_target_device": true,
+          "same_header_request_id": true,
+          "same_body_request_id": true,
+          "same_exact_raw_body": true,
+          "result": "token_revoked",
+          "http_status": 401
+        },
+        {
+          "name": "different_target_device",
+          "same_endpoint": true,
+          "same_token": true,
+          "same_target_device": false,
+          "same_header_request_id": true,
+          "same_body_request_id": true,
+          "same_exact_raw_body": true,
+          "result": "token_revoked",
+          "http_status": 401
+        },
+        {
+          "name": "different_header_request_id",
+          "same_endpoint": true,
+          "same_token": true,
+          "same_target_device": true,
+          "same_header_request_id": false,
+          "same_body_request_id": true,
+          "same_exact_raw_body": true,
+          "result": "token_revoked",
+          "http_status": 401
+        },
+        {
+          "name": "different_body_request_id",
+          "same_endpoint": true,
+          "same_token": true,
+          "same_target_device": true,
+          "same_header_request_id": true,
+          "same_body_request_id": false,
+          "same_exact_raw_body": false,
+          "result": "token_revoked",
+          "http_status": 401
+        },
+        {
+          "name": "semantically_equal_reordered_body",
+          "same_endpoint": true,
+          "same_token": true,
+          "same_target_device": true,
+          "same_header_request_id": true,
+          "same_body_request_id": true,
+          "same_exact_raw_body": false,
+          "result": "token_revoked",
+          "http_status": 401
+        },
+        {
+          "name": "same_tuple_on_other_endpoint",
+          "same_endpoint": false,
+          "same_token": true,
+          "same_target_device": true,
+          "same_header_request_id": true,
+          "same_body_request_id": true,
+          "same_exact_raw_body": true,
+          "result": "token_revoked",
+          "http_status": 401
+        }
+      ],
+      "receipt_lookup_side_effects": {
+        "retired_receipt_row_lookup": true,
+        "general_device_or_vault_data_access": false,
+        "state_mutation": false,
+        "scope_authority": false,
+        "cursor_consumed": false,
+        "snapshot_or_lease_access": false,
+        "last_sync_or_ack_updated": false,
+        "timestamp_or_receipt_lifetime_refreshed": false
+      },
+      "mismatch_reveals_receipt_details": false
+    }
   },
   "instance_secret_rotation": {
     "active_generation": "1",
@@ -59,6 +177,7 @@
   },
   "snapshot_create_capability_negotiation": {
     "required_exact": [
+      "authenticated-collection-frontiers-v2",
       "snapshot-collection-markers-v1",
       "snapshot-device-registry-v1",
       "snapshot-read-v1"
@@ -67,6 +186,7 @@
       {
         "name": "exact_canonical_declaration",
         "request_required_capabilities": [
+          "authenticated-collection-frontiers-v2",
           "snapshot-collection-markers-v1",
           "snapshot-device-registry-v1",
           "snapshot-read-v1"
@@ -84,6 +204,7 @@
       {
         "name": "incomplete_declaration",
         "request_required_capabilities": [
+          "authenticated-collection-frontiers-v2",
           "snapshot-collection-markers-v1",
           "snapshot-read-v1"
         ],
@@ -95,6 +216,7 @@
         "name": "noncanonical_order",
         "request_required_capabilities": [
           "snapshot-read-v1",
+          "authenticated-collection-frontiers-v2",
           "snapshot-collection-markers-v1",
           "snapshot-device-registry-v1"
         ],
@@ -105,6 +227,7 @@
       {
         "name": "duplicate_declaration",
         "request_required_capabilities": [
+          "authenticated-collection-frontiers-v2",
           "snapshot-collection-markers-v1",
           "snapshot-device-registry-v1",
           "snapshot-device-registry-v1",
@@ -117,6 +240,7 @@
       {
         "name": "additional_unknown_capability",
         "request_required_capabilities": [
+          "authenticated-collection-frontiers-v2",
           "snapshot-collection-markers-v1",
           "snapshot-device-registry-v1",
           "snapshot-future-v2",
@@ -171,6 +295,7 @@
     {"client_min": "1", "client_max": "1", "server_min": "1", "server_max": "1", "result": "protocol_1"},
     {"client_min": "2", "client_max": "2", "server_min": "1", "server_max": "1", "result": "unsupported_protocol", "http_status": 426},
     {"client_min": "1", "client_max": "1", "missing_required_capability": "envelope-cas-v1", "result": "unsupported_capability", "http_status": 426},
+    {"client_min": "1", "client_max": "1", "missing_required_capability": "authenticated-collection-frontiers-v2", "operation": "snapshot_read", "result": "unsupported_capability", "http_status": 426},
     {"client_min": "1", "client_max": "1", "missing_required_capability": "snapshot-collection-markers-v1", "operation": "snapshot_read", "result": "unsupported_capability", "http_status": 426},
     {"client_min": "1", "client_max": "1", "missing_required_capability": "snapshot-device-registry-v1", "operation": "snapshot_read", "result": "unsupported_capability", "http_status": 426},
     {"client_min": "1", "client_max": "1", "unknown_crypto_suite": "future-suite", "result": "preserve_opaque_and_block_write"}

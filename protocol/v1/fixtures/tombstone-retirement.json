@@ -4,6 +4,10 @@
   "tombstone": {
     "record_id": "00000000-0000-4000-8000-000000000020",
     "revision_id": "00000000-0000-4000-8000-000000000022",
+    "vector": [
+      {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+    ],
+    "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "cursor": "40",
     "received_at": "2026-01-01T00:00:00.000Z",
     "minimum_retention_seconds": "7776000",
@@ -18,7 +22,8 @@
       "tombstone": false,
       "vector": [
         {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
-      ]
+      ],
+      "collection_witness_authenticator": null
     },
     "dominating_resolution": {
       "revision_id": "00000000-0000-4000-8000-000000000023",
@@ -26,7 +31,8 @@
       "vector": [
         {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
         {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
-      ]
+      ],
+      "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     },
     "later_sibling_states": [
       {
@@ -34,6 +40,8 @@
         "barrier_cursor": "40",
         "active_device_ack_cursors": ["40", "40"],
         "candidate_is_sole_undominated_revision": true,
+        "witness_revision_id": "00000000-0000-4000-8000-000000000022",
+        "candidate_witnesses_itself": true,
         "collection_eligible": true
       },
       {
@@ -62,18 +70,93 @@
         "barrier_cursor": "42",
         "active_device_ack_cursors": ["42", "42"],
         "candidate_is_dominated": true,
+        "witness_revision_id": "00000000-0000-4000-8000-000000000023",
+        "retained_witness_strictly_dominates_every_other_revision_and_existing_marker": true,
         "collection_eligible": true
       }
     ],
-    "collection_marker_persists_joined_frontier": true,
+    "collection_requires_single_authenticated_witness": true,
+    "server_componentwise_join_for_marker_forbidden": true,
+    "collection_marker_key": ["record_id"],
+    "maximum_collection_markers_per_record": 1,
+    "collection_marker_is_monotonic_exact_witness_certificate": true,
+    "sole_tombstone_self_witness_collection": {
+      "marker": {
+        "record_id": "00000000-0000-4000-8000-000000000020",
+        "witness_revision_id": "00000000-0000-4000-8000-000000000022",
+        "frontier": [
+          {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+        ],
+        "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "barrier_cursor": "40"
+      },
+      "candidate_bytes_removed": true,
+      "marker_persists_after_candidate_removal": true,
+      "later_strictly_dominating_witness_replaces_marker": true
+    },
+    "marker_transition_rules": {
+      "no_existing_marker": "create",
+      "exact_tuple_retry": "idempotent_no_cursor",
+      "strictly_dominating_witness": "replace_same_record_row",
+      "equal_vector_different_witness": "revision_equivocation",
+      "weaker_or_incomparable_witness": "collection_ineligible",
+      "physical_prune_covered_by_unchanged_marker": "no_marker_change_no_cursor"
+    },
     "collection_marker": {
       "record_id": "00000000-0000-4000-8000-000000000020",
-      "collected_revision_id": "00000000-0000-4000-8000-000000000022",
+      "witness_revision_id": "00000000-0000-4000-8000-000000000023",
       "frontier": [
         {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
         {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
       ],
+      "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "barrier_cursor": "42"
+    },
+    "later_aged_candidate_prune_under_unchanged_marker": {
+      "record_id": "00000000-0000-4000-8000-000000000028",
+      "persisted_marker": {
+        "record_id": "00000000-0000-4000-8000-000000000028",
+        "witness_revision_id": "00000000-0000-4000-8000-00000000002a",
+        "frontier": [
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"}
+        ],
+        "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "barrier_cursor": "61"
+      },
+      "original_witness_revision_bytes_present": false,
+      "now_eligible_candidate": {
+        "revision_id": "00000000-0000-4000-8000-000000000029",
+        "tombstone": true,
+        "vector": [
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+        ],
+        "retention_age_seconds": "7776000",
+        "cursor": "60"
+      },
+      "candidate_strictly_dominated_by_persisted_marker": true,
+      "retained_witness_selected": false,
+      "barrier_recomputed_across_current_retained_revisions": "61",
+      "active_device_ack_cursors": ["61", "61"],
+      "candidate_bytes_removed": true,
+      "marker_tuple_byte_identical_after_prune": true,
+      "marker_change_cursor_consumed": false
+    },
+    "delete_recreate_delete_cycle": {
+      "marker_rows_before": 1,
+      "recreation_vector_includes_verified_marker_frontier": true,
+      "recreation_must_strictly_dominate_marker": true,
+      "second_tombstone_witness_strictly_dominates_recreation_and_old_marker": true,
+      "marker_rows_after": 1,
+      "same_record_marker_replaced": true
+    },
+    "selective_valid_certificate_replay": {
+      "older_certificate_hmac_valid": true,
+      "durable_frontier_includes_newer_authenticated_revision": true,
+      "older_certificate_covers_durable_frontier": false,
+      "result": "rollback_or_fork_rejected",
+      "revision_causal_bytes_retained_until_covering_marker": true,
+      "acknowledgement_alone_allows_discard": false,
+      "fresh_client_without_checkpoint_can_detect_coherent_older_state": false
     },
     "later_mutation_must_dominate_persisted_frontier": true,
     "stale_later_mutation_error": "stale_after_collection"

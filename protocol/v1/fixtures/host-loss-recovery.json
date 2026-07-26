@@ -15,16 +15,19 @@
     "tombstone_siblings": 1,
     "revision_count": "2",
     "vectors_and_revision_ids_present": true,
+    "surviving_client_verified_revision_aead_and_every_non_null_collection_witness_authenticator": true,
     "all_persistent_collection_markers_present": true,
+    "surviving_client_verified_marker_authenticators": true,
     "collection_marker_count": "1",
     "collection_markers": [
       {
         "record_id": "00000000-0000-4000-8000-000000000030",
-        "collected_revision_id": "00000000-0000-4000-8000-000000000031",
+        "witness_revision_id": "00000000-0000-4000-8000-000000000031",
         "frontier": [
           {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "3"},
           {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
         ],
+        "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "barrier_cursor": "45"
       }
     ],
@@ -56,7 +59,7 @@
     "collection_marker_count": "1",
     "source_device_count": "3",
     "page_count": "3",
-    "pages_sha256": "5898626477205c2c90f8431a28de0e8948ca5430c88fac0c6ac1a3b7b3de13ba"
+    "pages_sha256": "ffd59b9e071ab04b1d8252330946309169ad47a234cd84f20f4d56b45aa4d51e"
   },
   "digest_fixture_encoding": "recorded_raw_request_body_bytes_are_compact_sorted_json_utf8_pages_each_prefixed_u64be_length",
   "raw_body_digest_cases": [
@@ -95,8 +98,9 @@
           "version_vector": [
             {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
           ],
+          "collection_witness_authenticator": null,
           "payload_schema": "1",
-          "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+          "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
           "tombstone": false,
           "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
@@ -109,8 +113,9 @@
           "version_vector": [
             {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
           ],
+          "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           "payload_schema": "1",
-          "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+          "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
           "tombstone": true,
           "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
@@ -127,11 +132,12 @@
       "collection_markers": [
         {
           "record_id": "00000000-0000-4000-8000-000000000030",
-          "collected_revision_id": "00000000-0000-4000-8000-000000000031",
+          "witness_revision_id": "00000000-0000-4000-8000-000000000031",
           "frontier": [
             {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "3"},
             {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
           ],
+          "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           "barrier_cursor": "45"
         }
       ],
@@ -168,17 +174,21 @@
     "same_vmk_rewrapped_under_new_instance_secret": true,
     "record_ciphertexts_byte_identical": true,
     "record_ids_revision_ids_vectors_and_tombstone_flags_byte_identical": true,
-    "collection_markers_and_frontiers_byte_identical": true,
-    "source_device_ids_and_max_author_counters_preserved": true
+    "collection_marker_witness_certificates_and_frontiers_byte_identical": true,
+    "source_device_ids_and_max_author_counters_preserved": true,
+    "recovering_client_readback_reverified_before_completion": true,
+    "source_abandoned_only_after_destination_reverification": true
   },
   "atomic_import": {
     "administrative_transport": "verified_ssh_stdin_json",
     "requires_empty_staging_instance": true,
+    "server_has_no_vmk_and_does_not_verify_aead_or_collection_witness_hmac": true,
+    "server_enforces_canonical_shape_order_uniqueness_and_counter_bounds": true,
     "manifest_binds_source_cut_cursor_count_and_sha256": true,
     "manifest_has_separate_revision_collection_marker_and_source_device_counts": true,
     "page_phases": ["record_revisions", "collection_markers", "source_devices"],
     "revision_pages_sorted_by": ["record_id_uuid_bytes", "revision_id_uuid_bytes"],
-    "collection_marker_pages_sorted_by": ["record_id_uuid_bytes", "collected_revision_id_uuid_bytes"],
+    "collection_marker_pages_sorted_by": ["record_id_uuid_bytes"],
     "source_device_pages_sorted_by": ["device_id_uuid_bytes"],
     "collection_markers_imported_before_activation": true,
     "complete_source_device_registry_imported_before_activation": true,
@@ -283,6 +293,7 @@
   },
   "post_import_collection_barrier": {
     "record_id": "00000000-0000-4000-8000-000000000030",
+    "new_mutation_causal_context_includes_verified_marker_frontiers": true,
     "persisted_frontier": [
       {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "3"},
       {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
@@ -302,10 +313,16 @@
       "result": "stale_after_collection"
     },
     "dominating_upload": {
+      "author_device_id": "00000000-0000-4000-8000-000000000043",
+      "author_counter": "1",
+      "causal_context_from_verified_marker_frontiers": true,
       "version_vector": [
-        {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "4"},
-        {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+        {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "3"},
+        {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"},
+        {"device_id": "00000000-0000-4000-8000-000000000043", "counter": "1"}
       ],
+      "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "non_null_because_revision_strictly_dominates_complete_durable_frontier": true,
       "result": "accepted"
     },
     "marker_active_at_destination_activation": true,

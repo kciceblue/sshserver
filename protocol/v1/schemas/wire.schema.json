@@ -56,6 +56,7 @@
         "author_device_id",
         "author_counter",
         "version_vector",
+        "collection_witness_authenticator",
         "payload_schema",
         "crypto_suite",
         "tombstone",
@@ -75,8 +76,24 @@
           "uniqueItems": true,
           "items": {"$ref": "#/$defs/vector_entry"}
         },
+        "collection_witness_authenticator": {
+          "description": "Required nullable explicit collection-witness authorization. Null means this revision cannot be copied into a collection marker. A non-null value is exactly 32 client-generated HMAC-SHA-256 bytes authenticating this revision ID and canonical vector under the per-record collection-witness key. Honest clients emit it only for a tombstone or a revision that strictly dominates their complete durable same-record frontier. The null/non-null kind and, when present, raw bytes are bound into this revision's AEAD associated data.",
+          "oneOf": [
+            {"type": "null"},
+            {
+              "allOf": [
+                {"$ref": "#/$defs/base64url"},
+                {
+                  "type": "string",
+                  "minLength": 43,
+                  "maxLength": 43
+                }
+              ]
+            }
+          ]
+        },
         "payload_schema": {"const": "1"},
-        "crypto_suite": {"const": "jat-xchacha-hkdf-argon2id-draft1"},
+        "crypto_suite": {"const": "jat-xchacha-hkdf-argon2id-draft2"},
         "tombstone": {"type": "boolean"},
         "nonce": {
           "allOf": [{"$ref": "#/$defs/base64url"}],
@@ -118,7 +135,7 @@
       ],
       "properties": {
         "protocol_version": {"const": "1"},
-        "crypto_suite": {"const": "jat-xchacha-hkdf-argon2id-draft1"},
+        "crypto_suite": {"const": "jat-xchacha-hkdf-argon2id-draft2"},
         "instance_id": {"$ref": "#/$defs/uuid"},
         "vault_id": {"$ref": "#/$defs/uuid"},
         "envelope_generation": {"$ref": "#/$defs/uint64"},
@@ -210,20 +227,37 @@
     },
     "collection_marker": {
       "type": "object",
+      "description": "The single monotonic exact witness certificate for record_id. Its frontier and non-null explicit collection-witness authenticator are copied byte-for-byte from witness_revision_id. A revision carrying null cannot authorize a marker. A replacement witness must strictly dominate the old frontier; exact tuple replay is idempotent and equal-vector/different-witness input is equivocation. The HMAC authenticates explicit authorization and the witness/vector but does not prove completeness, maximality, collection, or barrier_cursor.",
       "additionalProperties": false,
-      "required": ["record_id", "collected_revision_id", "frontier", "barrier_cursor"],
+      "required": ["record_id", "witness_revision_id", "frontier", "collection_witness_authenticator", "barrier_cursor"],
       "properties": {
         "record_id": {"$ref": "#/$defs/uuid"},
-        "collected_revision_id": {"$ref": "#/$defs/uuid"},
+        "witness_revision_id": {"$ref": "#/$defs/uuid"},
         "frontier": {
           "type": "array",
-          "description": "Nonempty and strictly increasing by raw UUID bytes with one unique positive-counter entry per device. Semantic validation rejects duplicate IDs even when their counters differ.",
+          "description": "Exact vector copied from witness_revision_id: nonempty and strictly increasing by raw UUID bytes with one unique positive-counter entry per device. Semantic validation rejects duplicate IDs even when their counters differ; a server-generated component-wise join is forbidden.",
           "minItems": 1,
           "maxItems": 64,
           "uniqueItems": true,
           "items": {"$ref": "#/$defs/vector_entry"}
         },
-        "barrier_cursor": {"$ref": "#/$defs/uint64"}
+        "collection_witness_authenticator": {
+          "allOf": [
+            {"$ref": "#/$defs/base64url"},
+            {
+              "type": "string",
+              "minLength": 43,
+              "maxLength": 43,
+              "description": "Exact non-null 32-byte explicit collection-witness authenticator copied from the witness revision and verified client-side before the marker can affect a snapshot, causal clock, stale barrier, or recovery."
+            }
+          ]
+        },
+        "barrier_cursor": {
+          "allOf": [
+            {"$ref": "#/$defs/uint64"}
+          ],
+          "description": "Unauthenticated server-operational acknowledgement cursor recorded with the certificate. It is not part of the HMAC and is never a client security or conflict-resolution input."
+        }
       }
     },
     "change": {
@@ -308,13 +342,13 @@
         "storage_schema": {"const": "1"},
         "crypto_suites": {
           "type": "array",
-          "items": {"const": "jat-xchacha-hkdf-argon2id-draft1"},
+          "items": {"const": "jat-xchacha-hkdf-argon2id-draft2"},
           "minItems": 1,
           "maxItems": 1
         },
         "capabilities": {
           "type": "array",
-          "description": "Sorted advertised capabilities. Recovery-complete snapshot responses require snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1.",
+          "description": "Sorted advertised capabilities. Recovery-complete snapshot responses require authenticated-collection-frontiers-v2, snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1.",
           "uniqueItems": true,
           "items": {"type": "string"}
         },
@@ -444,6 +478,7 @@
         "request_id": {"$ref": "#/$defs/uuid"},
         "required_capabilities": {
           "const": [
+            "authenticated-collection-frontiers-v2",
             "snapshot-collection-markers-v1",
             "snapshot-device-registry-v1",
             "snapshot-read-v1"
@@ -677,6 +712,7 @@
     },
     "revoke_device_request": {
       "type": "object",
+      "description": "For self-revocation, the body request_id must equal JAT-Request-ID. The exact authenticated raw body is fingerprinted and retained with the pre-revocation token hash and byte-equivalent 200 response for endpoint-only receipt replay.",
       "additionalProperties": false,
       "required": ["request_id", "allow_zero_active"],
       "properties": {

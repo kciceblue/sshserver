@@ -1,0 +1,76 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-executable-public-only-secure-enclave-fixture",
+  "description": "Deterministic public-only P-256 identity fixture. The public point was generated and validated locally with the Apache-2.0 OpenSSL CLI; no private key is committed.",
+  "canonical_identity": {
+    "payload_version": 1,
+    "record_type": "secure_enclave_identity",
+    "body": {
+      "name": "Device-bound P-256 fixture",
+      "notes": "Public-only canonical X9.63 point",
+      "key_kind": "secure_enclave_p256",
+      "public_key_encoding": "p256-x963-uncompressed-v1",
+      "public_key": "BOXLx8gqGH28bPrcbaetgBy-wOK9KUpSOp7WTpn9wuqFd97BhsZAVr1IL2KPhsyg0d1beoJZO0W0lMuYKKJ71mU",
+      "fingerprint": "SHA256:psVtrgxRPZhkaSJxlG9jWh+dj9L64yVazx5gwsMymtY",
+      "origin_device_id": "00000000-0000-4000-8000-000000000010",
+      "availability": "device_bound",
+      "created_at": "2026-07-27T00:00:00.000Z",
+      "updated_at": "2026-07-27T00:00:00.000Z"
+    }
+  },
+  "negative_cases": [
+    {
+      "name": "missing-public-key-encoding",
+      "mutation": {"operation": "remove", "field": "public_key_encoding"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "wrong-public-key-encoding",
+      "mutation": {"operation": "replace", "field": "public_key_encoding", "value": "p256-spki-der-v1"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "empty-public-key",
+      "mutation": {"operation": "replace", "field": "public_key", "value": ""},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "compressed-sec1-public-key",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "A-XLx8gqGH28bPrcbaetgBy-wOK9KUpSOp7WTpn9wuqF"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "spki-der-public-key",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5cvHyCoYfbxs-txtp62AHL7A4r0pSlI6ntZOmf3C6oV33sGGxkBWvUgvYo-GzKDR3Vt6glk7RbSUy5goonvWZQ"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "wrong-uncompressed-prefix",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "AuXLx8gqGH28bPrcbaetgBy-wOK9KUpSOp7WTpn9wuqFd97BhsZAVr1IL2KPhsyg0d1beoJZO0W0lMuYKKJ71mU"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "off-curve-point",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "noncanonical-base64url",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "BOXLx8gqGH28bPrcbaetgBy-wOK9KUpSOp7WTpn9wuqFd97BhsZAVr1IL2KPhsyg0d1beoJZO0W0lMuYKKJ71mV"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "fingerprint-mismatch",
+      "mutation": {"operation": "replace", "field": "fingerprint", "value": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+      "rejected_by": "key_validation"
+    }
+  ],
+  "expected": {
+    "decoded_public_key_bytes": 65,
+    "encoded_public_key_characters": 87,
+    "uncompressed_prefix_hex": "04",
+    "private_key_committed": false,
+    "strict_curve_parse_and_canonical_reencode_required": true,
+    "fingerprint_algorithm": "OpenSSH ecdsa-sha2-nistp256 SHA-256"
+  }
+}

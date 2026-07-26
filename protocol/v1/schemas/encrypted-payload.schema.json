@@ -254,6 +254,7 @@
         "name",
         "notes",
         "key_kind",
+        "public_key_encoding",
         "public_key",
         "fingerprint",
         "origin_device_id",
@@ -265,8 +266,25 @@
         "name": {"type": "string", "minLength": 1, "maxLength": 1024},
         "notes": {"type": "string", "maxLength": 65536},
         "key_kind": {"const": "secure_enclave_p256"},
-        "public_key": {"$ref": "wire.schema.json#/$defs/base64url"},
-        "fingerprint": {"type": "string", "minLength": 1, "maxLength": 512},
+        "public_key_encoding": {"const": "p256-x963-uncompressed-v1"},
+        "public_key": {
+          "allOf": [
+            {"$ref": "wire.schema.json#/$defs/base64url"},
+            {
+              "type": "string",
+              "minLength": 87,
+              "maxLength": 87,
+              "description": "Canonical unpadded base64url for exactly 65 ANSI X9.63/SEC1 bytes 0x04 || X32 || Y32. Implementations strictly decode, parse as a P-256 point, canonically re-encode, and require byte equality before persistence."
+            }
+          ]
+        },
+        "fingerprint": {
+          "type": "string",
+          "minLength": 50,
+          "maxLength": 50,
+          "pattern": "^SHA256:[A-Za-z0-9+/]{43}$",
+          "description": "OpenSSH SHA-256 fingerprint recomputed from the canonical ecdsa-sha2-nistp256 public blob and required to match exactly before persistence."
+        },
         "origin_device_id": {"$ref": "wire.schema.json#/$defs/uuid"},
         "availability": {"const": "device_bound"},
         "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},

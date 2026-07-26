@@ -14,8 +14,9 @@
       "version_vector": [
         {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
       ],
+      "collection_witness_authenticator": null,
       "payload_schema": "1",
-      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
       "tombstone": false,
       "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
@@ -28,8 +29,9 @@
       "version_vector": [
         {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
       ],
+      "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "payload_schema": "1",
-      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
       "tombstone": true,
       "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
@@ -46,8 +48,9 @@
       {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
       {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
     ],
+    "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "payload_schema": "1",
-    "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+    "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
     "tombstone": false,
     "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
@@ -124,7 +127,72 @@
     ],
     "normal_upload_result": "accepted",
     "normal_collection_marker_result": "accepted",
-    "malformed_recovery_import_result": "refuse_recovery_import"
+    "malformed_recovery_import_result": "refuse_recovery_import",
+    "collection_witness_authorization": {
+      "complete_durable_frontier_includes_all_verified_revisions_and_prior_marker": true,
+      "acknowledgement_alone_discards_frontier_input": false,
+      "cases": [
+        {
+          "name": "initial_live_revision",
+          "tombstone": false,
+          "complete_durable_frontier": null,
+          "revision_vector": [
+            {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+          ],
+          "collection_witness_authenticator": null
+        },
+        {
+          "name": "incomparable_live_sibling",
+          "tombstone": false,
+          "complete_durable_frontier": [
+            {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+          ],
+          "revision_vector": [
+            {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+          ],
+          "collection_witness_authenticator": null
+        },
+        {
+          "name": "stale_live_revision",
+          "tombstone": false,
+          "complete_durable_frontier": [
+            {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"}
+          ],
+          "revision_vector": [
+            {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+          ],
+          "collection_witness_authenticator": null
+        },
+        {
+          "name": "strictly_dominating_resolution",
+          "tombstone": false,
+          "complete_durable_frontier": [
+            {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"},
+            {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+          ],
+          "revision_vector": [
+            {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
+            {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+          ],
+          "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        },
+        {
+          "name": "tombstone_authorization_before_collection_eligibility",
+          "tombstone": true,
+          "complete_durable_frontier": [
+            {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+          ],
+          "revision_vector": [
+            {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+          ],
+          "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      ],
+      "initial_live_null_replaced_with_resolution_tag_result": "aead_or_collection_witness_authenticator_mismatch",
+      "marker_null_authenticator_result": "invalid_request"
+    },
+    "non_null_collection_witness_authenticator_placeholder_is_not_reviewed_crypto_output": true,
+    "smaller_structurally_valid_frontier_with_unchanged_authenticator_result": "collection_witness_authenticator_mismatch"
   },
   "expected": {
     "siblings_before_resolution": 2,

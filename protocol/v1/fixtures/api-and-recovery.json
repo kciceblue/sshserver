@@ -8,8 +8,9 @@
     "protocol_min": "1",
     "protocol_max": "1",
     "storage_schema": "1",
-    "crypto_suites": ["jat-xchacha-hkdf-argon2id-draft1"],
+    "crypto_suites": ["jat-xchacha-hkdf-argon2id-draft2"],
     "capabilities": [
+      "authenticated-collection-frontiers-v2",
       "conflict-siblings-v1",
       "device-token-rotation-v1",
       "envelope-cas-v1",

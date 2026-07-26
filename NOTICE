@@ -8,6 +8,6 @@ stage. External GitHub Actions used by CI are recorded in DEPENDENCIES.json
 and are not redistributed by this repository.
 
 The protocol conformance tests invoke a system-provided OpenSSL 3 command-line
-tool (Apache-2.0) to strictly parse, canonically re-encode, and derive the
-public halves of software-identity key fixtures. OpenSSL is not linked into or
-redistributed by this repository.
+tool (Apache-2.0) to strictly parse, validate, canonically re-encode, and derive
+the public halves of software-identity and public-only Secure Enclave identity
+fixtures. OpenSSL is not linked into or redistributed by this repository.

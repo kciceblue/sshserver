@@ -7,6 +7,7 @@
     "device_id": "00000000-0000-4000-8000-000000000003",
     "request_id": "00000000-0000-4000-8000-000000000040",
     "required_capabilities": [
+      "authenticated-collection-frontiers-v2",
       "snapshot-collection-markers-v1",
       "snapshot-device-registry-v1",
       "snapshot-read-v1"
@@ -19,7 +20,7 @@
     "envelope_generation": "2",
     "envelope": {
       "protocol_version": "1",
-      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+      "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
       "instance_id": "00000000-0000-4000-8000-000000000001",
       "vault_id": "00000000-0000-4000-8000-000000000002",
       "envelope_generation": "2",
@@ -61,8 +62,9 @@
             "version_vector": [
               {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
             ],
+            "collection_witness_authenticator": null,
             "payload_schema": "1",
-            "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+            "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
             "tombstone": false,
             "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
@@ -94,8 +96,9 @@
             "version_vector": [
               {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
             ],
+            "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "payload_schema": "1",
-            "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+            "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
             "tombstone": true,
             "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
@@ -122,11 +125,12 @@
         "collection_markers": [
           {
             "record_id": "00000000-0000-4000-8000-000000000030",
-            "collected_revision_id": "00000000-0000-4000-8000-000000000031",
+            "witness_revision_id": "00000000-0000-4000-8000-000000000031",
             "frontier": [
               {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "3"},
               {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
             ],
+            "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "barrier_cursor": "45"
           }
         ],
@@ -309,8 +313,9 @@
             {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"},
             {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
           ],
+          "collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           "payload_schema": "1",
-          "crypto_suite": "jat-xchacha-hkdf-argon2id-draft1",
+          "crypto_suite": "jat-xchacha-hkdf-argon2id-draft2",
           "tombstone": false,
           "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
@@ -332,6 +337,29 @@
     "tombstone_sibling_count": 1,
     "collection_marker_count": 1,
     "collection_marker_frontiers_preserved": true,
+    "collection_marker_witness_certificates_preserved": true,
+    "checkpoint_coverage": {
+      "ordinary_revision_checkpoint_without_prior_marker": {
+        "record_id": "00000000-0000-4000-8000-000000000020",
+        "prior_marker_checkpoint_present": false,
+        "prior_durable_frontier": [
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+        ],
+        "incoming_marker_present": false,
+        "incoming_revision_aggregate_covers_prior_frontier": true,
+        "result": "accepted"
+      },
+      "prior_marker_checkpoint": {
+        "record_id": "00000000-0000-4000-8000-000000000030",
+        "prior_marker_frontier": [
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "3"},
+          {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+        ],
+        "incoming_marker_relation": "exact",
+        "result": "accepted",
+        "missing_incoming_marker_result": "rollback_or_fork_rejected"
+      }
+    },
     "all_source_devices_included": true,
     "source_device_count": 3,
     "never_authored_source_device_id": "00000000-0000-4000-8000-000000000003",

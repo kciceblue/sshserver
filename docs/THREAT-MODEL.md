@@ -80,19 +80,24 @@ but cannot erase data or keys already present on that device.
 ### Review-pending goals
 
 1. XChaCha20-Poly1305 detects record modification, swapping between IDs,
-   visible-metadata modification, and wrong-key/wrong-passphrase use.
+   visible-metadata modification, and wrong-key/wrong-passphrase use; the
+   independently domain-separated per-record HMAC authenticates exact
+   revision/witness frontiers after revision ciphertext is collected.
 2. Passphrase mode prevents host-only VMK unwrapping except through offline
    guessing.
 3. Per-device bearer credentials provide independently revocable server
    access without storing token plaintext server-side.
-4. Durable client checkpoints detect rollback relative to state that device has
-   previously observed.
+4. Durable client checkpoints, including the complete per-record causal
+   frontier from every authenticated revision and marker plus the latest
+   authenticated monotonic marker tuple, detect rollback relative to state
+   that device has previously observed.
 5. Retention and acknowledgement rules prevent an honest server from collecting
    a deletion before every active device has durably observed it.
-6. Stable full snapshots return every undominated sibling, every persistent
-   collection-marker frontier, and every source device ID with its exact
-   maximum author counter at one cut, then move to deltas without a pagination
-   gap, resurrection window, or reusable retired identity.
+6. Stable full snapshots return every undominated sibling, the single
+   persistent authenticated witness marker per applicable record, and every
+   source device ID with its exact maximum author counter at one cut, then move
+   to deltas without a pagination gap, resurrection window, or reusable
+   retired identity.
 
 These goals become claims only after Tom approves the exact construction and
 the Swift and Go conformance suites pass reviewed vectors.
@@ -108,8 +113,8 @@ V1 does not protect against:
 - offline passphrase guessing after full host or complete-backup disclosure;
 - disclosure of the metadata budget listed in the protocol;
 - a user explicitly trusting an attacker's SSH host key;
-- coherent rollback presented to a newly recovered device that has no surviving
-  checkpoint;
+- coherent rollback, including a valid older marker certificate, presented to a
+  newly recovered device that has no surviving checkpoint;
 - secure remote erasure of a lost device;
 - filesystem guarantees stronger than the host operating system provides; or
 - reconstruction of any Secure Enclave private key.
@@ -128,19 +133,19 @@ V1 does not protect against:
 | Revoked device reconnects | Server rejects token before read/write transaction | Returning local edits require explicit import under a fresh device ID; no implicit resurrection. |
 | Modified ciphertext/tag | AEAD validation fails | Quarantine exact opaque revision; keep good siblings and do not apply local or Keychain mutations. |
 | Record swapping | Record/revision/vault IDs are authenticated as associated data | Reject and quarantine. |
-| Visible vector/frontier/tombstone alteration | Vector and tombstone fields are authenticated as associated data; every vector and frontier is nonempty, uniquely keyed, positive-counter, and canonically ordered | Reject empty, duplicate, out-of-order, zero-valued, author-mismatched, or cryptographically invalid input before comparison or recovery import; server-owned cursor/time remain non-authoritative. |
+| Visible vector/frontier/tombstone/authorization alteration | Revision vectors, tombstone fields, and the null/non-null collection-witness authorization kind and bytes are bound by AEAD associated data; a non-null authorization is additionally a VMK-derived per-record witness HMAC that can survive as the marker certificate | Reject empty, duplicate, out-of-order, zero-valued, author-mismatched, noncanonical, or HMAC/AEAD-invalid input before comparison or local activation. Initial and non-dominating live revisions carry null and cannot authorize collection. The HMAC proves explicit authorization and tuple integrity, not server completeness or maximality; server-owned cursor/time remain non-authoritative. |
 | Replay of an older individual revision | Durable vectors/counters retain newer siblings | Ignore dominated replay and record diagnostic evidence. |
-| Coherent full-state rollback | Surviving device compares durable envelope generation, author counter, vectors, and checkpoint | Block sync and require recovery. A new device with no checkpoint cannot prove freshness. |
+| Selective or coherent valid-certificate rollback | Surviving device retains the complete durable causal frontier from all authenticated revisions and markers, plus the latest marker tuple and change checkpoint | Before accepting a marker, require its verified frontier to cover the full causal checkpoint; reject a valid but older revision/marker certificate, missing marker, weaker/incomparable frontier, or equal-vector/different-witness tuple. Acknowledgement alone never discards the evidence. A fresh device with no checkpoint cannot prove freshness. |
 | Server equivocation/fork | Different clients can receive different valid histories | V1 has no transparency log. It can detect contradictions when histories meet but cannot guarantee timely fork detection. |
 | Version-vector inflation by host | Host cannot forge valid record AD | Reject altered records. It can omit data or deny service. |
 | Version-vector inflation by enrolled malicious device | Device with VMK can create valid data; server enforces sequential author counters | Limit prevents large jumps but not deliberate valid churn. Revoke device; availability impact remains. |
 | Concurrent edit/edit | Vectors incomparable | Retain both; deterministic projection is not deletion. User resolution dominates both. |
 | Concurrent edit/delete | Vectors incomparable | Retain live and tombstone siblings; never silently delete the edit or local key. |
-| Later sibling after tombstone acknowledgement | Per-record collection barrier is recomputed from every retained revision cursor while the record is locked | Raise the barrier; an unresolved concurrent tombstone remains ineligible. After collection, reject writes that do not dominate the persisted frontier. |
-| Host loss after collection | The surviving completed snapshot contains every persistent collection marker and its frontier, even when no revision for that record remains | Import markers into inert staging and activate them atomically with revisions. A stale write that does not dominate every imported frontier fails with `stale_after_collection`; recovery never resets the barrier. |
+| Later sibling after tombstone acknowledgement | Per-record collection barrier is recomputed while the record and its one monotonic marker are locked; a marker-advance witness must carry explicit non-null authorization and strictly dominate every other current revision and the old marker | Raise the barrier; unresolved siblings and null-authorized live revisions remain ineligible. Copy the witness ID/vector/HMAC exactly, never synthesize a join, and reject later writes that do not dominate the persisted marker frontier. A later-aged candidate already covered by an unchanged marker may be physically pruned after the original witness bytes are gone, but only under the same recomputed barrier, age, and acknowledgement checks. |
+| Host loss after collection | The surviving completed snapshot contains the single authenticated witness marker for every applicable record, even when no revision for that record remains | Surviving client verifies AEAD/HMAC before import; server preserves opaque bytes and structural invariants; recovering client re-verifies after activation. A stale write that does not dominate the imported marker fails with `stale_after_collection`; recovery never resets the barrier. |
 | Remote identity tombstone | Has no device-local custody generation or cleanup authority | Unlink shared record, preserve local key as orphan, require explicit local exact-generation cleanup. |
 | Lost one device | Other device or verified SSH path survives | Revoke token. Secure Enclave key on lost device is unrecoverable and must be replaced. |
-| Lost host, surviving device | Surviving client has VMK and a completed snapshot containing every sibling/tombstone/vector, both source generations, every persistent collection-marker frontier, and the complete source device registry at cut C | Preserve instance/vault IDs, take checked independent successors of the envelope and instance-secret generations, rewrap the same VMK under a new host secret, atomically import exact revisions, markers, and source device IDs, rebuild cursor floor C while reserving the mandatory enrollment cursor, reconstruct every old ID retired from the authoritative registry counter, and never sync the abandoned fork. A projection-only, marker-incomplete, or inferred-registry local store is insufficient; generation, cursor, or the 64-device capacity needed for one fresh enrollment fails before staging. |
+| Lost host, surviving device | Surviving client has VMK and a completed snapshot containing every sibling/tombstone/vector/nullable authorization, both source generations, each non-null monotonic marker witness tuple, and the complete source device registry at cut C | Verify AEAD, every non-null revision authorization, and every marker HMAC client-side; preserve instance/vault IDs, take checked independent successors, rewrap the same VMK, atomically import exact opaque revisions/markers/device IDs, rebuild cursor floor C while reserving enrollment, re-verify from the activated destination, and never sync the abandoned fork. Projection-only, marker-incomplete, inferred-registry, capacity-exhausted, or cryptographically invalid recovery fails closed. |
 | Lost instance secret, surviving device | Client still holds VMK | Create a new secret and conditionally rewrap. Never replace secret without a device-held VMK. |
 | Lost passphrase, surviving device | Device already holds VMK | After local authorization, set a new passphrase envelope. This proposed recovery requires Tom approval. |
 | Lost all devices, base mode | Host secret plus envelope can unwrap VMK | Enroll through verified SSH. Software identities recover; Secure Enclave private keys do not. |
@@ -155,7 +160,8 @@ V1 does not protect against:
 | Snapshot expires mid-page | Snapshot ID/token is missing or lease expires | Discard all staged pages and begin a fresh cut; never combine snapshots or fall back to an empty delta. |
 | Snapshot-create storage exhaustion | A unique request is rate-limited to five attempts per rolling minute per device, with one active snapshot per device, eight per instance, and 64 MiB total active snapshot metadata | Return `rate_limited` or `limit_exceeded` before persisting a snapshot/cut, allocating metadata, or retaining a revision reference. Exact retries return the existing lease without consuming capacity. Snapshot membership uses content-addressed references to existing immutable revision payloads rather than full-vault copies. |
 | Snapshot holder attempts to delay revocation | Copied snapshot metadata and retained content-addressed revision references never lock live registry rows; each page reauthenticates current device state | Commit revocation immediately and return `token_revoked` on every later page request by that owner. |
-| Incompatible protocol/crypto version | Negotiation has no compatible required capability, or the snapshot caller does not declare the exact canonical `snapshot-collection-markers-v1`, `snapshot-device-registry-v1`, and `snapshot-read-v1` trio | Preserve opaque data and block affected writes; reject snapshot creation with `unsupported_capability` before allocation; never downgrade or reset. |
+| Lost self-revocation response | Retired row retains the exact request ID, authenticated raw-body fingerprint, pre-revocation token hash, and byte-equivalent 200 response | On the revoke endpoint only, the same revoked bearer may retrieve that exact receipt when target, header ID, body ID, and raw body all match. Any mismatch returns indistinguishable `token_revoked`; beyond the constant-time retired-receipt row lookup, replay grants no general device/vault/ciphertext read, mutation, scope, cursor, lease, timing refresh, or authority elsewhere. |
+| Incompatible protocol/crypto version | Negotiation lacks draft2 or the snapshot caller does not declare the exact canonical quartet `authenticated-collection-frontiers-v2`, `snapshot-collection-markers-v1`, `snapshot-device-registry-v1`, and `snapshot-read-v1` | Preserve opaque data and block affected writes; reject snapshot creation with `unsupported_capability` before allocation; never treat draft1 and draft2 as the same suite or downgrade/reset. |
 
 ## 6. Mode guarantees
 
@@ -199,9 +205,15 @@ access policy remain review-pending.
 ### 7.2 Secure Enclave identities
 
 Only public key, fingerprint, origin device, and non-secret descriptive data
-sync. Other devices display an unavailable placeholder and must not imply the
-private key was backed up. Device loss means replacement and remote
-reauthorization, not key recovery.
+sync. Before persistence, clients require the canonical 65-byte uncompressed
+P-256 X9.63 point, strict curve parse and byte-identical re-encoding, and an
+exact recomputed OpenSSH fingerprint. Empty, compressed, DER/SPKI,
+wrong-length, wrong-prefix, off-curve, non-canonical, and fingerprint-mismatched
+values are rejected before local state or custody changes. Other devices
+display an unavailable placeholder and must not imply the private key was
+backed up. Device loss means replacement and remote reauthorization, not key
+recovery. This validation and the local custody boundary remain Tom-review
+gates.
 
 ### 7.3 Deletion authority
 
@@ -262,7 +274,10 @@ The implementation must eventually demonstrate:
 - atomic identity-preserving host-recovery import with independent checked
   generation successors, cursor-floor and reserved-enrollment cursor/device
   capacity, authoritative complete source-device reconstruction, revision
-  vector, collection-marker frontier, and stale-after-collection tests;
+  vector/AEAD and nullable witness-authorization verification, monotonic
+  one-marker-per-record non-null witness HMAC,
+  pre-import and post-activation client verification, and
+  stale-after-collection tests;
 - crash/restart tests at each durable state-machine boundary; and
 - no server vault-crypto dependency or private-key parser.
 
@@ -273,8 +288,10 @@ Tom's recorded review must explicitly accept or revise:
 1. HTTP/1.1 JSON over SSH-forwarded loopback and the listener/limit profile.
 2. Random sizes, token/grant hashing, client-generated token model, scopes,
    rotation, and last-device rules.
-3. HKDF construction, domain labels, envelope and record associated data,
-   XChaCha20-Poly1305 usage, nonce requirements, and known-answer vectors.
+3. HKDF construction, domain labels, envelope and draft2 record associated
+   data, independent collection-witness key/HMAC, XChaCha20-Poly1305 usage,
+   nonce requirements, marker-checkpoint rollback behavior, and known-answer
+   vectors.
 4. Argon2id version `0x13` (19), parameters, device calibration floor, NFC handling, passphrase
    reset with a surviving device, and the warning for disabling passphrase
    mode.
@@ -285,8 +302,8 @@ Tom's recorded review must explicitly accept or revise:
    exact-generation actions may delete protected keys.
 8. Base/passphrase compromise wording, rollback limitation, recovery matrix,
    and intentional unrecoverability cases.
-9. Stable full-snapshot pagination, persistent tombstone collection-marker
-   frontiers, marker/device-registry capability negotiation, and
+9. Stable full-snapshot pagination, the bounded monotonic authenticated witness
+   marker per record, draft2 marker/device-registry capability negotiation, and
    identity-preserving host-loss recovery including independent generation
    successors, complete source-device reconstruction, reserved enrollment
    cursor/device capacity, and stale-after-collection reconstruction.

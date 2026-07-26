@@ -58,6 +58,15 @@ Implementations MUST NOT ship P1–P6 until Tom approves the exact profile and
 the fixtures in `protocol/v1/fixtures/crypto-review-vectors.json` contain
 independently verified cryptographic outputs.
 
+The proposed wire suite is
+`jat-xchacha-hkdf-argon2id-draft2`, with numeric suite ID 2 in canonical
+associated data. It supersedes the never-shipped draft1 proposal because
+draft2 adds explicit nullable collection-witness authorization to record
+revisions and binds its kind and bytes into record associated data. Draft1 and
+draft2 are not interchangeable or negotiable as the same suite. Servers advertise
+`authenticated-collection-frontiers-v2`; a client that does not understand it
+preserves the opaque data and blocks writes.
+
 ## 2. Scope and non-goals
 
 One server instance owns one `instance_id` and one `vault_id`. It serves one
@@ -366,6 +375,44 @@ device, or local plaintext. A potentially compromised device therefore also
 requires a separately reviewed VMK-rotation/re-encryption operation if future
 confidentiality from that device is required; that operation is outside V1.
 
+Self-revocation remains permitted and has one deliberately narrow exception to
+ordinary revoked-token rejection. In the same transaction that retires its own
+row, the server retains for the life of that row:
+
+- the self-revocation request ID;
+- the exact authenticated request-body fingerprint;
+- the pre-revocation device-token hash; and
+- the byte-equivalent HTTP 200 response, including its original headers and
+  body.
+
+The body fingerprint is computed only after the bearer is matched to the
+retired row and the path target plus equal header and body request IDs are
+validated:
+
+```text
+SHA-256(
+  lp("JAT self revocation body fingerprint v1") ||
+  uuid_bytes(instance_id) ||
+  uuid_bytes(vault_id) ||
+  uuid_bytes(target_device_id) ||
+  lp(exact_raw_request_body_bytes)
+)
+```
+
+On this endpoint only, receipt lookup for a retired row occurs before the
+ordinary revoked-token rejection. The same pre-revocation bearer may retrieve
+only the recorded response when the target device, `JAT-Request-ID`, body
+request ID, and exact raw authenticated body bytes all match the retained
+receipt. This is a receipt lookup, not authorization: it performs no general
+device, vault, envelope, ciphertext, sync, snapshot, cursor, acknowledgement,
+scope, lease, last-sync, or rate-window read beyond the constant-time
+retired-receipt row lookup; performs no state mutation; and does not refresh
+any timestamp, receipt lifetime, or other lifetime. Any token, target, header,
+or body mismatch returns the same HTTP 401 `token_revoked` response without
+revealing whether a receipt exists or which field differed. No other endpoint
+or request gains this exception. Token-hash and body-fingerprint comparisons
+are constant-time.
+
 Revoking the last active device requires `allow_zero_active: true`. With zero
 active devices, record and tombstone garbage collection freezes. A new device
 can enroll only with a fresh SSH-created grant. Vault deletion is a separate
@@ -440,7 +487,7 @@ the 32-byte VMK. Associated data is this byte concatenation:
 ```text
 lp("JAT vault envelope AD v1") ||
 u16be(protocol_major = 1) ||
-u16be(crypto_suite = 1) ||
+u16be(crypto_suite = 2) ||
 uuid_bytes(instance_id) ||
 uuid_bytes(vault_id) ||
 u64be(envelope_generation) ||
@@ -495,18 +542,76 @@ record_prk = HKDF-SHA-256-Extract(
 record_key = HKDF-SHA-256-Expand(
   record_prk,
   info = lp("JAT record key v1") ||
+         u16be(protocol_major = 1) ||
+         u16be(crypto_suite = 2) ||
          uuid_bytes(instance_id) ||
-         uuid_bytes(vault_id),
+         uuid_bytes(vault_id) ||
+         uuid_bytes(record_id),
   length = 32
 )
 ```
 
-Every revision uses a new 24-byte random nonce. Its associated data is:
+The separately domain-separated per-record collection-witness key is:
+
+```text
+collection_witness_prk = HKDF-SHA-256-Extract(
+  salt = uuid_bytes(record_id),
+  ikm = VMK
+)
+collection_witness_key = HKDF-SHA-256-Expand(
+  collection_witness_prk,
+  info = lp("JAT collection witness key v1") ||
+         u16be(protocol_major = 1) ||
+         u16be(crypto_suite = 2) ||
+         uuid_bytes(instance_id) ||
+         uuid_bytes(vault_id) ||
+         uuid_bytes(record_id),
+  length = 32
+)
+```
+
+`collection_witness_authenticator` is a required nullable wire field. `null`
+explicitly means that the revision is not authorized for use as a collection
+witness. An honest client:
+
+- MUST emit `null` for an initial live revision and for any live revision that
+  does not strictly dominate its complete durable same-record causal frontier;
+- MUST emit a non-null authenticator for a tombstone; and
+- MUST emit a non-null authenticator for a live revision that strictly
+  dominates that complete frontier, including a conflict resolution.
+
+The complete durable frontier incorporates every authenticated revision and
+every previously verified marker for the record; acknowledgement alone does
+not remove an input. A tombstone may carry explicit authorization before it is
+eligible for collection, but the server-side dominance, age, and
+acknowledgement checks below still apply. Initial live revisions never carry
+authorization. For an authorized revision, the client computes:
+
+```text
+collection_witness_authenticator = HMAC-SHA-256(
+  collection_witness_key,
+  lp("JAT collection witness authenticator v1") ||
+  u16be(protocol_major = 1) ||
+  u16be(crypto_suite = 2) ||
+  uuid_bytes(instance_id) ||
+  uuid_bytes(vault_id) ||
+  uuid_bytes(record_id) ||
+  uuid_bytes(revision_id) ||
+  u16be(vector_entry_count) ||
+  concat(for each vector entry sorted by device UUID bytes:
+      uuid_bytes(device_id) || u64be(counter))
+)
+```
+
+The wire encodes a present authenticator's exact 32 bytes as 43-character
+unpadded base64url. The server stores the nullable field but cannot derive the
+key or authenticate a non-null value. Every revision uses a new 24-byte random
+nonce. Its associated data is:
 
 ```text
 lp("JAT record revision AD v1") ||
 u16be(protocol_major = 1) ||
-u16be(crypto_suite = 1) ||
+u16be(crypto_suite = 2) ||
 uuid_bytes(instance_id) ||
 uuid_bytes(vault_id) ||
 uuid_bytes(record_id) ||
@@ -516,9 +621,19 @@ u64be(author_counter) ||
 u16be(payload_schema = 1) ||
 u8(tombstone ? 1 : 0) ||
 u16be(vector_entry_count) ||
-for each vector entry sorted by device UUID bytes:
-    uuid_bytes(device_id) || u64be(counter)
+concat(for each vector entry sorted by device UUID bytes:
+    uuid_bytes(device_id) || u64be(counter)) ||
+u8(collection_witness_authenticator_kind) ||
+if collection_witness_authenticator_kind == 1:
+    collection_witness_authenticator_bytes
 ```
+
+Authenticator kind 0 means `null` and contributes no following bytes. Kind 1
+means the HMAC construction above and contributes exactly 32 decoded bytes.
+Every other kind is invalid. Consequently altering an existing ciphertext's
+field from null to non-null or vice versa, or substituting another revision's
+tag, changes associated data and fails AEAD validation; a tag copied across
+revision IDs or vectors also fails HMAC verification.
 
 Every version vector and collection-marker frontier is nonempty and canonical.
 Entries are strictly increasing by the raw 16 UUID bytes, so each device ID
@@ -531,9 +646,12 @@ author-mismatched vector or frontier with `invalid_request` before using it for
 comparison, associated-data construction, snapshot staging, or recovery
 import.
 
-All client-supplied server-visible synchronization metadata is authenticated.
-The server-assigned change cursor and receipt time are not part of the record
-and are never used to select data.
+All client-supplied server-visible synchronization metadata is authenticated:
+record AEAD binds the author, counter, payload, tombstone, vector, and nullable
+authorization kind and bytes. When authorization is non-null, its
+domain-separated HMAC additionally binds the canonical witness revision and
+vector. The server-assigned change cursor and receipt time are not part of the
+record and are never used to select data.
 
 For a live revision, plaintext is UTF-8 JSON matching section 9. For a
 tombstone, plaintext is exactly the UTF-8 bytes
@@ -542,9 +660,10 @@ The visible tombstone flag and encrypted marker must agree; disagreement is a
 corrupt record.
 
 The client validates identifiers, vector ordering, associated data, AEAD tag,
-payload schema, record type, and application fields before mutating local
-state. One corrupt revision is quarantined with its opaque bytes and does not
-cause good records to be discarded.
+every non-null collection-witness authenticator, payload schema, record type,
+and application fields before mutating local state. One corrupt revision is
+quarantined with its opaque bytes and does not cause good records to be
+discarded.
 
 ## 9. Encrypted application payload registry
 
@@ -617,9 +736,23 @@ boundary.
 ### 9.5 `secure_enclave_identity`
 
 The body contains `name`, `notes`, `key_kind = secure_enclave_p256`, public-key
-bytes, fingerprint, `origin_device_id`, `availability = device_bound`, and
-timestamps. It MUST NOT contain a private key, wrapped private key, Keychain
-persistent reference, custody generation, or cleanup authority.
+bytes with `public_key_encoding = p256-x963-uncompressed-v1`, fingerprint,
+`origin_device_id`, `availability = device_bound`, and timestamps. The public
+key is the canonical uncompressed ANSI X9.63/SEC1 P-256 point
+`0x04 || X32 || Y32`: exactly 65 decoded bytes and 87 unpadded base64url
+characters. Before any persistent local import or custody mutation, the client
+MUST strictly base64url-decode it, parse it as a point on P-256, canonically
+re-encode it in the same uncompressed form, and require byte-for-byte equality.
+It rejects an empty, compressed, DER/SPKI, wrong-length, wrong-prefix,
+off-curve, or non-canonical value. The client then MUST recompute the OpenSSH
+`ecdsa-sha2-nistp256` SHA-256 fingerprint from the canonical public point and
+require exact equality with `fingerprint`; the supplied fingerprint is not
+trusted.
+
+The body MUST NOT contain a private key, wrapped private key, Keychain
+persistent reference, custody generation, or cleanup authority. The public-key
+encoding, parsing, fingerprint verification, and local custody behavior remain
+**REVIEW-PENDING** and require Tom's review before implementation or merge.
 
 On any device without the matching local key, this record is an unavailable
 device-bound placeholder. The UI must say that the private key was not backed
@@ -657,8 +790,24 @@ version vector or decide a conflict.
 
 Each device maintains one durable unsigned 64-bit author counter across all
 records. Creating a mutation increments it exactly once. The version vector is
-the component-wise maximum of all durable revisions observed by the client,
-with the new author counter substituted for its own entry.
+the component-wise maximum of every durable revision vector and every retained,
+cryptographically verified collection-marker frontier observed by the client,
+with the new author counter substituted for its own entry. Marker frontiers
+remain part of this durable causal context even when no revision bytes for the
+record remain. A client MUST verify a marker before joining its frontier, and
+MUST NOT create a mutation for that record while an unverified or quarantined
+marker is present. This component-wise maximum is permitted for constructing a
+new client-authenticated revision; it is not permission for a server to
+synthesize a collection-marker frontier.
+
+The client also persists that component-wise maximum as the complete durable
+per-record causal frontier across every authenticated revision and verified
+marker it has ever accepted. Acknowledging a server cursor does not erase this
+causal evidence. The client retains the authenticated revision bytes and
+frontier at least until it has verified and durably checkpointed a marker whose
+frontier equals or strictly dominates the complete durable frontier. It may
+then prune local revision bytes under its local policy, but the causal frontier
+and latest marker tuple remain durable rollback evidence.
 
 Counters never wrap. A device at `UInt64.max` receives `counter_exhausted`, is
 made read-only, and must enroll with a new device ID before creating further
@@ -743,28 +892,95 @@ only from positive monotonic elapsed time while the daemon runs, checkpointing
 before collection. Restart downtime earns no age. Wall-clock jumps can alter
 displayed receipt times but cannot accelerate collection.
 
-Collection uses this mechanical per-record acknowledgement barrier. In the
-same transaction that locks the record against new revisions, the server:
+Collection uses one bounded monotonic marker per record, keyed and ordered only
+by `record_id`. A witness covers a candidate only when the candidate is the
+witness itself, with the exact same revision ID and vector, or when the witness
+vector strictly dominates the candidate vector. Equal-vector revisions with
+different IDs do not cover one another and prevent collection.
 
-1. requires the candidate either to be a tombstone that is the sole
-   undominated revision or to be strictly dominated by a retained revision;
-2. computes `barrier_cursor` as the greatest change cursor of every retained
+A marker-advance transaction locks the record, its current marker, and new
+revisions, then:
+
+1. selects exactly one retained witness revision for the record and requires
+   its `collection_witness_authenticator` to be non-null. A tombstone that is
+   the sole undominated revision may witness itself; otherwise the witness is a
+   retained resolution that the creating client explicitly authorized. The
+   marker frontier equals the witness's own vector. That vector MUST strictly
+   dominate every other candidate and retained revision for the record and,
+   when replacing a marker, strictly dominate its existing frontier;
+2. copies the witness revision ID, exact vector, and exact 32-byte non-null
+   authenticator. It MUST NOT synthesize a component-wise join, change a
+   counter, treat `null` as authorization, or substitute another revision's
+   authenticator;
+3. computes `barrier_cursor` as the greatest change cursor of every retained
    revision for that record, including a sibling or resolution accepted after
    the candidate;
-3. requires the candidate's durable retention-age counter to be at least 90
-   days and every currently active device's durable `ack_cursor` to be at least
-   `barrier_cursor`;
-4. writes a collection marker containing the record ID, collected revision ID,
-   joined version-vector frontier, and `barrier_cursor`; and only then
-5. removes the candidate bytes in that transaction.
+4. requires every candidate selected for removal to have at least 90 days of
+   durable retention age and every currently active device's durable
+   `ack_cursor` to be at least `barrier_cursor`;
+5. creates the marker when none exists, or replaces it only when the new exact
+   witness vector strictly dominates the old marker frontier. An exact replay
+   of the whole marker tuple is idempotent and consumes no new cursor;
+   equal-vector/different-witness input is `revision_equivocation`, while a
+   weaker or incomparable witness cannot authorize collection; and only then
+6. removes every selected retention-eligible candidate covered by that
+   witness—the self-witnessing sole tombstone itself or another revision the
+   witness strictly dominates—in the same transaction.
+
+A marker-unchanged physical-prune transaction does not select a retained
+witness and remains possible after the original witness revision bytes were
+deleted. It locks the same state, reuses the persisted exact non-null marker,
+recomputes the barrier across every currently retained revision, applies the
+same per-candidate age and active-device acknowledgement requirements, and
+removes only now-eligible candidates that the marker already covers. The
+marker tuple remains byte-identical and no marker change cursor is consumed.
+An equal-vector revision with a different revision ID is not covered by this
+path.
 
 A later concurrent sibling therefore raises the barrier and also makes an
 undominated tombstone ineligible until a retained resolution dominates both.
 The barrier is recomputed rather than cached outside the collection
-transaction. The collection marker remains after the bytes are removed. A
-later mutation must dominate its persisted frontier or the server rejects it
-with `stale_after_collection`; acknowledgement followed by delayed stale upload
-cannot resurrect collected state. The exact sequence is executable in
+transaction. One transaction may remove multiple retention-eligible candidates
+dominated by the same witness and changes the one marker at most once. A later
+physical prune under the unchanged exact marker is not a new logical marker
+transition. Delete/recreate/delete cycles therefore replace the same bounded
+row with strictly advancing witness certificates rather than growing marker
+storage. The server never combines witnesses, joins frontiers, treats a null
+revision field as authorization, or treats `barrier_cursor` as authenticated
+metadata.
+
+The witness HMAC proves only that a VMK holder explicitly authorized that exact
+revision ID and vector for possible collection use. It does not prove that the
+server reported all revisions, selected the maximal witness, completed a
+collection, or reported an honest `barrier_cursor`. A client recomputes and
+constant-time verifies every non-null revision authenticator and every marker
+HMAC before a marker can affect snapshot activation, durable causal context, a
+`stale_after_collection` decision, or recovery. A null marker authenticator or
+a missing, malformed, or mismatched non-null authenticator quarantines the
+record and fails snapshot/recovery closed; it can never replace or weaken the
+client's durable authenticated frontier checkpoint.
+
+A later mutation must strictly dominate the persisted marker frontier or the
+server rejects it with `stale_after_collection`; acknowledgement
+followed by delayed stale upload cannot resurrect collected state. A surviving
+client durably checkpoints the latest verified marker tuple and the complete
+causal frontier from all authenticated revisions and markers per record.
+Before accepting any marker, its verified frontier MUST equal or strictly
+dominate that complete durable frontier. Delta processing then accepts only an
+exact marker replay or a valid strictly dominating replacement, and rejects a
+missing, weaker, incomparable, or equal-vector/different-witness marker. For
+every prior marker checkpoint, a full snapshot MUST contain that exact marker
+or a valid strictly dominating replacement, even when its cut cursor is newer.
+Independently, the aggregate causal frontier formed from every authenticated
+snapshot revision and verified snapshot marker for each record MUST equal or
+strictly dominate that record's complete durable causal frontier. No marker is
+required for an ordinary record that had no prior marker checkpoint when the
+snapshot revisions alone cover its durable frontier. A valid older revision
+certificate or marker can therefore be replayed only as selective omission or
+coherent full-state rollback, which a surviving checkpoint detects. A newly
+enrolled device with no independent checkpoint cannot prove that a coherent
+older complete view was not replayed; V1 does not claim otherwise. The exact
+sequence is executable in
 `protocol/v1/fixtures/tombstone-retirement.json`.
 
 Retirement removes a device from future acknowledgement quorum but never
@@ -789,7 +1005,7 @@ The required operations are:
 | `POST /v1/snapshot-reads` | bearer, sync read | Create an idempotent stable full-state cut |
 | `POST /v1/snapshot-reads/{snapshot_id}/pages` | bearer, sync read | Read one stable sibling-complete snapshot page |
 | `GET /v1/devices` | bearer, devices read | Active and retired device metadata budget |
-| `POST /v1/devices/{device_id}/revoke` | bearer, devices manage | Durable revocation, optional zero-active confirmation |
+| `POST /v1/devices/{device_id}/revoke` | bearer, devices manage | Durable revocation, optional zero-active confirmation, exact self-revocation receipt replay |
 | `POST /v1/device-token-rotations` | bearer | Retry-safe token-hash replacement |
 
 ### 11.1 Delta requests and deterministic mutation order
@@ -807,7 +1023,8 @@ request receipts are retained for at least 30 days and 10,000 requests per
 device, whichever retains more. After a receipt ages out, record revision IDs,
 author counters, envelope generations, and acknowledgements still make an exact
 retry idempotent, but reuse of an expired request ID with unrelated bytes is no
-longer a security claim.
+longer a security claim. The retired-row self-revocation receipt in section 6.2
+is a permanent endpoint-only exception to this generic aging policy.
 
 The sync request carries `after_cursor`, `ack_cursor`, and sorted mutations.
 The mutation array is strictly increasing by this exact key:
@@ -828,16 +1045,18 @@ full-snapshot requirement; it is never silently interpreted as an empty delta.
 After `cursor_expired`, or when no trusted local checkpoint exists, the client
 uses the snapshot-read endpoints rather than guessing a new delta cursor.
 Recovery-complete V1 snapshots require `snapshot-read-v1`,
-`snapshot-collection-markers-v1`, and `snapshot-device-registry-v1`. A server
+`snapshot-collection-markers-v1`, `snapshot-device-registry-v1`, and
+`authenticated-collection-frontiers-v2`. A server
 emitting the required `collection_markers` or `source_devices` response member
 and its corresponding advertised page limit MUST advertise the corresponding
-capability; a client MUST require all three before creating a snapshot and
+capability; a client MUST require all four before creating a snapshot and
 fails closed with `unsupported_capability` when any is absent. The snapshot
 create body MUST declare `required_capabilities` as exactly this canonical,
 UTF-8-byte-sorted array:
 
 ```json
 [
+  "authenticated-collection-frontiers-v2",
   "snapshot-collection-markers-v1",
   "snapshot-device-registry-v1",
   "snapshot-read-v1"
@@ -884,13 +1103,14 @@ revision payload reference, or change an existing lease.
 Snapshot membership and page bytes remain fixed despite concurrent writes.
 The stream has three phases: pages of at most 128 revisions strictly ordered
 by `(record_id UUID bytes, revision_id UUID bytes)`, followed by pages of at
-most 128 collection markers strictly ordered by
-`(record_id UUID bytes, collected_revision_id UUID bytes)`, followed by pages
-of at most 64 source-device entries strictly ordered by `device_id UUID
-bytes`. Empty phases are skipped, and a page never mixes phases; siblings,
-markers, or device entries may cross a page boundary. Each opaque 32-byte page
-token is bound to snapshot ID, authenticated device ID, cut cursor, phase, and
-the next ordering key. Replaying a page token returns byte-equivalent JSON.
+most 128 collection markers strictly ordered by `record_id UUID bytes`,
+followed by pages of at most 64 source-device entries strictly ordered by
+`device_id UUID bytes`. Because there is exactly one marker per record,
+duplicate marker record IDs are invalid. Empty phases are skipped, and a page
+never mixes phases; siblings, markers, or device entries may cross a page
+boundary. Each opaque 32-byte page token is bound to snapshot ID, authenticated
+device ID, cut cursor, phase, and the next ordering key. Replaying a page token
+returns byte-equivalent JSON.
 At creation the server copies the envelope, collection markers, projected
 source-device entries, ordered membership keys, content addresses, and paging
 metadata into immutable snapshot metadata for the lease, proposed as 15
@@ -915,12 +1135,24 @@ access to the device-bound snapshot. `expires_at` is display metadata only.
 
 The client stages pages under one snapshot ID and atomically replaces its sync
 store only after all pages, the envelope, every AEAD value, every collection
-marker and frontier, every unique source-device entry, and the final null page
-token validate. A marker's `barrier_cursor` MUST be at most C. Every
+marker witness HMAC, every unique source-device entry, and the final null page
+token validate. It recomputes every non-null revision
+`collection_witness_authenticator` and every marker authenticator with the
+VMK-derived per-record key and compares in constant time; a null revision field
+is valid but cannot authorize a marker, while a null marker field is invalid.
+A marker's operational `barrier_cursor` MUST be at most C, but that cursor is
+not authenticated and never changes causal acceptance. Every
 `author_device_id`, revision-vector device ID, and marker-frontier device ID
 MUST appear in `source_devices`, and each referenced counter MUST be at most
-that entry's `max_author_counter`. The client retains every marker and source
-device separately; it never drops or weakens a frontier because the
+that entry's `max_author_counter`. Before activation, every prior marker
+checkpoint MUST have an exact incoming marker or a valid strictly dominating
+replacement; missing, weaker, incomparable, or equal-vector/different-witness
+input is rollback/fork evidence. Separately, for every locally checkpointed
+record, the aggregate frontier from all authenticated incoming revisions and
+verified incoming markers MUST equal or strictly dominate the complete durable
+causal frontier. An ordinary record with no prior marker needs no marker when
+its incoming revisions provide that coverage. The client retains every marker
+and source device separately; it never drops or weakens a frontier because the
 corresponding revision bytes are absent, and never infers that an absent device
 ID is reusable. It then calls `/v1/sync` with `after_cursor = C` and may set
 `ack_cursor = C` only after the complete snapshot is durable. The first delta
@@ -1006,9 +1238,11 @@ forbidden.
 
 Protocol negotiation cannot prevent a malicious host from replaying an old but
 previously valid complete view. A surviving client compares the server view to
-its durable envelope generation, author counter, vector components, and change
-checkpoint and blocks rollback. A newly recovered device with no external
-checkpoint cannot distinguish a coherent old backup from the latest state.
+its durable envelope generation, author counter, vector components, per-record
+authenticated marker checkpoints, and change checkpoint and blocks rollback.
+The HMAC proves marker tuple integrity, not completeness or maximality. A newly
+recovered device with no external checkpoint cannot distinguish a coherent old
+backup or valid older marker from the latest state.
 
 ## 14. Backup, restore, and lifecycle recovery — REVIEW-PENDING P6
 
@@ -1077,12 +1311,16 @@ V1 uses identity-preserving recovery because record keys and associated data
 authenticate `instance_id` and `vault_id`. The precondition is a surviving
 client that holds the VMK and a durably completed snapshot at source cut C,
 including every undominated live/tombstone sibling and its exact revision ID,
-vector, nonce, and ciphertext, plus every persistent collection marker and its
-exact collected revision ID, frontier, and barrier cursor, plus every source
-device ID and its exact maximum author counter. A local store containing only
-the deterministic projection, omitting a marker, or inferring its device
-registry only from retained vectors/frontiers is insufficient and the recovery
-command MUST refuse it.
+vector, collection witness authenticator, nonce, and ciphertext, plus the single
+persistent collection marker for each applicable record and its exact witness
+revision ID, frontier, collection witness authenticator, and barrier cursor, plus every
+source device ID and its exact maximum author counter. Before producing an
+import, the surviving client verifies every revision AEAD, every non-null
+revision collection-witness authenticator, and every marker witness
+authenticator with the VMK. A local
+store containing only the deterministic projection, omitting a marker, or
+inferring its device registry only from retained vectors/frontiers is
+insufficient and the recovery command MUST refuse it.
 
 Through a newly verified SSH connection, the user runs an administrative
 `recovery begin` command naming the old instance ID, old vault ID, source cut C,
@@ -1121,14 +1359,13 @@ recovery ID. The client rewraps the same VMK in a new envelope at
 It streams JSON pages through verified SSH standard input to
 `recovery import-page`. Revision pages come first and are strictly ordered by
 `(record_id UUID bytes, revision_id UUID bytes)`; collection-marker pages
-follow and are strictly ordered by
-`(record_id UUID bytes, collected_revision_id UUID bytes)`; source-device pages
-come last and are strictly ordered by `device_id UUID bytes`. Pages are
+follow and are strictly ordered by unique `record_id UUID bytes`; source-device
+pages come last and are strictly ordered by `device_id UUID bytes`. Pages are
 idempotent only when the page index and exact raw request-body bytes match.
 `recovery finalize`
 checks the manifest, exact checked envelope and instance-secret successors,
 phase and page order, all three counts, digest, vector and frontier
-canonicality, revision/marker/device uniqueness, every marker
+canonicality, one-marker-per-record and revision/device uniqueness, every marker
 `barrier_cursor <= C`, every referenced author/vector/frontier device's
 presence in the source registry, every referenced counter against that
 registry entry's exact `max_author_counter`, the reserved fresh-device slot,
@@ -1136,12 +1373,16 @@ and an otherwise empty staging instance, then activates all state in one
 transaction. Conflicting duplicate markers or source-device entries fail
 closed rather than joining, replacing, or weakening state. Interrupted or
 invalid staging is inert and can only be resumed with the same recovery ID or
-discarded.
+discarded. The server cannot derive the VMK and therefore enforces only
+canonical shape, ordering, uniqueness, counter bounds, and opaque-byte
+preservation; it does not claim to cryptographically verify a revision or
+marker authenticator.
 
 Because the instance/vault IDs and VMK are preserved, every imported record
 ciphertext, record/revision ID, version vector, author counter, and tombstone
-flag is byte-identical. Every collection marker, including its collected
-revision ID, frontier, and source barrier cursor, is also preserved exactly.
+flag is byte-identical. Every collection marker, including its witness
+revision ID, frontier, collection witness authenticator, and source barrier
+cursor, is also preserved exactly.
 Every imported source device ID is created as retired with the exact maximum
 counter from the authoritative source-device registry entry, including a
 never-authored ID absent from all imported vectors and frontiers, and it is
@@ -1162,9 +1403,11 @@ normal cursor-bearing device-state change. Let R be C when the import has no
 items and otherwise the final imported-item cursor; enrollment receives the
 reserved cursor R+1.
 Before the staging transaction becomes visible, every later mutation for that
-record must dominate every imported marker frontier or fail with
+record must dominate its imported marker frontier or fail with
 `stale_after_collection`. Collection stays frozen until the new device has
-verified the import and acknowledged R, and delta sync starts with
+read back and re-verified every imported revision AEAD and frontier
+authenticator and every marker authenticator, then acknowledged R; only then is
+recovery complete and the source may be abandoned. Delta sync starts with
 `after_cursor = R`. This preserves the surviving
 rollback checkpoint and tombstone barriers without pretending that old
 cursor-to-item assignments survived. The executable state description is
