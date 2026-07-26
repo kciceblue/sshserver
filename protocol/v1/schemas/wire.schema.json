@@ -191,6 +191,16 @@
         "max_author_counter": {"$ref": "#/$defs/uint64"}
       }
     },
+    "source_device_registry_entry": {
+      "type": "object",
+      "description": "Stable snapshot projection of every source device registry row. Credentials, scopes, status, acknowledgements, and timestamps are intentionally excluded; host recovery reconstructs every listed device ID as retired with this exact counter ceiling.",
+      "additionalProperties": false,
+      "required": ["device_id", "max_author_counter"],
+      "properties": {
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "max_author_counter": {"$ref": "#/$defs/uint64"}
+      }
+    },
     "collection_marker": {
       "type": "object",
       "additionalProperties": false,
@@ -295,14 +305,14 @@
         },
         "capabilities": {
           "type": "array",
-          "description": "Sorted advertised capabilities. Marker-aware snapshot responses require both snapshot-read-v1 and snapshot-collection-markers-v1.",
+          "description": "Sorted advertised capabilities. Recovery-complete snapshot responses require snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1.",
           "uniqueItems": true,
           "items": {"type": "string"}
         },
         "limits": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["max_body_bytes", "max_mutations", "max_page_changes", "max_snapshot_page_revisions", "max_snapshot_page_collection_markers", "max_devices"],
+          "required": ["max_body_bytes", "max_mutations", "max_page_changes", "max_snapshot_page_revisions", "max_snapshot_page_collection_markers", "max_snapshot_page_source_devices", "max_devices"],
           "properties": {
             "max_body_bytes": {"const": 4194304},
             "max_mutations": {"const": 256},
@@ -311,6 +321,10 @@
             "max_snapshot_page_collection_markers": {
               "const": 128,
               "description": "Present only as part of the required snapshot-collection-markers-v1 contract."
+            },
+            "max_snapshot_page_source_devices": {
+              "const": 64,
+              "description": "Present only as part of the required snapshot-device-registry-v1 contract."
             },
             "max_devices": {"const": 64}
           }
@@ -466,26 +480,36 @@
             {
               "properties": {
                 "revisions": {"minItems": 1},
-                "collection_markers": {"maxItems": 0}
+                "collection_markers": {"maxItems": 0},
+                "source_devices": {"maxItems": 0}
               }
             },
             {
               "properties": {
                 "revisions": {"maxItems": 0},
-                "collection_markers": {"minItems": 1}
+                "collection_markers": {"minItems": 1},
+                "source_devices": {"maxItems": 0}
               }
             },
             {
               "properties": {
                 "revisions": {"maxItems": 0},
                 "collection_markers": {"maxItems": 0},
+                "source_devices": {"minItems": 1}
+              }
+            },
+            {
+              "properties": {
+                "revisions": {"maxItems": 0},
+                "collection_markers": {"maxItems": 0},
+                "source_devices": {"maxItems": 0},
                 "has_more": {"const": false}
               }
             }
           ]
         }
       ],
-      "required": ["protocol_version", "snapshot_id", "cut_cursor", "envelope_generation", "revisions", "collection_markers", "next_page_token", "has_more"],
+      "required": ["protocol_version", "snapshot_id", "cut_cursor", "envelope_generation", "revisions", "collection_markers", "source_devices", "next_page_token", "has_more"],
       "properties": {
         "protocol_version": {"const": "1"},
         "snapshot_id": {"$ref": "#/$defs/uuid"},
@@ -500,6 +524,11 @@
           "type": "array",
           "maxItems": 128,
           "items": {"$ref": "#/$defs/collection_marker"}
+        },
+        "source_devices": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/source_device_registry_entry"}
         },
         "next_page_token": {
           "oneOf": [
@@ -516,7 +545,7 @@
     },
     "host_recovery_manifest": {
       "type": "object",
-      "description": "Before staging, recovery checks independent successors for both source generations and reserves one cursor beyond all imported items for mandatory enrollment.",
+      "description": "Before staging, recovery checks independent successors for both source generations, reserves one cursor beyond all imported cursor-bearing items, and reserves one device registry slot for mandatory fresh enrollment.",
       "additionalProperties": false,
       "required": [
         "protocol_version",
@@ -527,6 +556,7 @@
         "source_instance_secret_generation",
         "revision_count",
         "collection_marker_count",
+        "source_device_count",
         "page_count",
         "pages_sha256"
       ],
@@ -539,6 +569,7 @@
         "source_instance_secret_generation": {"$ref": "#/$defs/uint64"},
         "revision_count": {"$ref": "#/$defs/uint64"},
         "collection_marker_count": {"$ref": "#/$defs/uint64"},
+        "source_device_count": {"$ref": "#/$defs/uint64"},
         "page_count": {"$ref": "#/$defs/uint64"},
         "pages_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
@@ -552,7 +583,8 @@
           "then": {
             "properties": {
               "revisions": {"minItems": 1},
-              "collection_markers": {"maxItems": 0}
+              "collection_markers": {"maxItems": 0},
+              "source_devices": {"maxItems": 0}
             }
           }
         },
@@ -561,18 +593,29 @@
           "then": {
             "properties": {
               "revisions": {"maxItems": 0},
-              "collection_markers": {"minItems": 1}
+              "collection_markers": {"minItems": 1},
+              "source_devices": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"phase": {"const": "source_devices"}}},
+          "then": {
+            "properties": {
+              "revisions": {"maxItems": 0},
+              "collection_markers": {"maxItems": 0},
+              "source_devices": {"minItems": 1}
             }
           }
         }
       ],
-      "required": ["protocol_version", "page_index", "phase", "revisions", "collection_markers"],
+      "required": ["protocol_version", "page_index", "phase", "revisions", "collection_markers", "source_devices"],
       "properties": {
         "protocol_version": {"const": "1"},
         "page_index": {"$ref": "#/$defs/uint64"},
         "phase": {
           "type": "string",
-          "enum": ["record_revisions", "collection_markers"]
+          "enum": ["record_revisions", "collection_markers", "source_devices"]
         },
         "revisions": {
           "type": "array",
@@ -583,6 +626,11 @@
           "type": "array",
           "maxItems": 128,
           "items": {"$ref": "#/$defs/collection_marker"}
+        },
+        "source_devices": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/source_device_registry_entry"}
         }
       }
     },

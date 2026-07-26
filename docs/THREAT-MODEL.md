@@ -89,9 +89,10 @@ but cannot erase data or keys already present on that device.
    previously observed.
 5. Retention and acknowledgement rules prevent an honest server from collecting
    a deletion before every active device has durably observed it.
-6. Stable full snapshots return every undominated sibling and every persistent
-   collection-marker frontier at one cut, then move to deltas without a
-   pagination gap or resurrection window.
+6. Stable full snapshots return every undominated sibling, every persistent
+   collection-marker frontier, and every source device ID with its exact
+   maximum author counter at one cut, then move to deltas without a pagination
+   gap, resurrection window, or reusable retired identity.
 
 These goals become claims only after Tom approves the exact construction and
 the Swift and Go conformance suites pass reviewed vectors.
@@ -139,12 +140,12 @@ V1 does not protect against:
 | Host loss after collection | The surviving completed snapshot contains every persistent collection marker and its frontier, even when no revision for that record remains | Import markers into inert staging and activate them atomically with revisions. A stale write that does not dominate every imported frontier fails with `stale_after_collection`; recovery never resets the barrier. |
 | Remote identity tombstone | Has no device-local custody generation or cleanup authority | Unlink shared record, preserve local key as orphan, require explicit local exact-generation cleanup. |
 | Lost one device | Other device or verified SSH path survives | Revoke token. Secure Enclave key on lost device is unrecoverable and must be replaced. |
-| Lost host, surviving device | Surviving client has VMK and a completed snapshot containing every sibling/tombstone/vector, both source generations, and every persistent collection-marker frontier at cut C | Preserve instance/vault IDs, take checked independent successors of the envelope and instance-secret generations, rewrap the same VMK under a new host secret, atomically import exact revisions and markers, rebuild cursor floor C while reserving the mandatory enrollment cursor, retire old device IDs as activation baseline, and never sync the abandoned fork. A projection-only or marker-incomplete local store is insufficient; generation or cursor exhaustion fails before staging. |
+| Lost host, surviving device | Surviving client has VMK and a completed snapshot containing every sibling/tombstone/vector, both source generations, every persistent collection-marker frontier, and the complete source device registry at cut C | Preserve instance/vault IDs, take checked independent successors of the envelope and instance-secret generations, rewrap the same VMK under a new host secret, atomically import exact revisions, markers, and source device IDs, rebuild cursor floor C while reserving the mandatory enrollment cursor, reconstruct every old ID retired from the authoritative registry counter, and never sync the abandoned fork. A projection-only, marker-incomplete, or inferred-registry local store is insufficient; generation, cursor, or the 64-device capacity needed for one fresh enrollment fails before staging. |
 | Lost instance secret, surviving device | Client still holds VMK | Create a new secret and conditionally rewrap. Never replace secret without a device-held VMK. |
 | Lost passphrase, surviving device | Device already holds VMK | After local authorization, set a new passphrase envelope. This proposed recovery requires Tom approval. |
 | Lost all devices, base mode | Host secret plus envelope can unwrap VMK | Enroll through verified SSH. Software identities recover; Secure Enclave private keys do not. |
 | Lost all devices, passphrase mode | Host alone cannot unwrap VMK | Enroll through SSH and supply passphrase. Losing passphrase too is intentionally unrecoverable. |
-| Partial backup/restore | Manifest, checksum, schema, IDs, file-mode, and persistent collection-marker count validation fail | Keep old instance untouched; restore only into isolation. Never reconstruct or omit marker frontiers. |
+| Partial or path-aliased backup/restore | Manifest, checksum, schema, IDs, file-mode, fixed canonical path allowlist, and persistent collection-marker count validation fail before extraction | Keep old instance untouched; restore only into isolation. Require exact ASCII `config.json`, `instance-secret`, and `sync.db` once each, reject case aliases and unlisted archive members, and never reconstruct or omit marker frontiers. |
 | Backup during instance-secret rotation | Pending or recovery secret slot makes the transition unstable | V1 refuses backup until rotation returns to `stable`; it never emits a partial transition archive. |
 | Database and secret from different instances | Instance/vault/generation mismatch | Fail closed with `instance_mismatch`; never try alternate derivations. |
 | Clock skew | Grants use a boot-bound monotonic deadline; collection age accrues only from durably checkpointed positive daemon monotonic uptime | Wall clocks are display metadata. Restart downtime and clock jumps can delay collection but cannot accelerate it or select a value. |
@@ -152,7 +153,7 @@ V1 does not protect against:
 | Interrupted passphrase rewrap | Envelope generation CAS leaves one committed envelope | Reload winner; records are unchanged. |
 | Interrupted secret rotation | Active and pending generations remain recoverable until envelope and secret agree | Resume or discard pending state according to two-phase state machine. |
 | Snapshot expires mid-page | Snapshot ID/token is missing or lease expires | Discard all staged pages and begin a fresh cut; never combine snapshots or fall back to an empty delta. |
-| Incompatible protocol/crypto version | Negotiation has no compatible required capability, including `snapshot-collection-markers-v1` for marker-aware snapshot pages | Preserve opaque data and block affected writes; never downgrade or reset. |
+| Incompatible protocol/crypto version | Negotiation has no compatible required capability, including `snapshot-collection-markers-v1` and `snapshot-device-registry-v1` for recovery-complete snapshot pages | Preserve opaque data and block affected writes; never downgrade or reset. |
 
 ## 6. Mode guarantees
 
@@ -226,6 +227,11 @@ The manifest also records the persistent collection-marker row count covered
 by the database checksum. Restore compares the checked database with that
 count before activation and never treats missing marker rows as collectable
 history; otherwise a stale client could resurrect a record after host restore.
+Before extraction, restore also requires exactly the fixed V1 canonical path
+allowlist (`config.json`, `instance-secret`, and `sync.db`) and rejects case
+aliases, duplicates, missing paths, or extra archive members. This avoids
+depending on whether the destination filesystem is case-sensitive or how it
+canonicalizes names.
 
 ## 9. Operational controls
 
@@ -235,17 +241,17 @@ The implementation must eventually demonstrate:
 - mode `0600` instance secret, config, database, and backup artifacts;
 - bounded HTTP parsing, request bodies, pages, sibling counts, and rate limits;
 - stable snapshot cuts, replayable phase-bound page tokens, sibling- and
-  collection-marker-complete pagination, expiry discard, and exact
-  cut-to-delta transition;
+  collection-marker-complete pagination, complete source-device registry
+  projection, expiry discard, and exact cut-to-delta transition;
 - constant-time grant/token-hash comparison;
 - structured log redaction tests covering every credential and ciphertext
   field;
 - transactional enrollment, token rotation/revocation, sync, envelope CAS,
   backup checkpoint, and restore replacement;
 - atomic identity-preserving host-recovery import with independent checked
-  generation successors, cursor-floor and reserved-enrollment capacity,
-  revision vector, collection-marker frontier, and stale-after-collection
-  tests;
+  generation successors, cursor-floor and reserved-enrollment cursor/device
+  capacity, authoritative complete source-device reconstruction, revision
+  vector, collection-marker frontier, and stale-after-collection tests;
 - crash/restart tests at each durable state-machine boundary; and
 - no server vault-crypto dependency or private-key parser.
 
@@ -269,9 +275,10 @@ Tom's recorded review must explicitly accept or revise:
 8. Base/passphrase compromise wording, rollback limitation, recovery matrix,
    and intentional unrecoverability cases.
 9. Stable full-snapshot pagination, persistent tombstone collection-marker
-   frontiers, marker-capability negotiation, and identity-preserving host-loss
-   recovery including independent generation successors, reserved enrollment
-   cursor capacity, and stale-after-collection reconstruction.
+   frontiers, marker/device-registry capability negotiation, and
+   identity-preserving host-loss recovery including independent generation
+   successors, complete source-device reconstruction, reserved enrollment
+   cursor/device capacity, and stale-after-collection reconstruction.
 
 Until those answers and exact conformance results are recorded, this threat
 model is a review artifact rather than a completed security claim.

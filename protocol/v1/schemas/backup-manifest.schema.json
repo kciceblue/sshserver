@@ -32,15 +32,19 @@
     "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
     "files": {
       "type": "array",
-      "description": "Semantic post-schema invariant: Every path value MUST be unique; restore rejects duplicate paths even when the remaining item fields differ because JSON Schema uniqueItems compares complete objects.",
+      "description": "V1 fixed canonical allowlist: config.json, instance-secret, and sync.db, each exactly once with exact ASCII spelling and case. Restore performs this semantic set-and-cardinality check before extraction because JSON Schema uniqueItems compares complete objects.",
       "minItems": 3,
+      "maxItems": 3,
       "uniqueItems": true,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["path", "mode", "size", "sha256"],
         "properties": {
-          "path": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+          "path": {
+            "type": "string",
+            "enum": ["config.json", "instance-secret", "sync.db"]
+          },
           "mode": {"const": "0600"},
           "size": {"$ref": "wire.schema.json#/$defs/uint64"},
           "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}

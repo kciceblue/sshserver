@@ -2,7 +2,7 @@
   "fixture_version": 1,
   "status": "review-pending-semantics",
   "strategy": "identity_preserving_recovery",
-  "description": "V1 preserves instance and vault IDs so every authenticated revision and persistent collection frontier can be imported without weakening a tombstone barrier. A migration to new IDs would require full decrypt and re-encrypt and is intentionally not implied by host recovery.",
+  "description": "V1 preserves instance and vault IDs so every authenticated revision, persistent collection frontier, and source device identity can be imported without weakening a tombstone barrier or reusing an old device ID. A migration to new IDs would require full decrypt and re-encrypt and is intentionally not implied by host recovery.",
   "source_completed_snapshot": {
     "instance_id": "00000000-0000-4000-8000-000000000001",
     "vault_id": "00000000-0000-4000-8000-000000000002",
@@ -27,6 +27,22 @@
         ],
         "barrier_cursor": "45"
       }
+    ],
+    "all_source_devices_present": true,
+    "source_device_count": "3",
+    "source_devices": [
+      {
+        "device_id": "00000000-0000-4000-8000-000000000003",
+        "max_author_counter": "0"
+      },
+      {
+        "device_id": "00000000-0000-4000-8000-000000000010",
+        "max_author_counter": "3"
+      },
+      {
+        "device_id": "00000000-0000-4000-8000-000000000011",
+        "max_author_counter": "1"
+      }
     ]
   },
   "recovery_manifest": {
@@ -38,8 +54,9 @@
     "source_instance_secret_generation": "1",
     "revision_count": "2",
     "collection_marker_count": "1",
-    "page_count": "2",
-    "pages_sha256": "8cee7eafb0c01cc94c130febc04924954eb42bb3f762c8110d35efcfca3d8379"
+    "source_device_count": "3",
+    "page_count": "3",
+    "pages_sha256": "5898626477205c2c90f8431a28de0e8948ca5430c88fac0c6ac1a3b7b3de13ba"
   },
   "digest_fixture_encoding": "compact_sorted_json_utf8_pages_each_prefixed_u64be_length",
   "import_pages": [
@@ -77,7 +94,8 @@
           "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
         }
       ],
-      "collection_markers": []
+      "collection_markers": [],
+      "source_devices": []
     },
     {
       "protocol_version": "1",
@@ -94,6 +112,28 @@
           ],
           "barrier_cursor": "45"
         }
+      ],
+      "source_devices": []
+    },
+    {
+      "protocol_version": "1",
+      "page_index": "2",
+      "phase": "source_devices",
+      "revisions": [],
+      "collection_markers": [],
+      "source_devices": [
+        {
+          "device_id": "00000000-0000-4000-8000-000000000003",
+          "max_author_counter": "0"
+        },
+        {
+          "device_id": "00000000-0000-4000-8000-000000000010",
+          "max_author_counter": "3"
+        },
+        {
+          "device_id": "00000000-0000-4000-8000-000000000011",
+          "max_author_counter": "1"
+        }
       ]
     }
   ],
@@ -106,27 +146,37 @@
     "same_vmk_rewrapped_under_new_instance_secret": true,
     "record_ciphertexts_byte_identical": true,
     "record_ids_revision_ids_vectors_and_tombstone_flags_byte_identical": true,
-    "collection_markers_and_frontiers_byte_identical": true
+    "collection_markers_and_frontiers_byte_identical": true,
+    "source_device_ids_and_max_author_counters_preserved": true
   },
   "atomic_import": {
     "administrative_transport": "verified_ssh_stdin_json",
     "requires_empty_staging_instance": true,
     "manifest_binds_source_cut_cursor_count_and_sha256": true,
-    "manifest_has_separate_revision_and_collection_marker_counts": true,
-    "page_phases": ["record_revisions", "collection_markers"],
+    "manifest_has_separate_revision_collection_marker_and_source_device_counts": true,
+    "page_phases": ["record_revisions", "collection_markers", "source_devices"],
     "revision_pages_sorted_by": ["record_id_uuid_bytes", "revision_id_uuid_bytes"],
     "collection_marker_pages_sorted_by": ["record_id_uuid_bytes", "collected_revision_id_uuid_bytes"],
+    "source_device_pages_sorted_by": ["device_id_uuid_bytes"],
     "collection_markers_imported_before_activation": true,
+    "complete_source_device_registry_imported_before_activation": true,
     "conflicting_duplicate_marker": "refuse_recovery_import",
+    "conflicting_duplicate_source_device": "refuse_recovery_import",
     "staged_envelope_and_reconstructed_retired_devices_are_activation_baseline": true,
     "activation_baseline_rows_receive_change_cursors": false,
     "mandatory_post_recovery_enrollment_cursor_reserved": true,
+    "mandatory_post_recovery_enrollment_device_slot_reserved": true,
     "all_source_device_ids_marked_retired": true,
-    "source_max_author_counters_reconstructed_from_revision_vectors_and_marker_frontiers": true,
+    "source_max_author_counters_reconstructed_from_authoritative_device_registry": true,
+    "all_authors_vectors_and_frontiers_reference_registered_devices": true,
+    "all_referenced_counters_at_or_below_registry_max": true,
     "reconstructed_source_max_author_counters": [
-      {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "3"},
-      {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
+      {"device_id": "00000000-0000-4000-8000-000000000003", "max_author_counter": "0"},
+      {"device_id": "00000000-0000-4000-8000-000000000010", "max_author_counter": "3"},
+      {"device_id": "00000000-0000-4000-8000-000000000011", "max_author_counter": "1"}
     ],
+    "never_authored_source_device_reconstructed_retired": "00000000-0000-4000-8000-000000000003",
+    "source_token_hashes_scopes_status_timestamps_copied": false,
     "source_acknowledgements_copied": false,
     "source_tombstone_retention_age_copied": false,
     "destination_tombstone_retention_age_seconds": "0",
@@ -155,6 +205,31 @@
       "source_cut_cursor": "18446744073709551612",
       "result": "server_cursor_exhausted",
       "staging_state_created": false
+    },
+    "checked_at_recovery_begin_and_finalize": true
+  },
+  "device_registry_capacity": {
+    "max_active_plus_retired_devices": "64",
+    "fixture_source_device_count": "3",
+    "reserved_fresh_enrollment_slots": "1",
+    "fixture_result": "accepted",
+    "exact_fit": {
+      "source_device_count": "63",
+      "post_enrollment_device_count": "64",
+      "result": "accepted"
+    },
+    "capacity_exhausted_source": {
+      "source_device_count": "64",
+      "required_fresh_enrollment_slots": "1",
+      "result": "recovery_device_capacity_exhausted",
+      "staging_state_created": false
+    },
+    "finalize_defense_in_depth": {
+      "verified_manifest_source_device_count": "64",
+      "imported_unique_source_device_count": "64",
+      "required_fresh_enrollment_slots": "1",
+      "result": "recovery_device_capacity_exhausted",
+      "destination_activated": false
     },
     "checked_at_recovery_begin_and_finalize": true
   },
@@ -223,6 +298,8 @@
   },
   "failure_rules": {
     "incomplete_snapshot": "refuse_recovery_import",
+    "missing_or_incomplete_source_device_registry": "refuse_recovery_import",
+    "source_registry_leaves_no_fresh_enrollment_slot": "recovery_device_capacity_exhausted",
     "identity_mismatch": "instance_mismatch",
     "source_generation_has_no_uint64_successor": "recovery_generation_exhausted",
     "missing_sibling_tombstone_or_collection_marker": "manifest_digest_mismatch",

@@ -1,7 +1,7 @@
 {
   "fixture_version": 1,
   "status": "review-pending-semantics",
-  "description": "Stable full-snapshot pagination retains both sides of an edit/delete conflict and every persistent collection frontier, then transitions to deltas strictly after the cut cursor.",
+  "description": "Stable full-snapshot pagination retains both sides of an edit/delete conflict, every persistent collection frontier, and the complete source device registry, then transitions to deltas strictly after the cut cursor.",
   "create_request": {
     "protocol_version": "1",
     "device_id": "00000000-0000-4000-8000-000000000003",
@@ -64,6 +64,7 @@
           }
         ],
         "collection_markers": [],
+        "source_devices": [],
         "next_page_token": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
         "has_more": true
       }
@@ -96,6 +97,7 @@
           }
         ],
         "collection_markers": [],
+        "source_devices": [],
         "next_page_token": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
         "has_more": true
       }
@@ -121,6 +123,38 @@
               {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
             ],
             "barrier_cursor": "45"
+          }
+        ],
+        "source_devices": [],
+        "next_page_token": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+        "has_more": true
+      }
+    },
+    {
+      "request": {
+        "protocol_version": "1",
+        "device_id": "00000000-0000-4000-8000-000000000003",
+        "page_token": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"
+      },
+      "response": {
+        "protocol_version": "1",
+        "snapshot_id": "00000000-0000-4000-8000-000000000041",
+        "cut_cursor": "50",
+        "envelope_generation": "2",
+        "revisions": [],
+        "collection_markers": [],
+        "source_devices": [
+          {
+            "device_id": "00000000-0000-4000-8000-000000000003",
+            "max_author_counter": "0"
+          },
+          {
+            "device_id": "00000000-0000-4000-8000-000000000010",
+            "max_author_counter": "3"
+          },
+          {
+            "device_id": "00000000-0000-4000-8000-000000000011",
+            "max_author_counter": "1"
           }
         ],
         "next_page_token": null,
@@ -170,14 +204,17 @@
     "membership_frozen_at_cut_cursor": true,
     "page_replay_is_byte_equivalent": true,
     "ordering_key": ["record_id_uuid_bytes", "revision_id_uuid_bytes"],
-    "page_phases": ["record_revisions", "record_revisions", "collection_markers"],
-    "snapshot_phases": ["record_revisions", "collection_markers"],
+    "page_phases": ["record_revisions", "record_revisions", "collection_markers", "source_devices"],
+    "snapshot_phases": ["record_revisions", "collection_markers", "source_devices"],
     "all_undominated_siblings_included": true,
     "all_persistent_collection_markers_included": true,
     "live_sibling_count": 1,
     "tombstone_sibling_count": 1,
     "collection_marker_count": 1,
     "collection_marker_frontiers_preserved": true,
+    "all_source_devices_included": true,
+    "source_device_count": 3,
+    "never_authored_source_device_id": "00000000-0000-4000-8000-000000000003",
     "partial_snapshot_must_be_discarded_on_expiry": true,
     "first_delta_after_cursor": "50"
   }

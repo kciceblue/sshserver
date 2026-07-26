@@ -54,6 +54,7 @@ DEVICE_LOCAL_FIELDS = {
     "store_epoch",
     "keychain_persistent_reference",
 }
+BACKUP_MANIFEST_PATHS = frozenset({"config.json", "instance-secret", "sync.db"})
 
 
 def read_json(path: Path) -> dict:
@@ -113,6 +114,19 @@ def vector_map(revision: dict) -> dict[str, int]:
     return {entry["device_id"]: parse_uint64(entry["counter"]) for entry in entries}
 
 
+def source_device_counter_map(entries: list[dict]) -> dict[str, int]:
+    ids = [entry["device_id"] for entry in entries]
+    uuid_keys = [uuid.UUID(device_id).bytes for device_id in ids]
+    if uuid_keys != sorted(uuid_keys):
+        raise ValueError("source device entries are not sorted")
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate source device entry")
+    return {
+        entry["device_id"]: parse_uint64(entry["max_author_counter"])
+        for entry in entries
+    }
+
+
 def dominates(left: dict[str, int], right: dict[str, int]) -> bool:
     keys = set(left) | set(right)
     return all(left.get(key, 0) >= right.get(key, 0) for key in keys) and any(
@@ -120,14 +134,34 @@ def dominates(left: dict[str, int], right: dict[str, int]) -> bool:
     )
 
 
-def validate_backup_manifest_paths(manifest: dict) -> None:
-    """Enforce path-key uniqueness after structural JSON Schema validation."""
+def validate_backup_manifest_paths(
+    manifest: dict,
+    archive_members: list[str] | None = None,
+) -> None:
+    """Enforce the exact canonical V1 manifest and archive allowlist."""
     seen: set[str] = set()
     for item in manifest["files"]:
         path = item["path"]
+        if path not in BACKUP_MANIFEST_PATHS:
+            raise ValueError(f"noncanonical backup manifest path: {path}")
         if path in seen:
             raise ValueError(f"duplicate backup manifest path: {path}")
         seen.add(path)
+    if seen != BACKUP_MANIFEST_PATHS:
+        missing = ", ".join(sorted(BACKUP_MANIFEST_PATHS - seen))
+        raise ValueError(f"missing backup manifest path: {missing}")
+    if archive_members is None:
+        return
+    seen_archive_members: set[str] = set()
+    for path in archive_members:
+        if path not in BACKUP_MANIFEST_PATHS:
+            raise ValueError(f"noncanonical backup archive member: {path}")
+        if path in seen_archive_members:
+            raise ValueError(f"duplicate backup archive member: {path}")
+        seen_archive_members.add(path)
+    if seen_archive_members != BACKUP_MANIFEST_PATHS:
+        missing = ", ".join(sorted(BACKUP_MANIFEST_PATHS - seen_archive_members))
+        raise ValueError(f"missing backup archive member: {missing}")
 
 
 def schema_matches(value: object, schema: dict, root: dict) -> bool:
@@ -379,6 +413,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
             "record_revision",
             "vault_envelope",
             "device",
+            "source_device_registry_entry",
             "enrollment_request",
             "sync_request",
             "sync_response",
@@ -733,7 +768,11 @@ class SyncProtocolSpecTests(unittest.TestCase):
         ]
         self.assertEqual(
             {case["missing_required_capability"] for case in unsupported_capabilities},
-            {"envelope-cas-v1", "snapshot-collection-markers-v1"},
+            {
+                "envelope-cas-v1",
+                "snapshot-collection-markers-v1",
+                "snapshot-device-registry-v1",
+            },
         )
         self.assertTrue(
             all(case["http_status"] == 426 for case in unsupported_capabilities)
@@ -771,7 +810,10 @@ class SyncProtocolSpecTests(unittest.TestCase):
         manifest = fixture["backup_manifest"]
         assert_uuid_v4(self, manifest["instance_id"])
         assert_uuid_v4(self, manifest["vault_id"])
-        self.assertEqual({item["path"] for item in manifest["files"]}, {"sync.db", "instance-secret", "config.json"})
+        self.assertEqual(
+            {item["path"] for item in manifest["files"]},
+            BACKUP_MANIFEST_PATHS,
+        )
         self.assertEqual(manifest["secret_rotation_state"], "stable")
         self.assertIn("collection_marker_count", self.backup_schema["required"])
         self.assertEqual(parse_uint64(manifest["collection_marker_count"]), 1)
@@ -779,7 +821,8 @@ class SyncProtocolSpecTests(unittest.TestCase):
             self.backup_schema["properties"]["secret_rotation_state"]["const"],
             "stable",
         )
-        validate_backup_manifest_paths(manifest)
+        archive_members = [item["path"] for item in manifest["files"]]
+        validate_backup_manifest_paths(manifest, archive_members)
         for item in manifest["files"]:
             self.assertEqual(item["mode"], "0600")
             parse_uint64(item["size"])
@@ -791,6 +834,16 @@ class SyncProtocolSpecTests(unittest.TestCase):
             cases["duplicate_manifest_path_with_different_checksum"],
             "restore_incompatible",
         )
+        self.assertEqual(cases["case_alias_manifest_path"], "restore_incompatible")
+        self.assertEqual(
+            cases["missing_canonical_manifest_path"],
+            "restore_incompatible",
+        )
+        self.assertEqual(
+            cases["missing_canonical_archive_member"],
+            "restore_incompatible",
+        )
+        self.assertEqual(cases["unlisted_archive_member"], "restore_incompatible")
         duplicate_manifest = copy.deepcopy(manifest)
         duplicate_path = copy.deepcopy(duplicate_manifest["files"][0])
         duplicate_path["sha256"] = "f" * 64
@@ -802,9 +855,54 @@ class SyncProtocolSpecTests(unittest.TestCase):
             r"^duplicate backup manifest path: sync\.db$",
         ):
             validate_backup_manifest_paths(duplicate_manifest)
+        case_alias_manifest = copy.deepcopy(manifest)
+        case_alias_manifest["files"][0]["path"] = "SYNC.db"
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^noncanonical backup manifest path: SYNC\.db$",
+        ):
+            validate_backup_manifest_paths(case_alias_manifest)
+        missing_manifest_path = copy.deepcopy(manifest)
+        missing_manifest_path["files"] = [
+            item
+            for item in missing_manifest_path["files"]
+            if item["path"] != "config.json"
+        ]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^missing backup manifest path: config\.json$",
+        ):
+            validate_backup_manifest_paths(missing_manifest_path)
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^missing backup archive member: config\.json$",
+        ):
+            validate_backup_manifest_paths(
+                manifest,
+                [
+                    path
+                    for path in archive_members
+                    if path != "config.json"
+                ],
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^noncanonical backup archive member: metadata\.json$",
+        ):
+            validate_backup_manifest_paths(
+                manifest,
+                [*archive_members, "metadata.json"],
+            )
+        file_schema = self.backup_schema["properties"]["files"]
+        self.assertEqual(file_schema["minItems"], len(BACKUP_MANIFEST_PATHS))
+        self.assertEqual(file_schema["maxItems"], len(BACKUP_MANIFEST_PATHS))
+        self.assertEqual(
+            set(file_schema["items"]["properties"]["path"]["enum"]),
+            BACKUP_MANIFEST_PATHS,
+        )
         self.assertIn(
-            "Every path value MUST be unique",
-            self.backup_schema["properties"]["files"]["description"],
+            "each exactly once with exact ASCII spelling and case",
+            file_schema["description"],
         )
         backup_cases = {case["name"]: case["result"] for case in fixture["backup_cases"]}
         self.assertEqual(
@@ -828,7 +926,11 @@ class SyncProtocolSpecTests(unittest.TestCase):
             sorted(capabilities["capabilities"]),
         )
         self.assertTrue(
-            {"snapshot-read-v1", "snapshot-collection-markers-v1"}.issubset(
+            {
+                "snapshot-read-v1",
+                "snapshot-collection-markers-v1",
+                "snapshot-device-registry-v1",
+            }.issubset(
                 capabilities["capabilities"]
             )
         )
@@ -836,6 +938,10 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(
             capabilities["limits"]["max_snapshot_page_collection_markers"],
             128,
+        )
+        self.assertEqual(
+            capabilities["limits"]["max_snapshot_page_source_devices"],
+            64,
         )
         request = fixture["empty_sync_request"]
         response = fixture["empty_sync_response"]
@@ -885,6 +991,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
 
         revisions: list[dict] = []
         collection_markers: list[dict] = []
+        source_devices: list[dict] = []
         phases: list[str] = []
         expected_token = create_response["first_page_token"]
         for index, page in enumerate(fixture["pages"]):
@@ -905,15 +1012,20 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 response_page["envelope_generation"],
                 create_response["envelope_generation"],
             )
-            self.assertFalse(
-                response_page["revisions"] and response_page["collection_markers"]
+            populated_phase_count = sum(
+                bool(response_page[field])
+                for field in ("revisions", "collection_markers", "source_devices")
             )
+            self.assertEqual(populated_phase_count, 1)
             revisions.extend(response_page["revisions"])
             collection_markers.extend(response_page["collection_markers"])
+            source_devices.extend(response_page["source_devices"])
             if response_page["revisions"]:
                 phases.append("record_revisions")
             elif response_page["collection_markers"]:
                 phases.append("collection_markers")
+            elif response_page["source_devices"]:
+                phases.append("source_devices")
             expected_token = response_page["next_page_token"]
             self.assertEqual(response_page["has_more"], index < len(fixture["pages"]) - 1)
         self.assertIsNone(expected_token)
@@ -951,6 +1063,39 @@ class SyncProtocolSpecTests(unittest.TestCase):
         for marker in collection_markers:
             self.assertLessEqual(parse_uint64(marker["barrier_cursor"]), cut)
             self.assertTrue(vector_map({"version_vector": marker["frontier"]}))
+        source_counters = source_device_counter_map(source_devices)
+        self.assertEqual(
+            len(source_devices),
+            fixture["expected"]["source_device_count"],
+        )
+        self.assertTrue(fixture["expected"]["all_source_devices_included"])
+        self.assertEqual(
+            fixture["expected"]["never_authored_source_device_id"],
+            create_request["device_id"],
+        )
+        referenced_counters: dict[str, int] = {}
+        for revision in revisions:
+            self.assertIn(revision["author_device_id"], source_counters)
+            for device_id, counter in vector_map(revision).items():
+                referenced_counters[device_id] = max(
+                    referenced_counters.get(device_id, 0),
+                    counter,
+                )
+        for marker in collection_markers:
+            for device_id, counter in vector_map(
+                {"version_vector": marker["frontier"]}
+            ).items():
+                referenced_counters[device_id] = max(
+                    referenced_counters.get(device_id, 0),
+                    counter,
+                )
+        self.assertTrue(set(referenced_counters).issubset(source_counters))
+        for device_id, counter in referenced_counters.items():
+            self.assertLessEqual(counter, source_counters[device_id])
+        never_authored = fixture["expected"]["never_authored_source_device_id"]
+        self.assertIn(never_authored, source_counters)
+        self.assertEqual(source_counters[never_authored], 0)
+        self.assertNotIn(never_authored, referenced_counters)
 
         delta_request = fixture["delta_transition_request"]
         delta_response = fixture["delta_transition_response"]
@@ -966,13 +1111,28 @@ class SyncProtocolSpecTests(unittest.TestCase):
         fixture = self.fixtures["full-snapshot-recovery.json"]
         schema = self.wire["$defs"]["snapshot_page_response"]
         revision_page = fixture["pages"][0]["response"]
-        marker_page = fixture["pages"][-1]["response"]
+        marker_page = next(
+            page["response"]
+            for page in fixture["pages"]
+            if page["response"]["collection_markers"]
+        )
+        source_device_page = next(
+            page["response"]
+            for page in fixture["pages"]
+            if page["response"]["source_devices"]
+        )
 
         mixed_page = copy.deepcopy(revision_page)
         mixed_page["collection_markers"] = copy.deepcopy(
             marker_page["collection_markers"]
         )
         self.assertFalse(schema_matches(mixed_page, schema, self.wire))
+
+        mixed_source_device_page = copy.deepcopy(revision_page)
+        mixed_source_device_page["source_devices"] = copy.deepcopy(
+            source_device_page["source_devices"]
+        )
+        self.assertFalse(schema_matches(mixed_source_device_page, schema, self.wire))
 
         empty_nonterminal_page = copy.deepcopy(revision_page)
         empty_nonterminal_page["revisions"] = []
@@ -982,7 +1142,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
         null_nonterminal_token["next_page_token"] = None
         self.assertFalse(schema_matches(null_nonterminal_token, schema, self.wire))
 
-        token_on_final_page = copy.deepcopy(marker_page)
+        token_on_final_page = copy.deepcopy(source_device_page)
         token_on_final_page["next_page_token"] = revision_page["next_page_token"]
         self.assertFalse(schema_matches(token_on_final_page, schema, self.wire))
 
@@ -993,6 +1153,21 @@ class SyncProtocolSpecTests(unittest.TestCase):
         phase_payload_mismatch["phase"] = "collection_markers"
         self.assertFalse(
             schema_matches(phase_payload_mismatch, recovery_schema, self.wire)
+        )
+        recovery_source_page = self.fixtures["host-loss-recovery.json"][
+            "import_pages"
+        ][-1]
+        self.assertTrue(
+            schema_matches(recovery_source_page, recovery_schema, self.wire)
+        )
+        source_phase_payload_mismatch = copy.deepcopy(recovery_source_page)
+        source_phase_payload_mismatch["phase"] = "record_revisions"
+        self.assertFalse(
+            schema_matches(
+                source_phase_payload_mismatch,
+                recovery_schema,
+                self.wire,
+            )
         )
 
     def test_identity_preserving_host_recovery_preserves_records_and_rebuilds_cursors(self) -> None:
@@ -1012,6 +1187,11 @@ class SyncProtocolSpecTests(unittest.TestCase):
             parse_uint64(source["collection_marker_count"]),
             len(source["collection_markers"]),
         )
+        self.assertTrue(source["all_source_devices_present"])
+        self.assertEqual(
+            parse_uint64(source["source_device_count"]),
+            len(source["source_devices"]),
+        )
         snapshot_fixture = self.fixtures["full-snapshot-recovery.json"]
         snapshot_revisions = [
             revision
@@ -1023,7 +1203,16 @@ class SyncProtocolSpecTests(unittest.TestCase):
             for page in snapshot_fixture["pages"]
             for marker in page["response"]["collection_markers"]
         ]
+        snapshot_source_devices = [
+            source_device
+            for page in snapshot_fixture["pages"]
+            for source_device in page["response"]["source_devices"]
+        ]
         self.assertEqual(source["collection_markers"], snapshot_markers)
+        self.assertEqual(source["source_devices"], snapshot_source_devices)
+        source_registry = source_device_counter_map(source["source_devices"])
+        for device_id in source_registry:
+            assert_uuid_v4(self, device_id)
         snapshot_envelope = snapshot_fixture["create_response"]["envelope"]
         passphrase_rewrap_envelope = self.fixtures["vault-envelope.json"][
             "passphrase_rewrap"
@@ -1061,6 +1250,9 @@ class SyncProtocolSpecTests(unittest.TestCase):
             recovered["record_ids_revision_ids_vectors_and_tombstone_flags_byte_identical"]
         )
         self.assertTrue(recovered["collection_markers_and_frontiers_byte_identical"])
+        self.assertTrue(
+            recovered["source_device_ids_and_max_author_counters_preserved"]
+        )
         self.assertEqual(manifest["instance_id"], source["instance_id"])
         self.assertEqual(manifest["vault_id"], source["vault_id"])
         self.assertEqual(manifest["source_cut_cursor"], source["cut_cursor"])
@@ -1095,6 +1287,10 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(
             manifest["collection_marker_count"],
             source["collection_marker_count"],
+        )
+        self.assertEqual(
+            manifest["source_device_count"],
+            source["source_device_count"],
         )
         self.assertEqual(parse_uint64(manifest["page_count"]), len(pages))
         digest = hashlib.sha256()
@@ -1133,6 +1329,11 @@ class SyncProtocolSpecTests(unittest.TestCase):
         imported_markers = [
             marker for page in pages for marker in page["collection_markers"]
         ]
+        imported_source_devices = [
+            source_device
+            for page in pages
+            for source_device in page["source_devices"]
+        ]
         self.assertEqual(
             len(imported_revisions),
             parse_uint64(manifest["revision_count"]),
@@ -1143,11 +1344,43 @@ class SyncProtocolSpecTests(unittest.TestCase):
             parse_uint64(manifest["collection_marker_count"]),
         )
         self.assertEqual(imported_markers, source["collection_markers"])
+        self.assertEqual(
+            len(imported_source_devices),
+            parse_uint64(manifest["source_device_count"]),
+        )
+        self.assertEqual(imported_source_devices, source["source_devices"])
+        self.assertEqual(imported_source_devices, snapshot_source_devices)
         self.assertTrue(imported["collection_markers_imported_before_activation"])
+        self.assertTrue(
+            imported["complete_source_device_registry_imported_before_activation"]
+        )
         self.assertEqual(
             imported["conflicting_duplicate_marker"],
             "refuse_recovery_import",
         )
+        self.assertEqual(
+            imported["conflicting_duplicate_source_device"],
+            "refuse_recovery_import",
+        )
+        duplicate_source_devices = copy.deepcopy(imported_source_devices)
+        duplicate_source_device = copy.deepcopy(duplicate_source_devices[0])
+        duplicate_source_device["max_author_counter"] = "1"
+        duplicate_source_devices.append(duplicate_source_device)
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^duplicate source device entry$",
+        ):
+            source_device_counter_map(
+                sorted(
+                    duplicate_source_devices,
+                    key=lambda item: uuid.UUID(item["device_id"]).bytes,
+                )
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^source device entries are not sorted$",
+        ):
+            source_device_counter_map(list(reversed(imported_source_devices)))
         self.assertTrue(
             imported[
                 "staged_envelope_and_reconstructed_retired_devices_are_activation_baseline"
@@ -1155,32 +1388,56 @@ class SyncProtocolSpecTests(unittest.TestCase):
         )
         self.assertFalse(imported["activation_baseline_rows_receive_change_cursors"])
         self.assertTrue(imported["mandatory_post_recovery_enrollment_cursor_reserved"])
+        self.assertTrue(
+            imported["mandatory_post_recovery_enrollment_device_slot_reserved"]
+        )
         self.assertTrue(imported["all_source_device_ids_marked_retired"])
         self.assertTrue(
             imported[
-                "source_max_author_counters_reconstructed_from_revision_vectors_and_marker_frontiers"
+                "source_max_author_counters_reconstructed_from_authoritative_device_registry"
             ]
         )
-        reconstructed_counters: dict[str, int] = {}
+        self.assertTrue(
+            imported["all_authors_vectors_and_frontiers_reference_registered_devices"]
+        )
+        self.assertTrue(imported["all_referenced_counters_at_or_below_registry_max"])
+        referenced_counters: dict[str, int] = {}
         for revision in imported_revisions:
+            self.assertIn(revision["author_device_id"], source_registry)
             for device_id, counter in vector_map(revision).items():
-                reconstructed_counters[device_id] = max(
-                    reconstructed_counters.get(device_id, 0),
+                referenced_counters[device_id] = max(
+                    referenced_counters.get(device_id, 0),
                     counter,
                 )
         for marker in imported_markers:
             for device_id, counter in vector_map(
                 {"version_vector": marker["frontier"]}
             ).items():
-                reconstructed_counters[device_id] = max(
-                    reconstructed_counters.get(device_id, 0),
+                referenced_counters[device_id] = max(
+                    referenced_counters.get(device_id, 0),
                     counter,
                 )
         expected_counters = {
-            item["device_id"]: parse_uint64(item["counter"])
+            item["device_id"]: parse_uint64(item["max_author_counter"])
             for item in imported["reconstructed_source_max_author_counters"]
         }
-        self.assertEqual(reconstructed_counters, expected_counters)
+        self.assertEqual(expected_counters, source_registry)
+        self.assertTrue(set(referenced_counters).issubset(source_registry))
+        for device_id, counter in referenced_counters.items():
+            self.assertLessEqual(counter, source_registry[device_id])
+        never_authored = imported[
+            "never_authored_source_device_reconstructed_retired"
+        ]
+        self.assertEqual(
+            never_authored,
+            snapshot_fixture["expected"]["never_authored_source_device_id"],
+        )
+        self.assertIn(never_authored, source_registry)
+        self.assertEqual(source_registry[never_authored], 0)
+        self.assertNotIn(never_authored, referenced_counters)
+        self.assertFalse(
+            imported["source_token_hashes_scopes_status_timestamps_copied"]
+        )
         self.assertFalse(imported["source_acknowledgements_copied"])
         self.assertFalse(imported["source_tombstone_retention_age_copied"])
         self.assertEqual(parse_uint64(imported["destination_tombstone_retention_age_seconds"]), 0)
@@ -1192,6 +1449,8 @@ class SyncProtocolSpecTests(unittest.TestCase):
             len(imported_cursors),
             len(imported_revisions) + len(imported_markers),
         )
+        self.assertGreater(len(imported_source_devices), 0)
+        self.assertFalse(imported["activation_baseline_rows_receive_change_cursors"])
         self.assertEqual(parse_uint64(cursors["destination_import_end_cursor"]), imported_cursors[-1])
         self.assertEqual(
             cursors["recovering_device_resumes_delta_after_cursor"],
@@ -1243,6 +1502,77 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(overflow["result"], "server_cursor_exhausted")
         self.assertFalse(overflow["staging_state_created"])
         self.assertTrue(capacity["checked_at_recovery_begin_and_finalize"])
+        device_capacity = fixture["device_registry_capacity"]
+        max_devices = parse_uint64(
+            device_capacity["max_active_plus_retired_devices"]
+        )
+        source_device_count = parse_uint64(
+            device_capacity["fixture_source_device_count"]
+        )
+        reserved_device_slots = parse_uint64(
+            device_capacity["reserved_fresh_enrollment_slots"]
+        )
+        self.assertEqual(source_device_count, len(imported_source_devices))
+        self.assertEqual(source_device_count, parse_uint64(manifest["source_device_count"]))
+        self.assertEqual(max_devices, 64)
+        self.assertEqual(reserved_device_slots, 1)
+        self.assertLessEqual(
+            source_device_count + reserved_device_slots,
+            max_devices,
+        )
+        self.assertEqual(device_capacity["fixture_result"], "accepted")
+        device_exact_fit = device_capacity["exact_fit"]
+        self.assertEqual(
+            parse_uint64(device_exact_fit["source_device_count"])
+            + reserved_device_slots,
+            parse_uint64(device_exact_fit["post_enrollment_device_count"]),
+        )
+        self.assertEqual(
+            parse_uint64(device_exact_fit["post_enrollment_device_count"]),
+            max_devices,
+        )
+        self.assertEqual(device_exact_fit["result"], "accepted")
+        device_overflow = device_capacity["capacity_exhausted_source"]
+        self.assertGreater(
+            parse_uint64(device_overflow["source_device_count"])
+            + parse_uint64(
+                device_overflow["required_fresh_enrollment_slots"]
+            ),
+            max_devices,
+        )
+        self.assertEqual(
+            device_overflow["result"],
+            "recovery_device_capacity_exhausted",
+        )
+        self.assertFalse(device_overflow["staging_state_created"])
+        finalize_capacity = device_capacity["finalize_defense_in_depth"]
+        self.assertEqual(
+            parse_uint64(
+                finalize_capacity["verified_manifest_source_device_count"]
+            ),
+            parse_uint64(finalize_capacity["imported_unique_source_device_count"]),
+        )
+        self.assertGreater(
+            parse_uint64(finalize_capacity["imported_unique_source_device_count"])
+            + parse_uint64(
+                finalize_capacity["required_fresh_enrollment_slots"]
+            ),
+            max_devices,
+        )
+        self.assertEqual(
+            finalize_capacity["result"],
+            "recovery_device_capacity_exhausted",
+        )
+        self.assertFalse(finalize_capacity["destination_activated"])
+        self.assertTrue(
+            device_capacity["checked_at_recovery_begin_and_finalize"]
+        )
+        self.assertEqual(
+            fixture["failure_rules"][
+                "source_registry_leaves_no_fresh_enrollment_slot"
+            ],
+            "recovery_device_capacity_exhausted",
+        )
         generation_capacity = fixture["generation_capacity"]
         self.assertTrue(generation_capacity["source_generations_diverge"])
         self.assertTrue(
@@ -1296,6 +1626,13 @@ class SyncProtocolSpecTests(unittest.TestCase):
             fixture["failure_rules"]["source_generation_has_no_uint64_successor"],
             "recovery_generation_exhausted",
         )
+        self.assertEqual(
+            fixture["failure_rules"]["missing_or_incomplete_source_device_registry"],
+            "refuse_recovery_import",
+        )
+        post_enrollment = fixture["post_import_enrollment"]
+        self.assertNotIn(post_enrollment["new_device_id"], source_registry)
+        self.assertFalse(post_enrollment["old_device_ids_reusable"])
         barrier = fixture["post_import_collection_barrier"]
         persisted = vector_map({"version_vector": barrier["persisted_frontier"]})
         self.assertEqual(
@@ -1330,6 +1667,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
             normalized_threat,
         )
         self.assertIn("recovery_generation_exhausted", normalized_protocol)
+        self.assertIn("recovery_device_capacity_exhausted", normalized_protocol)
 
     def _assert_record_revision_shape(self, revision: dict) -> None:
         for field in ("record_id", "revision_id", "author_device_id"):

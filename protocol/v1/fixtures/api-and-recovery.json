@@ -14,6 +14,7 @@
       "device-token-rotation-v1",
       "envelope-cas-v1",
       "snapshot-collection-markers-v1",
+      "snapshot-device-registry-v1",
       "snapshot-read-v1",
       "tombstone-ack-v1"
     ],
@@ -23,6 +24,7 @@
       "max_page_changes": 128,
       "max_snapshot_page_revisions": 128,
       "max_snapshot_page_collection_markers": 128,
+      "max_snapshot_page_source_devices": 64,
       "max_devices": 64
     }
   },
@@ -73,7 +75,11 @@
     {"name": "missing_secret", "result": "restore_incompatible"},
     {"name": "future_storage_schema", "result": "restore_incompatible"},
     {"name": "checksum_mismatch", "result": "restore_incompatible"},
-    {"name": "duplicate_manifest_path_with_different_checksum", "result": "restore_incompatible"}
+    {"name": "duplicate_manifest_path_with_different_checksum", "result": "restore_incompatible"},
+    {"name": "case_alias_manifest_path", "result": "restore_incompatible"},
+    {"name": "missing_canonical_manifest_path", "result": "restore_incompatible"},
+    {"name": "missing_canonical_archive_member", "result": "restore_incompatible"},
+    {"name": "unlisted_archive_member", "result": "restore_incompatible"}
   ],
   "backup_cases": [
     {"name": "stable_secret_generation", "result": "complete_backup"},

@@ -229,7 +229,7 @@
         },
         "responses": {
           "201": {
-            "description": "Stable snapshot cut and first page token created; requires snapshot-read-v1 and snapshot-collection-markers-v1",
+            "description": "Stable recovery-complete snapshot cut and first page token created; requires snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_create_response"}
@@ -237,7 +237,7 @@
             }
           },
           "200": {
-            "description": "Idempotent snapshot creation retry; requires snapshot-read-v1 and snapshot-collection-markers-v1",
+            "description": "Idempotent recovery-complete snapshot creation retry; requires snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_create_response"}
@@ -280,7 +280,7 @@
         },
         "responses": {
           "200": {
-            "description": "One stable phase page containing retained undominated revisions or persistent collection markers in key order; requires snapshot-read-v1 and snapshot-collection-markers-v1",
+            "description": "One stable phase page containing retained undominated revisions, persistent collection markers, or complete source-device registry entries in key order; requires snapshot-read-v1, snapshot-collection-markers-v1, and snapshot-device-registry-v1",
             "content": {
               "application/json": {
                 "schema": {"$ref": "schemas/wire.schema.json#/$defs/snapshot_page_response"}
