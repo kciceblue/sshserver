@@ -446,13 +446,17 @@
       },
       "prior_marker_checkpoint": {
         "record_id": "00000000-0000-4000-8000-000000000030",
+        "prior_marker_witness_revision_id": "00000000-0000-4000-8000-000000000031",
         "prior_marker_frontier": [
           {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "3"},
           {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"}
         ],
+        "prior_marker_collection_witness_authenticator": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "incoming_marker_relation": "exact",
         "result": "accepted",
-        "missing_incoming_marker_result": "rollback_or_fork_rejected"
+        "missing_incoming_marker_result": "rollback_or_fork_rejected",
+        "same_witness_id_changed_frontier_result": "revision_equivocation",
+        "same_witness_id_changed_authenticator_result": "revision_equivocation"
       }
     },
     "all_source_devices_included": true,

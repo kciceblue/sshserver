@@ -928,8 +928,10 @@ revisions, then:
 5. creates the marker when none exists, or replaces it only when the new exact
    witness vector strictly dominates the old marker frontier. An exact replay
    of the whole marker tuple is idempotent and consumes no new cursor;
-   equal-vector/different-witness input is `revision_equivocation`, while a
-   weaker or incomparable witness cannot authorize collection; and only then
+   the old `witness_revision_id` with any changed vector, authenticator, or
+   other tuple field and equal-vector/different-witness input are
+   `revision_equivocation`, while a weaker or incomparable witness cannot
+   authorize collection; and only then
 6. removes every selected retention-eligible candidate covered by that
    witness—the self-witnessing sole tombstone itself or another revision the
    witness strictly dominates—in the same transaction.
@@ -978,11 +980,17 @@ cover every still-retained sibling: it either names that sibling's exact
 revision ID/vector/authenticator as its witness or strictly dominates that
 sibling's vector. A marker that reuses a retained sibling's revision ID with a
 changed vector or authenticator is equivocation and is rejected before
-dominance comparison. Delta processing then accepts only an exact marker replay
-or a valid strictly dominating replacement, and rejects a missing, weaker,
-incomparable, aggregate-only, or equal-vector/different-witness marker. For
-every prior marker checkpoint, a full snapshot MUST contain that exact marker
-or a valid strictly dominating replacement, even when its cut cursor is newer.
+dominance comparison. Delta processing compares each incoming marker to the
+latest persisted marker checkpoint before any dominance decision: the exact
+whole tuple is a replay, the same prior `witness_revision_id` with any changed
+frontier, authenticator, or other tuple field is equivocation, and only a
+different witness ID with a strictly dominating frontier may replace it. A
+missing, weaker, incomparable, aggregate-only, or equal-vector/different-witness
+marker is rejected. For every prior marker checkpoint, a full snapshot applies
+the same ordering and MUST contain that exact marker or a valid strictly
+dominating replacement with a different `witness_revision_id`, even when its
+cut cursor is newer. This comparison remains mandatory when the original
+witness revision bytes have been pruned.
 For every exact authenticated revision object still retained in the local
 checkpoint, one same-record incoming item MUST independently prove continuity:
 either the same `revision_id` reappears with every authenticated field, nonce,
@@ -1172,7 +1180,10 @@ not authenticated and never changes causal acceptance. Every
 MUST appear in `source_devices`, and each referenced counter MUST be at most
 that entry's `max_author_counter`. Before activation, every prior marker
 checkpoint MUST have an exact incoming marker or a valid strictly dominating
-replacement; missing, weaker, incomparable, or equal-vector/different-witness
+replacement with a different `witness_revision_id`. An incoming marker that
+reuses the checkpoint's witness revision ID with any changed frontier,
+authenticator, or other tuple field is equivocation and fails before dominance
+comparison; missing, weaker, incomparable, or equal-vector/different-witness
 input is rollback/fork evidence. Each exact authenticated prior sibling still
 retained in the local checkpoint MUST also have one same-record continuity
 witness: the same-ID revision with every authenticated field, nonce, and

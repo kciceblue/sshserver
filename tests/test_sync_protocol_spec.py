@@ -624,6 +624,11 @@ def marker_transition_outcome(
         return "create"
     if proposed_marker == current_marker:
         return "idempotent_no_cursor"
+    if (
+        proposed_marker["witness_revision_id"]
+        == current_marker["witness_revision_id"]
+    ):
+        return "revision_equivocation"
     current = canonical_vector_map(current_marker["frontier"])
     proposed = canonical_vector_map(proposed_marker["frontier"])
     if proposed == current:
@@ -1978,6 +1983,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 "no_existing_marker": "create",
                 "exact_tuple_retry": "idempotent_no_cursor",
                 "strictly_dominating_witness": "replace_same_record_row",
+                "same_witness_id_changed_tuple": "revision_equivocation",
                 "equal_vector_different_witness": "revision_equivocation",
                 "weaker_or_incomparable_witness": "collection_ineligible",
                 "physical_prune_covered_by_unchanged_marker": (
@@ -1999,6 +2005,46 @@ class SyncProtocolSpecTests(unittest.TestCase):
             marker_transition_outcome(marker, stronger_marker),
             "replace_same_record_row",
         )
+        same_witness_changed_tuple = copy.deepcopy(marker)
+        same_witness_changed_tuple["frontier"][0]["counter"] = "3"
+        same_witness_changed_tuple[
+            "collection_witness_authenticator"
+        ] = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        self.assertEqual(
+            marker_transition_outcome(
+                marker,
+                same_witness_changed_tuple,
+            ),
+            "revision_equivocation",
+        )
+        delta_rules = barrier["delta_marker_checkpoint_rules"]
+        self.assertEqual(
+            delta_rules,
+            {
+                "exact_prior_marker_tuple": "idempotent_no_cursor",
+                "same_prior_witness_id_changed_tuple": (
+                    "revision_equivocation"
+                ),
+                "different_witness_strictly_dominating": (
+                    "replace_same_record_row"
+                ),
+            },
+        )
+        self.assertEqual(
+            marker_transition_outcome(marker, copy.deepcopy(marker)),
+            delta_rules["exact_prior_marker_tuple"],
+        )
+        self.assertEqual(
+            marker_transition_outcome(
+                marker,
+                same_witness_changed_tuple,
+            ),
+            delta_rules["same_prior_witness_id_changed_tuple"],
+        )
+        self.assertEqual(
+            marker_transition_outcome(marker, stronger_marker),
+            delta_rules["different_witness_strictly_dominating"],
+        )
         equal_different_witness = copy.deepcopy(marker)
         equal_different_witness["witness_revision_id"] = (
             "00000000-0000-4000-8000-000000000024"
@@ -2008,12 +2054,18 @@ class SyncProtocolSpecTests(unittest.TestCase):
             "revision_equivocation",
         )
         weaker_marker = copy.deepcopy(marker)
+        weaker_marker["witness_revision_id"] = (
+            "00000000-0000-4000-8000-000000000025"
+        )
         weaker_marker["frontier"][0]["counter"] = "1"
         self.assertEqual(
             marker_transition_outcome(marker, weaker_marker),
             "collection_ineligible",
         )
         incomparable_marker = copy.deepcopy(marker)
+        incomparable_marker["witness_revision_id"] = (
+            "00000000-0000-4000-8000-000000000026"
+        )
         incomparable_marker["frontier"] = [
             {
                 "device_id": "00000000-0000-4000-8000-000000000010",
@@ -3149,11 +3201,56 @@ class SyncProtocolSpecTests(unittest.TestCase):
             canonical_vector_map(incoming_prior_marker["frontier"]),
             canonical_vector_map(prior_marker_case["prior_marker_frontier"]),
         )
+        self.assertEqual(
+            incoming_prior_marker["witness_revision_id"],
+            prior_marker_case["prior_marker_witness_revision_id"],
+        )
+        self.assertEqual(
+            incoming_prior_marker["collection_witness_authenticator"],
+            prior_marker_case[
+                "prior_marker_collection_witness_authenticator"
+            ],
+        )
         self.assertEqual(prior_marker_case["incoming_marker_relation"], "exact")
+        self.assertEqual(
+            marker_transition_outcome(
+                incoming_prior_marker,
+                copy.deepcopy(incoming_prior_marker),
+            ),
+            "idempotent_no_cursor",
+        )
         self.assertEqual(prior_marker_case["result"], "accepted")
         self.assertEqual(
             prior_marker_case["missing_incoming_marker_result"],
             "rollback_or_fork_rejected",
+        )
+        reused_witness_changed_frontier = copy.deepcopy(
+            incoming_prior_marker
+        )
+        reused_witness_changed_frontier["frontier"][0]["counter"] = "4"
+        self.assertEqual(
+            marker_transition_outcome(
+                incoming_prior_marker,
+                reused_witness_changed_frontier,
+            ),
+            prior_marker_case[
+                "same_witness_id_changed_frontier_result"
+            ],
+        )
+        reused_witness_changed_authenticator = copy.deepcopy(
+            incoming_prior_marker
+        )
+        reused_witness_changed_authenticator[
+            "collection_witness_authenticator"
+        ] = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        self.assertEqual(
+            marker_transition_outcome(
+                incoming_prior_marker,
+                reused_witness_changed_authenticator,
+            ),
+            prior_marker_case[
+                "same_witness_id_changed_authenticator_result"
+            ],
         )
         for marker in collection_markers:
             self.assertLessEqual(parse_uint64(marker["barrier_cursor"]), cut)

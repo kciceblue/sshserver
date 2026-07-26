@@ -98,9 +98,15 @@
       "no_existing_marker": "create",
       "exact_tuple_retry": "idempotent_no_cursor",
       "strictly_dominating_witness": "replace_same_record_row",
+      "same_witness_id_changed_tuple": "revision_equivocation",
       "equal_vector_different_witness": "revision_equivocation",
       "weaker_or_incomparable_witness": "collection_ineligible",
       "physical_prune_covered_by_unchanged_marker": "no_marker_change_no_cursor"
+    },
+    "delta_marker_checkpoint_rules": {
+      "exact_prior_marker_tuple": "idempotent_no_cursor",
+      "same_prior_witness_id_changed_tuple": "revision_equivocation",
+      "different_witness_strictly_dominating": "replace_same_record_row"
     },
     "collection_marker": {
       "record_id": "00000000-0000-4000-8000-000000000020",
