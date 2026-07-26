@@ -354,6 +354,38 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_uint64(value)
 
+    def test_base64url_schema_rejects_impossible_unpadded_lengths(self) -> None:
+        pattern = re.compile(self.wire["$defs"]["base64url"]["pattern"])
+        accepted = ("", "AA", "AAA", "AAAA", "AAAAAA", "AAAAAAA", "AAAAAAAA")
+        rejected = ("A", "AAAAA", "AAAAAAAAA", "AA=", "AA+")
+        for value in accepted:
+            with self.subTest(value=value, result="accepted"):
+                self.assertIsNotNone(pattern.fullmatch(value))
+        for value in rejected:
+            with self.subTest(value=value, result="rejected"):
+                self.assertIsNone(pattern.fullmatch(value))
+
+    def test_enrollment_grant_is_consumed_once_but_exact_retry_returns_result(
+        self,
+    ) -> None:
+        normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
+        required_contract = (
+            "The grant authorizes exactly one state-changing enrollment transaction.",
+            "That first successful transaction consumes it.",
+            "The server returns the recorded success without authorizing a second state change.",
+        )
+        for claim in required_contract:
+            with self.subTest(claim=claim):
+                self.assertIn(claim, normalized_protocol)
+        self.assertNotIn(
+            "is never accepted after its first successful transaction",
+            normalized_protocol,
+        )
+
+        idempotency = self.fixtures["enrollment.json"]["idempotency"]
+        self.assertTrue(idempotency["grant_consumed_after_success"])
+        self.assertEqual(idempotency["byte_equivalent_retry_status"], 200)
+
     def test_enrollment_fixture_is_retry_safe_and_has_exact_sizes(self) -> None:
         fixture = self.fixtures["enrollment.json"]
         bootstrap = fixture["ssh_bootstrap"]

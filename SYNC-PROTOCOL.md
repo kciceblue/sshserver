@@ -215,10 +215,13 @@ and writes exactly one JSON object to the protected SSH channel:
 }
 ```
 
-The grant expires five minutes after creation, is usable once, and is never
-accepted after its first successful transaction. The command MUST suppress
-shell tracing and MUST NOT put secrets in command-line arguments, environment
-variables, persistent logs, or service-manager configuration.
+The grant expires five minutes after creation. The grant authorizes exactly one
+state-changing enrollment transaction. That first successful transaction
+consumes it. A later byte-equivalent retry may retrieve the recorded result as
+described in section 6, but the consumed grant cannot authorize another state
+change. The command MUST suppress shell tracing and MUST NOT put secrets in
+command-line arguments, environment variables, persistent logs, or
+service-manager configuration.
 
 Grant lifetime is measured with the daemon's monotonic clock and is bound to a
 random daemon boot ID. An unconsumed grant becomes invalid when that daemon
@@ -241,10 +244,14 @@ The proposed retry-safe enrollment is client-token-generated:
 3. Through the SSH forward, it calls `POST /v1/enrollments` with the grant,
    IDs, token, and the fixed V1 scope set.
 4. In one database transaction the server validates and consumes the grant,
-   stores the token hash, creates the device, and records the enrollment ID.
-5. A byte-equivalent retry with the same enrollment ID, device ID, and token
-   hash returns the original success. Any mismatch returns
-   `enrollment_replay_mismatch`.
+   stores the token hash, creates the device, and records the enrollment ID,
+   request fingerprint, and result against the consumed grant hash.
+5. When that consumed grant is presented again, a byte-equivalent retry with
+   the same enrollment ID, device ID, token hash, and fixed scope set returns
+   the original success. The server returns the recorded success without
+   authorizing a second state change. Any mismatch against that recorded
+   enrollment returns `enrollment_replay_mismatch`; a consumed grant without a
+   matching recorded enrollment returns `grant_consumed`.
 6. After success the client promotes the pending token to active Keychain
    state. If it never receives success, it may repeat the same request until
    grant expiry, then use SSH to create a new grant while retaining the same
