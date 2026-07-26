@@ -564,8 +564,12 @@ The body contains `name`, `notes`, `key_kind` (`ed25519` or `rsa`), exact
 private-key encoding identifier, private-key bytes, public-key bytes,
 fingerprint, requested local biometric policy, and timestamps. The entire body
 is inside record AEAD. Proposed canonical private encodings are a 32-byte
-Ed25519 seed and PKCS#8 DER for RSA; this export/import path and its local user
-authorization are **REVIEW-PENDING**.
+Ed25519 seed and PKCS#8 DER for RSA. The payload schema binds `ed25519` only to
+`ed25519-seed-v1` and `rsa` only to `rsa-pkcs8-der-v1`; after canonical
+base64url decode, the client MUST require exactly 32 Ed25519 seed bytes or
+strictly parse a non-empty RSA PKCS#8 DER value matching the declared key kind.
+This export/import path and its local user authorization are
+**REVIEW-PENDING**.
 
 Restoration writes no plaintext key file. The client authorizes access,
 decrypts in memory, imports directly into device-only Keychain storage, and

@@ -164,19 +164,42 @@ def validate_backup_manifest_paths(
         raise ValueError(f"missing backup archive member: {missing}")
 
 
-def schema_matches(value: object, schema: dict, root: dict) -> bool:
+def schema_matches(
+    value: object,
+    schema: dict,
+    root: dict,
+    external_roots: dict[str, dict] | None = None,
+) -> bool:
     reference = schema.get("$ref")
     if reference is not None:
+        reference_root = root
+        reference_fragment = reference
         if not reference.startswith("#/"):
-            raise ValueError(f"external schema reference is unsupported: {reference}")
-        target: object = root
-        for component in reference.removeprefix("#/").split("/"):
+            document, separator, fragment = reference.partition("#")
+            if (
+                not separator
+                or external_roots is None
+                or document not in external_roots
+                or not fragment.startswith("/")
+            ):
+                raise ValueError(
+                    f"external schema reference is unsupported: {reference}"
+                )
+            reference_root = external_roots[document]
+            reference_fragment = f"#{fragment}"
+        target: object = reference_root
+        for component in reference_fragment.removeprefix("#/").split("/"):
             if not isinstance(target, dict):
                 raise ValueError(f"invalid schema reference: {reference}")
             target = target[component.replace("~1", "/").replace("~0", "~")]
         if not isinstance(target, dict):
             raise ValueError(f"schema reference is not an object: {reference}")
-        if not schema_matches(value, target, root):
+        if not schema_matches(
+            value,
+            target,
+            reference_root,
+            external_roots,
+        ):
             return False
 
     value_type = schema.get("type")
@@ -195,13 +218,32 @@ def schema_matches(value: object, schema: dict, root: dict) -> bool:
     if "enum" in schema and value not in schema["enum"]:
         return False
     if "oneOf" in schema:
-        if sum(schema_matches(value, child, root) for child in schema["oneOf"]) != 1:
+        if (
+            sum(
+                schema_matches(value, child, root, external_roots)
+                for child in schema["oneOf"]
+            )
+            != 1
+        ):
             return False
     if "allOf" in schema:
-        if not all(schema_matches(value, child, root) for child in schema["allOf"]):
+        if not all(
+            schema_matches(value, child, root, external_roots)
+            for child in schema["allOf"]
+        ):
             return False
-    if "if" in schema and schema_matches(value, schema["if"], root):
-        if "then" in schema and not schema_matches(value, schema["then"], root):
+    if "if" in schema and schema_matches(
+        value,
+        schema["if"],
+        root,
+        external_roots,
+    ):
+        if "then" in schema and not schema_matches(
+            value,
+            schema["then"],
+            root,
+            external_roots,
+        ):
             return False
 
     if isinstance(value, dict):
@@ -210,7 +252,12 @@ def schema_matches(value: object, schema: dict, root: dict) -> bool:
             return False
         properties = schema.get("properties", {})
         for key, child in properties.items():
-            if key in value and not schema_matches(value[key], child, root):
+            if key in value and not schema_matches(
+                value[key],
+                child,
+                root,
+                external_roots,
+            ):
                 return False
         if schema.get("additionalProperties") is False:
             if not set(value).issubset(properties):
@@ -223,7 +270,10 @@ def schema_matches(value: object, schema: dict, root: dict) -> bool:
         if schema.get("uniqueItems") and len({json.dumps(item, sort_keys=True) for item in value}) != len(value):
             return False
         if "items" in schema:
-            if not all(schema_matches(item, schema["items"], root) for item in value):
+            if not all(
+                schema_matches(item, schema["items"], root, external_roots)
+                for item in value
+            ):
                 return False
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0):
@@ -804,6 +854,91 @@ class SyncProtocolSpecTests(unittest.TestCase):
         host_fields = set(defs["host_body"]["properties"])
         self.assertNotIn("identity_files", host_fields)
         self.assertNotIn("session_logging_enabled", host_fields)
+
+    def test_software_identity_schema_binds_key_kind_encoding_and_ed25519_seed_size(self) -> None:
+        body_schema = self.payload["$defs"]["software_identity_body"]
+        branches = {
+            branch["if"]["properties"]["key_kind"]["const"]: branch["then"][
+                "properties"
+            ]
+            for branch in body_schema["allOf"]
+        }
+        self.assertEqual(set(branches), {"ed25519", "rsa"})
+        self.assertEqual(
+            branches["ed25519"]["private_key_encoding"]["const"],
+            "ed25519-seed-v1",
+        )
+        self.assertEqual(
+            branches["rsa"]["private_key_encoding"]["const"],
+            "rsa-pkcs8-der-v1",
+        )
+        ed25519_key_shape = branches["ed25519"]["private_key"]["allOf"][1]
+        self.assertEqual(ed25519_key_shape["minLength"], 43)
+        self.assertEqual(ed25519_key_shape["maxLength"], 43)
+        self.assertEqual(
+            body_schema["properties"]["private_key"]["allOf"][1]["minLength"],
+            1,
+        )
+
+        valid_seed = base64.urlsafe_b64encode(b"\x01" * 32).rstrip(b"=").decode()
+        short_seed = base64.urlsafe_b64encode(b"\x01" * 31).rstrip(b"=").decode()
+        long_seed = base64.urlsafe_b64encode(b"\x01" * 33).rstrip(b"=").decode()
+        self.assertEqual(len(valid_seed), 43)
+        self.assertEqual(len(decode_base64url(valid_seed)), 32)
+        self.assertNotEqual(len(short_seed), 43)
+        self.assertNotEqual(len(long_seed), 43)
+        self.assertNotEqual(len(decode_base64url(short_seed)), 32)
+        self.assertNotEqual(len(decode_base64url(long_seed)), 32)
+
+        valid_payload = {
+            "payload_version": 1,
+            "record_type": "software_identity",
+            "body": {
+                "name": "Test key",
+                "notes": "",
+                "key_kind": "ed25519",
+                "private_key_encoding": "ed25519-seed-v1",
+                "private_key": valid_seed,
+                "public_key": "AQ",
+                "fingerprint": "SHA256:test",
+                "requested_biometric_policy": "none",
+                "created_at": "2026-07-26T00:00:00.000Z",
+                "updated_at": "2026-07-26T00:00:00.000Z",
+            },
+        }
+        external_roots = {"wire.schema.json": self.wire}
+        self.assertTrue(
+            schema_matches(
+                valid_payload,
+                self.payload,
+                self.payload,
+                external_roots,
+            )
+        )
+        for invalid_kind, invalid_encoding, invalid_key in (
+            ("ed25519", "rsa-pkcs8-der-v1", valid_seed),
+            ("rsa", "ed25519-seed-v1", "MAMCAQE"),
+            ("ed25519", "ed25519-seed-v1", ""),
+            ("ed25519", "ed25519-seed-v1", short_seed),
+            ("ed25519", "ed25519-seed-v1", long_seed),
+        ):
+            with self.subTest(
+                key_kind=invalid_kind,
+                private_key_encoding=invalid_encoding,
+                private_key_length=len(invalid_key),
+            ):
+                invalid_payload = copy.deepcopy(valid_payload)
+                invalid_payload["body"]["key_kind"] = invalid_kind
+                invalid_payload["body"]["private_key_encoding"] = invalid_encoding
+                invalid_payload["body"]["private_key"] = invalid_key
+                self.assertFalse(
+                    schema_matches(
+                        invalid_payload,
+                        self.payload,
+                        self.payload,
+                        external_roots,
+                    )
+                )
 
     def test_backup_fixture_is_complete_sensitive_and_fail_closed(self) -> None:
         fixture = self.fixtures["api-and-recovery.json"]

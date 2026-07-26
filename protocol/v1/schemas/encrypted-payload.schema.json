@@ -144,6 +144,41 @@
     "software_identity_body": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": ["key_kind"],
+            "properties": {"key_kind": {"const": "ed25519"}}
+          },
+          "then": {
+            "properties": {
+              "private_key_encoding": {"const": "ed25519-seed-v1"},
+              "private_key": {
+                "allOf": [
+                  {"$ref": "wire.schema.json#/$defs/base64url"},
+                  {
+                    "type": "string",
+                    "minLength": 43,
+                    "maxLength": 43,
+                    "description": "Canonical unpadded base64url for exactly one 32-byte Ed25519 seed; implementations also decode/re-encode and verify the decoded length."
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["key_kind"],
+            "properties": {"key_kind": {"const": "rsa"}}
+          },
+          "then": {
+            "properties": {
+              "private_key_encoding": {"const": "rsa-pkcs8-der-v1"}
+            }
+          }
+        }
+      ],
       "required": [
         "name",
         "notes",
@@ -161,7 +196,16 @@
         "notes": {"type": "string", "maxLength": 65536},
         "key_kind": {"type": "string", "enum": ["ed25519", "rsa"]},
         "private_key_encoding": {"type": "string", "enum": ["ed25519-seed-v1", "rsa-pkcs8-der-v1"]},
-        "private_key": {"$ref": "wire.schema.json#/$defs/base64url"},
+        "private_key": {
+          "allOf": [
+            {"$ref": "wire.schema.json#/$defs/base64url"},
+            {
+              "type": "string",
+              "minLength": 1,
+              "description": "After canonical base64url decode, Ed25519 is exactly 32 seed bytes and RSA is strictly parsed as non-empty PKCS#8 DER before import."
+            }
+          ]
+        },
         "public_key": {"$ref": "wire.schema.json#/$defs/base64url"},
         "fingerprint": {"type": "string", "minLength": 1, "maxLength": 512},
         "requested_biometric_policy": {"type": "string", "enum": ["none", "current_set"]},
