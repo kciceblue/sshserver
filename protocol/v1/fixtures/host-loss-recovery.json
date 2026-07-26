@@ -58,7 +58,29 @@
     "page_count": "3",
     "pages_sha256": "5898626477205c2c90f8431a28de0e8948ca5430c88fac0c6ac1a3b7b3de13ba"
   },
-  "digest_fixture_encoding": "compact_sorted_json_utf8_pages_each_prefixed_u64be_length",
+  "digest_fixture_encoding": "recorded_raw_request_body_bytes_are_compact_sorted_json_utf8_pages_each_prefixed_u64be_length",
+  "raw_body_digest_cases": [
+    {
+      "name": "recorded_fixture_bodies",
+      "semantic_pages_equal": true,
+      "raw_bytes_equal": true,
+      "result": "matches_manifest"
+    },
+    {
+      "name": "leading_whitespace_added",
+      "semantic_pages_equal": true,
+      "raw_bytes_equal": false,
+      "result": "manifest_digest_mismatch",
+      "destination_activated": false
+    },
+    {
+      "name": "top_level_keys_reordered",
+      "semantic_pages_equal": true,
+      "raw_bytes_equal": false,
+      "result": "manifest_digest_mismatch",
+      "destination_activated": false
+    }
+  ],
   "import_pages": [
     {
       "protocol_version": "1",

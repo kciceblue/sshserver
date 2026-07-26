@@ -25,6 +25,10 @@
       "max_snapshot_page_revisions": 128,
       "max_snapshot_page_collection_markers": 128,
       "max_snapshot_page_source_devices": 64,
+      "max_active_snapshots_per_device": 1,
+      "max_active_snapshots_per_instance": 8,
+      "max_snapshot_creates_per_minute_per_device": 5,
+      "max_active_snapshot_metadata_bytes_per_instance": 67108864,
       "max_devices": 64
     }
   },

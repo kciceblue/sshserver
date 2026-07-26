@@ -168,7 +168,16 @@
     }
   ],
   "lease_and_revocation": {
-    "snapshot_storage": "immutable_materialized_projection",
+    "snapshot_storage": "copied_metadata_with_content_addressed_revision_references",
+    "copied_snapshot_members": [
+      "envelope",
+      "collection_markers",
+      "source_device_projection",
+      "ordered_membership_and_paging_metadata"
+    ],
+    "revision_payload_storage": "retained_reference_to_existing_immutable_content_addressed_object",
+    "revision_payload_bytes_duplicated_per_snapshot": false,
+    "live_revision_rows_pinned": false,
     "live_device_rows_pinned": false,
     "live_mutations_blocked": false,
     "page_requests_authenticate_current_live_device_state": true,
@@ -180,6 +189,97 @@
       "subsequent_page_http_status": 401,
       "page_bytes_returned": false
     }
+  },
+  "resource_limits": {
+    "max_active_snapshots_per_device": 1,
+    "max_active_snapshots_per_instance": 8,
+    "max_snapshot_creates_per_minute_per_device": 5,
+    "max_active_snapshot_metadata_bytes_per_instance": 67108864,
+    "metadata_accounting_includes": [
+      "copied_envelope_markers_and_device_projection",
+      "membership_content_address_references_and_ordering_indices",
+      "page_tokens_lease_and_idempotency_records"
+    ],
+    "metadata_accounting_excludes": [
+      "shared_immutable_revision_payload_objects"
+    ],
+    "evaluation_order": [
+      "exact_idempotency_lookup",
+      "unique_request_rate_limit",
+      "expire_old_snapshots_and_recompute_usage",
+      "active_snapshot_count_limits",
+      "metadata_byte_limit",
+      "allocate_metadata_and_retain_payload_references"
+    ],
+    "cases": [
+      {
+        "name": "exact_retry_at_allocation_limits",
+        "same_device_and_request_id": true,
+        "active_snapshots_for_device": 1,
+        "active_snapshots_for_instance": 8,
+        "active_metadata_bytes": 67108864,
+        "result": "existing_snapshot",
+        "http_status": 200,
+        "unique_rate_attempt_consumed": false,
+        "additional_capacity_consumed": false,
+        "lease_refreshed": false
+      },
+      {
+        "name": "second_active_snapshot_for_device",
+        "prior_unique_attempts_in_rolling_minute": 1,
+        "active_snapshots_for_device": 1,
+        "active_snapshots_for_instance": 1,
+        "result": "limit_exceeded",
+        "http_status": 413,
+        "metadata_allocated": false,
+        "payload_reference_retained": false
+      },
+      {
+        "name": "ninth_active_snapshot_for_instance",
+        "prior_unique_attempts_in_rolling_minute": 1,
+        "active_snapshots_for_device": 0,
+        "active_snapshots_for_instance": 8,
+        "result": "limit_exceeded",
+        "http_status": 413,
+        "metadata_allocated": false,
+        "payload_reference_retained": false
+      },
+      {
+        "name": "metadata_exact_fit",
+        "prior_unique_attempts_in_rolling_minute": 1,
+        "active_snapshots_for_device": 0,
+        "active_snapshots_for_instance": 7,
+        "active_metadata_bytes": 67108862,
+        "candidate_metadata_bytes": 2,
+        "result": "snapshot_created",
+        "http_status": 201,
+        "metadata_allocated": true,
+        "payload_reference_retained": true
+      },
+      {
+        "name": "metadata_one_byte_over",
+        "prior_unique_attempts_in_rolling_minute": 1,
+        "active_snapshots_for_device": 0,
+        "active_snapshots_for_instance": 7,
+        "active_metadata_bytes": 67108863,
+        "candidate_metadata_bytes": 2,
+        "result": "limit_exceeded",
+        "http_status": 413,
+        "metadata_allocated": false,
+        "payload_reference_retained": false
+      },
+      {
+        "name": "sixth_unique_create_in_rolling_minute",
+        "prior_unique_attempts_in_rolling_minute": 5,
+        "active_snapshots_for_device": 0,
+        "active_snapshots_for_instance": 0,
+        "result": "rate_limited",
+        "http_status": 429,
+        "metadata_allocated": false,
+        "payload_reference_retained": false
+      }
+    ],
+    "all_rejections_before_snapshot_persist_or_allocation": true
   },
   "delta_transition_request": {
     "protocol_version": "1",

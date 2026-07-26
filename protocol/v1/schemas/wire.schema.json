@@ -321,7 +321,7 @@
         "limits": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["max_body_bytes", "max_mutations", "max_page_changes", "max_snapshot_page_revisions", "max_snapshot_page_collection_markers", "max_snapshot_page_source_devices", "max_devices"],
+          "required": ["max_body_bytes", "max_mutations", "max_page_changes", "max_snapshot_page_revisions", "max_snapshot_page_collection_markers", "max_snapshot_page_source_devices", "max_active_snapshots_per_device", "max_active_snapshots_per_instance", "max_snapshot_creates_per_minute_per_device", "max_active_snapshot_metadata_bytes_per_instance", "max_devices"],
           "properties": {
             "max_body_bytes": {"const": 4194304},
             "max_mutations": {"const": 256},
@@ -334,6 +334,19 @@
             "max_snapshot_page_source_devices": {
               "const": 64,
               "description": "Present only as part of the required snapshot-device-registry-v1 contract."
+            },
+            "max_active_snapshots_per_device": {
+              "const": 1,
+              "description": "Exact idempotent retries return the existing snapshot and do not consume another slot."
+            },
+            "max_active_snapshots_per_instance": {"const": 8},
+            "max_snapshot_creates_per_minute_per_device": {
+              "const": 5,
+              "description": "Maximum unique snapshot-create attempts in a rolling 60-second daemon-monotonic window; exact idempotent retries are excluded."
+            },
+            "max_active_snapshot_metadata_bytes_per_instance": {
+              "const": 67108864,
+              "description": "Counts copied envelope, marker, device-projection, membership, content-address reference, ordering, token, lease, and idempotency metadata for active snapshots; excludes shared immutable revision payload objects."
             },
             "max_devices": {"const": 64}
           }

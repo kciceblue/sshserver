@@ -220,7 +220,7 @@
     "/v1/snapshot-reads": {
       "post": {
         "operationId": "createSnapshotRead",
-        "description": "The request must declare exactly the canonical sorted required-capability trio snapshot-collection-markers-v1, snapshot-device-registry-v1, and snapshot-read-v1. Missing, incomplete, duplicate, additional, or noncanonical declarations return 426 unsupported_capability before snapshot allocation. Creation copies an immutable projection and never pins live device rows.",
+        "description": "The request must declare exactly the canonical sorted required-capability trio snapshot-collection-markers-v1, snapshot-device-registry-v1, and snapshot-read-v1. Missing, incomplete, duplicate, additional, or noncanonical declarations return 426 unsupported_capability before snapshot allocation. An exact device/request-ID retry returns the existing snapshot without refreshing its lease or consuming rate/capacity. New unique requests are limited to 5 per rolling minute per device, 1 active snapshot per device, 8 active snapshots per instance, and 67108864 bytes of active snapshot metadata per instance. Rate excess returns 429 rate_limited; count or metadata excess returns 413 limit_exceeded before metadata allocation or revision-object retention. Creation copies the envelope, marker/device projection, membership, and paging metadata while retaining content-addressed references to existing immutable revision payloads; it never duplicates full-vault payload bytes or pins live device rows.",
         "security": [{"deviceBearer": []}],
         "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
         "requestBody": {

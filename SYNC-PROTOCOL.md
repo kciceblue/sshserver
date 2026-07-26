@@ -167,6 +167,10 @@ surface. HTTP proxy mode, absolute-form request targets, protocol upgrade, and
 | Returned snapshot revisions per page | 128 |
 | Returned snapshot collection markers per page | 128 |
 | Returned snapshot source devices per page | 64 |
+| Active snapshots per authenticated device | 1 |
+| Active snapshots per instance | 8 |
+| Unique snapshot-create requests per device | 5 per rolling minute |
+| Active snapshot metadata per instance | 64 MiB |
 | Ciphertext per record revision | 512 KiB |
 | Undominated siblings per record | 32 |
 | Enrollment attempts per instance | 5 per minute |
@@ -859,6 +863,24 @@ entry remains even when that device never authored a retained revision or
 marker frontier, because its ID must never be reused after host recovery.
 Creation is idempotent by authenticated device and request ID.
 
+Snapshot allocation is bounded before any durable metadata is allocated or any
+revision payload reference is retained. After authentication, request-shape and
+capability validation, the server first looks up the device/request-ID
+idempotency tuple. An exact retry returns the existing snapshot and unchanged
+expiry without consuming rate or capacity. A mismatched retained request ID
+returns `request_id_reused`. For a new unique request, the server then enforces
+at most five unique create attempts per authenticated device in any rolling
+60 seconds of daemon monotonic uptime. The sixth returns HTTP 429
+`rate_limited`. Rate-admitted requests then enforce at most one active snapshot
+per device, eight active snapshots per instance, and
+`64 * 1024 * 1024 = 67108864` total bytes of active snapshot metadata per
+instance. A count or metadata excess returns HTTP 413 `limit_exceeded`.
+Unique attempts count toward the rate limit even when a later count or metadata
+check rejects them; exact idempotent retries do not. Expired snapshots are
+removed from active counts and metadata totals before these checks. Failure
+does not persist a snapshot or cut, allocate snapshot metadata, retain a
+revision payload reference, or change an existing lease.
+
 Snapshot membership and page bytes remain fixed despite concurrent writes.
 The stream has three phases: pages of at most 128 revisions strictly ordered
 by `(record_id UUID bytes, revision_id UUID bytes)`, followed by pages of at
@@ -869,11 +891,22 @@ bytes`. Empty phases are skipped, and a page never mixes phases; siblings,
 markers, or device entries may cross a page boundary. Each opaque 32-byte page
 token is bound to snapshot ID, authenticated device ID, cut cursor, phase, and
 the next ordering key. Replaying a page token returns byte-equivalent JSON.
-At creation the server copies the envelope, included revision bytes, collection
-markers, and projected source-device entries into immutable snapshot storage
-for the lease, proposed as 15 minutes of daemon monotonic uptime. The lease
-never pins or blocks live revision, marker, envelope, or device-registry rows;
-enrollment, revocation, token rotation, acknowledgement, collection, and sync
+At creation the server copies the envelope, collection markers, projected
+source-device entries, ordered membership keys, content addresses, and paging
+metadata into immutable snapshot metadata for the lease, proposed as 15
+minutes of daemon monotonic uptime. It does not duplicate the full revision
+payload bytes per snapshot. Each revision membership entry retains a reference
+to the server's existing immutable, content-addressed revision object; the
+object is released only after its last live reference is removed and its last
+snapshot reference expires.
+The 64 MiB metadata cap counts every copied byte and reference/index/lease/token
+record owned by active snapshots, but not the shared immutable revision payload
+objects themselves. Before allocation, the server uses checked arithmetic over
+the exact encoded lengths of the metadata representation it would persist; an
+overflow is a metadata-limit excess. A reference may delay garbage collection
+of an immutable object for the bounded lease, but the lease never pins or
+blocks changes to live revision, marker, envelope, or device-registry rows.
+Enrollment, revocation, token rotation, acknowledgement, collection, and sync
 continue normally. Every page request authenticates the bearer against the
 current live device registry before consulting the immutable snapshot. If the
 snapshot owner has been revoked, paging returns HTTP 401 `token_revoked`
@@ -1058,8 +1091,12 @@ instance-secret generation, separate revision, collection-marker,
 source-device, and page counts, plus a SHA-256 digest. The two source
 generations are independent: passphrase rewrap can advance the envelope
 generation without rotating the instance secret. The digest covers each exact
-UTF-8 `recovery import-page` body, in page order, preceded by its unsigned
-64-bit big-endian byte length.
+raw UTF-8 `recovery import-page` request-body byte sequence, in page order,
+preceded by its unsigned 64-bit big-endian byte length. The server hashes the
+received bytes before JSON parsing and never parses then reserializes,
+reorders keys, normalizes whitespace, or otherwise canonicalizes them for the
+digest. Semantically equivalent JSON with different bytes therefore has a
+different digest and is not an idempotent page replay.
 
 Before creating staging, the server uses checked unsigned arithmetic to
 require both source generations to be less than `UInt64.max`. It computes the
@@ -1087,7 +1124,8 @@ It streams JSON pages through verified SSH standard input to
 follow and are strictly ordered by
 `(record_id UUID bytes, collected_revision_id UUID bytes)`; source-device pages
 come last and are strictly ordered by `device_id UUID bytes`. Pages are
-idempotent only when the page index and exact body match. `recovery finalize`
+idempotent only when the page index and exact raw request-body bytes match.
+`recovery finalize`
 checks the manifest, exact checked envelope and instance-secret successors,
 phase and page order, all three counts, digest, vector and frontier
 canonicality, revision/marker/device uniqueness, every marker
@@ -1209,12 +1247,14 @@ Before this draft becomes approved:
    fixtures and agree byte-for-byte.
 4. Wire fixtures must demonstrate enrollment retry, self-only token rotation,
    deterministic mutation order, sibling-complete snapshot pagination and delta
-   transition, marker- and device-registry-capability negotiation, conflict
-   retention, later-sibling tombstone barriers, identity-preserving host
-   recovery with independent generation successors, complete source-device
-   reconstruction, and reserved enrollment device/cursor capacity, last-device
-   retirement, rotation-safe backup refusal, fixed canonical-path restore
-   rejection, restore mismatch, and version downgrade rejection.
+   transition, marker- and device-registry-capability negotiation, bounded
+   snapshot allocation with fail-before-retain behavior, conflict retention,
+   later-sibling tombstone barriers, identity-preserving host recovery with
+   independent generation successors, raw-body digest sensitivity, complete
+   source-device reconstruction, and reserved enrollment device/cursor
+   capacity, last-device retirement, rotation-safe backup refusal, fixed
+   canonical-path restore rejection, restore mismatch, and version downgrade
+   rejection.
 5. Policy checks must confirm that the server has no vault-crypto or private-key
    parser and that all implementation inputs satisfy the permissive-license
    allowlist.

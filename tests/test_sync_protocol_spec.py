@@ -244,21 +244,63 @@ def validate_snapshot_capability_declaration(request: dict) -> None:
         raise ValueError("unsupported_capability")
 
 
-def recovery_pages_sha256(pages: list[dict]) -> str:
-    digest = hashlib.sha256()
-    for page in pages:
-        body = json.dumps(
+def snapshot_create_outcome(case: dict, limits: dict) -> tuple[str, int]:
+    if case.get("same_device_and_request_id"):
+        return ("existing_snapshot", 200)
+    if (
+        case["prior_unique_attempts_in_rolling_minute"]
+        >= limits["max_snapshot_creates_per_minute_per_device"]
+    ):
+        return ("rate_limited", 429)
+    if (
+        case["active_snapshots_for_device"]
+        >= limits["max_active_snapshots_per_device"]
+        or case["active_snapshots_for_instance"]
+        >= limits["max_active_snapshots_per_instance"]
+        or case.get("active_metadata_bytes", 0)
+        + case.get("candidate_metadata_bytes", 0)
+        > limits["max_active_snapshot_metadata_bytes_per_instance"]
+    ):
+        return ("limit_exceeded", 413)
+    return ("snapshot_created", 201)
+
+
+def recorded_fixture_raw_page_bodies(pages: list[dict]) -> list[bytes]:
+    """Return the raw request bodies recorded by the deterministic fixture."""
+    return [
+        json.dumps(
             page,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
         ).encode("utf-8")
+        for page in pages
+    ]
+
+
+def recovery_raw_bodies_sha256(raw_bodies: list[bytes]) -> str:
+    digest = hashlib.sha256()
+    for body in raw_bodies:
+        body.decode("utf-8")
         digest.update(struct.pack(">Q", len(body)))
         digest.update(body)
     return digest.hexdigest()
 
 
-def validate_recovery_manifest_pages(manifest: dict, pages: list[dict]) -> None:
+def validate_recovery_manifest_pages(
+    manifest: dict,
+    pages: list[dict],
+    raw_bodies: list[bytes],
+) -> None:
+    if len(raw_bodies) != len(pages):
+        raise ValueError("raw request-body count mismatch")
+    for page, raw_body in zip(pages, raw_bodies):
+        parsed_body = json.loads(
+            raw_body.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+        )
+        if parsed_body != page:
+            raise ValueError("raw request-body semantic mismatch")
     expected_counts = {
         "page_count": len(pages),
         "revision_count": sum(len(page["revisions"]) for page in pages),
@@ -272,7 +314,7 @@ def validate_recovery_manifest_pages(manifest: dict, pages: list[dict]) -> None:
     for field, expected in expected_counts.items():
         if parse_uint64(manifest[field]) != expected:
             raise ValueError(f"{field} mismatch")
-    if manifest["pages_sha256"] != recovery_pages_sha256(pages):
+    if manifest["pages_sha256"] != recovery_raw_bodies_sha256(raw_bodies):
         raise ValueError("pages_sha256 mismatch")
 
 
@@ -571,6 +613,10 @@ class SyncProtocolSpecTests(unittest.TestCase):
             self.openapi["paths"]["/v1/snapshot-reads/{snapshot_id}/pages"]["post"]["responses"]
         )
         self.assertTrue({"404", "410"}.issubset(snapshot_statuses))
+        snapshot_create_statuses = set(
+            self.openapi["paths"]["/v1/snapshot-reads"]["post"]["responses"]
+        )
+        self.assertTrue({"413", "429"}.issubset(snapshot_create_statuses))
 
     def test_all_openapi_external_schema_references_resolve(self) -> None:
         references: list[str] = []
@@ -1528,6 +1574,13 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 capabilities["capabilities"]
             )
         )
+        self.assertTrue(
+            schema_matches(
+                capabilities,
+                self.wire["$defs"]["capabilities_response"],
+                self.wire,
+            )
+        )
         self.assertEqual(capabilities["limits"]["max_snapshot_page_revisions"], 128)
         self.assertEqual(
             capabilities["limits"]["max_snapshot_page_collection_markers"],
@@ -1536,6 +1589,31 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(
             capabilities["limits"]["max_snapshot_page_source_devices"],
             64,
+        )
+        self.assertEqual(
+            {
+                key: capabilities["limits"][key]
+                for key in (
+                    "max_active_snapshots_per_device",
+                    "max_active_snapshots_per_instance",
+                    "max_snapshot_creates_per_minute_per_device",
+                    "max_active_snapshot_metadata_bytes_per_instance",
+                )
+            },
+            {
+                "max_active_snapshots_per_device": 1,
+                "max_active_snapshots_per_instance": 8,
+                "max_snapshot_creates_per_minute_per_device": 5,
+                "max_active_snapshot_metadata_bytes_per_instance": 67108864,
+            },
+        )
+        self.assertEqual(
+            set(capabilities["limits"]),
+            set(
+                self.wire["$defs"]["capabilities_response"]["properties"][
+                    "limits"
+                ]["required"]
+            ),
         )
         request = fixture["empty_sync_request"]
         response = fixture["empty_sync_response"]
@@ -1715,8 +1793,23 @@ class SyncProtocolSpecTests(unittest.TestCase):
         lease = fixture["lease_and_revocation"]
         self.assertEqual(
             lease["snapshot_storage"],
-            "immutable_materialized_projection",
+            "copied_metadata_with_content_addressed_revision_references",
         )
+        self.assertEqual(
+            set(lease["copied_snapshot_members"]),
+            {
+                "envelope",
+                "collection_markers",
+                "source_device_projection",
+                "ordered_membership_and_paging_metadata",
+            },
+        )
+        self.assertEqual(
+            lease["revision_payload_storage"],
+            "retained_reference_to_existing_immutable_content_addressed_object",
+        )
+        self.assertFalse(lease["revision_payload_bytes_duplicated_per_snapshot"])
+        self.assertFalse(lease["live_revision_rows_pinned"])
         self.assertFalse(lease["live_device_rows_pinned"])
         self.assertFalse(lease["live_mutations_blocked"])
         self.assertTrue(lease["page_requests_authenticate_current_live_device_state"])
@@ -1728,6 +1821,83 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertFalse(revoked_owner["page_bytes_returned"])
         self.assertTrue(
             fixture["expected"]["immutable_projection_materialized_at_creation"]
+        )
+
+        resource_limits = fixture["resource_limits"]
+        self.assertEqual(
+            {
+                key: resource_limits[key]
+                for key in (
+                    "max_active_snapshots_per_device",
+                    "max_active_snapshots_per_instance",
+                    "max_snapshot_creates_per_minute_per_device",
+                    "max_active_snapshot_metadata_bytes_per_instance",
+                )
+            },
+            {
+                "max_active_snapshots_per_device": 1,
+                "max_active_snapshots_per_instance": 8,
+                "max_snapshot_creates_per_minute_per_device": 5,
+                "max_active_snapshot_metadata_bytes_per_instance": 67108864,
+            },
+        )
+        self.assertEqual(
+            resource_limits["evaluation_order"],
+            [
+                "exact_idempotency_lookup",
+                "unique_request_rate_limit",
+                "expire_old_snapshots_and_recompute_usage",
+                "active_snapshot_count_limits",
+                "metadata_byte_limit",
+                "allocate_metadata_and_retain_payload_references",
+            ],
+        )
+        self.assertIn(
+            "shared_immutable_revision_payload_objects",
+            resource_limits["metadata_accounting_excludes"],
+        )
+        cases = {case["name"]: case for case in resource_limits["cases"]}
+        self.assertEqual(
+            set(cases),
+            {
+                "exact_retry_at_allocation_limits",
+                "second_active_snapshot_for_device",
+                "ninth_active_snapshot_for_instance",
+                "metadata_exact_fit",
+                "metadata_one_byte_over",
+                "sixth_unique_create_in_rolling_minute",
+            },
+        )
+        for name, case in cases.items():
+            with self.subTest(snapshot_resource_case=name):
+                self.assertEqual(
+                    snapshot_create_outcome(case, resource_limits),
+                    (case["result"], case["http_status"]),
+                )
+                if case["result"] in {"limit_exceeded", "rate_limited"}:
+                    self.assertFalse(case["metadata_allocated"])
+                    self.assertFalse(case["payload_reference_retained"])
+        exact_retry = cases["exact_retry_at_allocation_limits"]
+        self.assertFalse(exact_retry["unique_rate_attempt_consumed"])
+        self.assertFalse(exact_retry["additional_capacity_consumed"])
+        self.assertFalse(exact_retry["lease_refreshed"])
+        exact_fit = cases["metadata_exact_fit"]
+        self.assertEqual(
+            exact_fit["active_metadata_bytes"]
+            + exact_fit["candidate_metadata_bytes"],
+            resource_limits["max_active_snapshot_metadata_bytes_per_instance"],
+        )
+        one_byte_over = cases["metadata_one_byte_over"]
+        self.assertEqual(
+            one_byte_over["active_metadata_bytes"]
+            + one_byte_over["candidate_metadata_bytes"],
+            resource_limits["max_active_snapshot_metadata_bytes_per_instance"]
+            + 1,
+        )
+        self.assertTrue(
+            resource_limits[
+                "all_rejections_before_snapshot_persist_or_allocation"
+            ]
         )
 
         delta_request = fixture["delta_transition_request"]
@@ -1938,9 +2108,18 @@ class SyncProtocolSpecTests(unittest.TestCase):
                     self.wire,
                 )
             )
-        validate_recovery_manifest_pages(manifest, pages)
+        recorded_raw_bodies = recorded_fixture_raw_page_bodies(pages)
         self.assertEqual(
-            recovery_pages_sha256(pages),
+            fixture["digest_fixture_encoding"],
+            "recorded_raw_request_body_bytes_are_compact_sorted_json_utf8_pages_each_prefixed_u64be_length",
+        )
+        validate_recovery_manifest_pages(
+            manifest,
+            pages,
+            recorded_raw_bodies,
+        )
+        self.assertEqual(
+            recovery_raw_bodies_sha256(recorded_raw_bodies),
             manifest["pages_sha256"],
         )
         for field in (
@@ -1961,15 +2140,96 @@ class SyncProtocolSpecTests(unittest.TestCase):
                     validate_recovery_manifest_pages(
                         mismatched_manifest,
                         pages,
+                        recorded_raw_bodies,
                     )
         digest_mismatch = copy.deepcopy(manifest)
         digest_mismatch["pages_sha256"] = "0" * 64
         with self.assertRaisesRegex(ValueError, r"^pages_sha256 mismatch$"):
-            validate_recovery_manifest_pages(digest_mismatch, pages)
+            validate_recovery_manifest_pages(
+                digest_mismatch,
+                pages,
+                recorded_raw_bodies,
+            )
         mutated_pages = copy.deepcopy(pages)
         mutated_pages[-1]["source_devices"][0]["max_author_counter"] = "1"
+        mutated_raw_bodies = recorded_fixture_raw_page_bodies(mutated_pages)
         with self.assertRaisesRegex(ValueError, r"^pages_sha256 mismatch$"):
-            validate_recovery_manifest_pages(manifest, mutated_pages)
+            validate_recovery_manifest_pages(
+                manifest,
+                mutated_pages,
+                mutated_raw_bodies,
+            )
+
+        raw_digest_cases = {
+            case["name"]: case
+            for case in fixture["raw_body_digest_cases"]
+        }
+        self.assertEqual(
+            set(raw_digest_cases),
+            {
+                "recorded_fixture_bodies",
+                "leading_whitespace_added",
+                "top_level_keys_reordered",
+            },
+        )
+        self.assertEqual(
+            raw_digest_cases["recorded_fixture_bodies"]["result"],
+            "matches_manifest",
+        )
+
+        whitespace_bodies = list(recorded_raw_bodies)
+        whitespace_bodies[0] = b" " + whitespace_bodies[0]
+        self.assertEqual(
+            json.loads(whitespace_bodies[0]),
+            pages[0],
+        )
+        self.assertNotEqual(whitespace_bodies[0], recorded_raw_bodies[0])
+        self.assertNotEqual(
+            recovery_raw_bodies_sha256(whitespace_bodies),
+            manifest["pages_sha256"],
+        )
+        with self.assertRaisesRegex(ValueError, r"^pages_sha256 mismatch$"):
+            validate_recovery_manifest_pages(
+                manifest,
+                pages,
+                whitespace_bodies,
+            )
+        whitespace_case = raw_digest_cases["leading_whitespace_added"]
+        self.assertTrue(whitespace_case["semantic_pages_equal"])
+        self.assertFalse(whitespace_case["raw_bytes_equal"])
+        self.assertEqual(
+            whitespace_case["result"],
+            "manifest_digest_mismatch",
+        )
+        self.assertFalse(whitespace_case["destination_activated"])
+
+        reordered_bodies = list(recorded_raw_bodies)
+        reordered_bodies[0] = json.dumps(
+            pages[0],
+            sort_keys=False,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        self.assertEqual(json.loads(reordered_bodies[0]), pages[0])
+        self.assertNotEqual(reordered_bodies[0], recorded_raw_bodies[0])
+        self.assertNotEqual(
+            recovery_raw_bodies_sha256(reordered_bodies),
+            manifest["pages_sha256"],
+        )
+        with self.assertRaisesRegex(ValueError, r"^pages_sha256 mismatch$"):
+            validate_recovery_manifest_pages(
+                manifest,
+                pages,
+                reordered_bodies,
+            )
+        reordered_case = raw_digest_cases["top_level_keys_reordered"]
+        self.assertTrue(reordered_case["semantic_pages_equal"])
+        self.assertFalse(reordered_case["raw_bytes_equal"])
+        self.assertEqual(
+            reordered_case["result"],
+            "manifest_digest_mismatch",
+        )
+        self.assertFalse(reordered_case["destination_activated"])
         self.assertEqual(
             [page["phase"] for page in pages],
             imported["page_phases"],

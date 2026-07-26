@@ -153,7 +153,8 @@ V1 does not protect against:
 | Interrupted passphrase rewrap | Envelope generation CAS leaves one committed envelope | Reload winner; records are unchanged. |
 | Interrupted secret rotation | Active and pending generations remain recoverable until envelope and secret agree | Resume or discard pending state according to two-phase state machine. |
 | Snapshot expires mid-page | Snapshot ID/token is missing or lease expires | Discard all staged pages and begin a fresh cut; never combine snapshots or fall back to an empty delta. |
-| Snapshot holder attempts to delay revocation | Snapshot bytes and source-device projection are immutable copies, never locks on live registry rows; each page reauthenticates current device state | Commit revocation immediately and return `token_revoked` on every later page request by that owner. |
+| Snapshot-create storage exhaustion | A unique request is rate-limited to five attempts per rolling minute per device, with one active snapshot per device, eight per instance, and 64 MiB total active snapshot metadata | Return `rate_limited` or `limit_exceeded` before persisting a snapshot/cut, allocating metadata, or retaining a revision reference. Exact retries return the existing lease without consuming capacity. Snapshot membership uses content-addressed references to existing immutable revision payloads rather than full-vault copies. |
+| Snapshot holder attempts to delay revocation | Copied snapshot metadata and retained content-addressed revision references never lock live registry rows; each page reauthenticates current device state | Commit revocation immediately and return `token_revoked` on every later page request by that owner. |
 | Incompatible protocol/crypto version | Negotiation has no compatible required capability, or the snapshot caller does not declare the exact canonical `snapshot-collection-markers-v1`, `snapshot-device-registry-v1`, and `snapshot-read-v1` trio | Preserve opaque data and block affected writes; reject snapshot creation with `unsupported_capability` before allocation; never downgrade or reset. |
 
 ## 6. Mode guarantees
@@ -249,8 +250,10 @@ The implementation must eventually demonstrate:
 - bounded HTTP parsing, request bodies, pages, sibling counts, and rate limits;
 - stable snapshot cuts, replayable phase-bound page tokens, sibling- and
   collection-marker-complete pagination, complete source-device registry
-  projection copied independently of live rows, live-state authentication on
-  every page, expiry discard, and exact cut-to-delta transition;
+  projection copied independently of live rows, content-addressed immutable
+  revision references, bounded active metadata/allocation rate, live-state
+  authentication on every page, expiry discard, and exact cut-to-delta
+  transition;
 - constant-time grant/token-hash comparison;
 - structured log redaction tests covering every credential and ciphertext
   field;
