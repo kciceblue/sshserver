@@ -153,7 +153,15 @@ def validate_software_identity_keypair(body: dict) -> None:
             private_key,
         )
         canonical_private = openssl_transform(
-            ["pkey", "-inform", "DER", "-outform", "DER"],
+            [
+                "pkcs8",
+                "-topk8",
+                "-nocrypt",
+                "-inform",
+                "DER",
+                "-outform",
+                "DER",
+            ],
             private_key,
         )
         if canonical_private != private_key:
