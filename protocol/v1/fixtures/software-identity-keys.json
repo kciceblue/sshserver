@@ -1,0 +1,144 @@
+{
+  "status": "review-pending-executable-software-identity-key-fixture",
+  "description": "Executable canonical encoding and private/public correspondence fixtures. These values exercise the review artifact only and do not approve the Keychain import implementation.",
+  "canonical_identities": {
+    "ed25519": {
+      "payload_version": 1,
+      "record_type": "software_identity",
+      "body": {
+        "name": "Fixture Ed25519 identity",
+        "notes": "",
+        "key_kind": "ed25519",
+        "private_key_encoding": "ed25519-seed-v1",
+        "private_key": "9W8tCJPEOqNJ3c38d9a3xsf1WzawUXUEFHGWK4ehk1w",
+        "public_key_encoding": "ed25519-raw-v1",
+        "public_key": "KRRjcMhJA1F-xSX6QKSVT62WOOKK2KUibQpcBvwMEz8",
+        "fingerprint": "fixture-ed25519",
+        "requested_biometric_policy": "none",
+        "created_at": "2026-07-27T00:00:00.000Z",
+        "updated_at": "2026-07-27T00:00:00.000Z"
+      }
+    },
+    "rsa": {
+      "payload_version": 1,
+      "record_type": "software_identity",
+      "body": {
+        "name": "Fixture RSA identity",
+        "notes": "",
+        "key_kind": "rsa",
+        "private_key_encoding": "rsa-pkcs8-der-v1",
+        "private_key": "MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCOyR5ECdjkxIq5SGom_RgBinLhjj8z1vvSaqo1kQppmopEDopr2LwSoilLJicPluakCVsxVBVvXJ99fRL8BOwkYwXM1uB0euDl-Dr-evNeHVmugueaC-Xw6uu1Cwit0v2kEF32AYsrmlenVxEUCUQU1vUZ2hAvKi8n68xj7OFJWRGEuyViviv4uiJA1MsdarcnwOcbR8NCGVNVogxCw8_HOpKAQVidS9WW0cDfoPb-9DNx7V-8ktVVDDzgzHy-x0HUXiUbhXNZ65cdPkexqC3viFTSWXyfYPEsXhzoDqvV60lBoQhWMvVhG22inpzmygT_nMDXMHT0f20EVWJbXtjjAgMBAAECggEAAY80dBeePUoqwCHJ5aqwJvlmbwPynI8GrQPKNQFbxB7MxBAzkYpsi35DVZEBq474uxgBmTDLr5907bPd0pm_YlfniLNzC7ipkK5hISN0dfiSd3eASDqUWSQJ-tBREavEMy6lpQizyv1ZRvE9oUCfRrbER9EIAXwJ9RHpphqp0Qg6UCo_aJIarvhdDYoDlW30QbpcstzrBcdE9s8jwHmePSfAg3-0BVtaNakyIJ7xJewmmH_MCMIhXd2EHLBLlP38KnjfbPI7Utf2Zf2eAfjqJw4BQZunYhnqqM7Vd8CdVUnHDFDzpzfwKMFH-2QfBGtQ8udxpq5g5WaSjxIV2ZELSQKBgQDGi7Qh3YIvt44TseWKzOd81NzELLmNfM2YJvx-6YBMNkMLBm5GvNJ-nq0y55BF6p9nh8m-nXg9gQ0mvKJdPGuaMnysL_Efslx7al5JnaIpjkWKXQszIjhMEpvO7LB4kqGsNFqFDoEP02gOadSDZ3zAFCposF16zt6Aa7EKIppMiQKBgQC4GrK3bv6hL2co04UF7WGCK4x4VZohLJXxwBoC6dMa9h-DCdob3bvDVJo3U9igz2qp3Mv27Csj6LIewGBH4PQbzIJTOhxwVB2e2mA_2HCO1z5U-qEldruR3XddmeClwoPGAdudxzH-fEys_z9LAhXs4czTsZPRHSSpEZcKOCNXCwKBgQDEDviV6HLCQ_PcpvMQmT6OGnTWk4O3n-I1uWnkuRekKoERxgvndlY2CuLlPZ1OLV2zknc5763oriMaeXOrthpbbjeGoODud-azSFpLP4n-lys8cpy4pbYKCOYq87dfmQxlTF2GvsfbpNtAQGlGSU77Le6i6mWk-9rj3XQ5mencYQKBgQCGcljZRKGHLIr1caLPdU-kNBFdP4ZTe6_04Ake34tfQSY6F9PETeV0_C-y__RPW6nVan05Ubcffiu18V9enpUmR-9UwDdMgOEwxOFNPs7UQbQvcuiD53WLTGSDYoCADNEWpPyw-Gs2IagNHkomiNtiJnPilOgR6mp_XW0j9WM5iQKBgQDDGXJiMctAuob7ShYin-S8weaha6T0ipH25ODfFOOdhl-b-FFUXLbBGHCMu5jUSq-zYqeeD7FMjl_f5ymo24nSpK9trDMUV5cSvjkVJKNZ7Ix9wlZWgch3lu9RNzeBVH6miSbM9V729DRzW6xs6RLFwwqbMGvpJdUu6M0BfhDRcw",
+        "public_key_encoding": "rsa-pkcs1-der-v1",
+        "public_key": "MIIBCgKCAQEAjskeRAnY5MSKuUhqJv0YAYpy4Y4_M9b70mqqNZEKaZqKRA6Ka9i8EqIpSyYnD5bmpAlbMVQVb1yffX0S_ATsJGMFzNbgdHrg5fg6_nrzXh1ZroLnmgvl8OrrtQsIrdL9pBBd9gGLK5pXp1cRFAlEFNb1GdoQLyovJ-vMY-zhSVkRhLslYr4r-LoiQNTLHWq3J8DnG0fDQhlTVaIMQsPPxzqSgEFYnUvVltHA36D2_vQzce1fvJLVVQw84Mx8vsdB1F4lG4VzWeuXHT5Hsagt74hU0ll8n2DxLF4c6A6r1etJQaEIVjL1YRttop6c5soE_5zA1zB09H9tBFViW17Y4wIDAQAB",
+        "fingerprint": "fixture-rsa",
+        "requested_biometric_policy": "none",
+        "created_at": "2026-07-27T00:00:00.000Z",
+        "updated_at": "2026-07-27T00:00:00.000Z"
+      }
+    }
+  },
+  "negative_cases": [
+    {
+      "name": "missing-public-key-encoding",
+      "base": "ed25519",
+      "mutation": {"operation": "remove", "field": "public_key_encoding"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "empty-public-key",
+      "base": "ed25519",
+      "mutation": {"operation": "replace", "field": "public_key", "value": ""},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "empty-private-key",
+      "base": "ed25519",
+      "mutation": {"operation": "replace", "field": "private_key", "value": ""},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "wrong-ed25519-public-encoding",
+      "base": "ed25519",
+      "mutation": {"operation": "replace", "field": "public_key_encoding", "value": "rsa-pkcs1-der-v1"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "wrong-ed25519-private-encoding",
+      "base": "ed25519",
+      "mutation": {"operation": "replace", "field": "private_key_encoding", "value": "rsa-pkcs8-der-v1"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "short-ed25519-public-key",
+      "base": "ed25519",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "long-ed25519-private-key",
+      "base": "ed25519",
+      "mutation": {"operation": "replace", "field": "private_key", "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "mismatched-ed25519-keypair",
+      "base": "ed25519",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "Q_PEoGzN86taAZb_K2QL6NsaspNtn3RtZvXtcbfUxbY"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "wrong-rsa-public-encoding",
+      "base": "rsa",
+      "mutation": {"operation": "replace", "field": "public_key_encoding", "value": "ed25519-raw-v1"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "wrong-rsa-private-encoding",
+      "base": "rsa",
+      "mutation": {"operation": "replace", "field": "private_key_encoding", "value": "ed25519-seed-v1"},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "malformed-rsa-pkcs8-private-key",
+      "base": "rsa",
+      "mutation": {"operation": "replace", "field": "private_key", "value": "AQ"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "wrong-rsa-private-algorithm",
+      "base": "rsa",
+      "mutation": {"operation": "replace", "field": "private_key", "value": "MC4CAQAwBQYDK2VwBCIEIPVvLQiTxDqjSd3N_HfWt8bH9Vs2sFF1BBRxliuHoZNc"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "noncanonical-rsa-private-trailing-bytes",
+      "base": "rsa",
+      "mutation": {"operation": "append", "field": "private_key", "value": "AA"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "malformed-rsa-pkcs1-public-key",
+      "base": "rsa",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "AQ"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "rsa-spki-public-instead-of-pkcs1",
+      "base": "rsa",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjskeRAnY5MSKuUhqJv0YAYpy4Y4_M9b70mqqNZEKaZqKRA6Ka9i8EqIpSyYnD5bmpAlbMVQVb1yffX0S_ATsJGMFzNbgdHrg5fg6_nrzXh1ZroLnmgvl8OrrtQsIrdL9pBBd9gGLK5pXp1cRFAlEFNb1GdoQLyovJ-vMY-zhSVkRhLslYr4r-LoiQNTLHWq3J8DnG0fDQhlTVaIMQsPPxzqSgEFYnUvVltHA36D2_vQzce1fvJLVVQw84Mx8vsdB1F4lG4VzWeuXHT5Hsagt74hU0ll8n2DxLF4c6A6r1etJQaEIVjL1YRttop6c5soE_5zA1zB09H9tBFViW17Y4wIDAQAB"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "noncanonical-rsa-public-trailing-byte",
+      "base": "rsa",
+      "mutation": {"operation": "append", "field": "public_key", "value": "AA"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "mismatched-rsa-keypair",
+      "base": "rsa",
+      "mutation": {"operation": "replace", "field": "public_key", "value": "MIIBCgKCAQEAweu8sMo90uTke5Cm4eA7z5C6vu8z85Nn7daEwF-JW028iQ7pvwtndoQOZlCPscPMhqljYZvOULP_0-gkBFjv5osGX_D3exJel84S8gc214L566xbwdOLmv_UCWKtym28kyImrFHzOpNx8GoFui7HeIUnolhtDkyijnkKCFpesH6Huq9TZA2ndidgrmLkk9PBcdVO7he41pVE1KlQfh2Ui1ZiEUAYliSuqauj2Mk1ngca10cmIFe2we8xM2b-ESa3d93HeEX08g9Hw6VKq50vsAdGlsVR3_O6XP9S5phDoPN9VFpS0n6q2RjsZVl3sy63Ph7E4XzS2DDKoRbqoHewpQIDAQAB"},
+      "rejected_by": "key_validation"
+    }
+  ]
+}

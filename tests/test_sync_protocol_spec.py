@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import struct
+import subprocess
 import unittest
 import uuid
 
@@ -55,6 +56,8 @@ DEVICE_LOCAL_FIELDS = {
     "keychain_persistent_reference",
 }
 BACKUP_MANIFEST_PATHS = frozenset({"config.json", "instance-secret", "sync.db"})
+ED25519_PKCS8_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
+ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 
 def read_json(path: Path) -> dict:
@@ -93,6 +96,93 @@ def decode_base64url(value: str) -> bytes:
     if reencoded != value:
         raise ValueError("not canonical unpadded base64url")
     return decoded
+
+
+def openssl_transform(arguments: list[str], input_bytes: bytes) -> bytes:
+    """Run the Apache-2.0 OpenSSL CLI as an executable conformance parser."""
+    try:
+        result = subprocess.run(
+            ["openssl", *arguments],
+            check=False,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("openssl is required for key fixture validation") from error
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(detail or f"openssl exited with {result.returncode}")
+    return result.stdout
+
+
+def validate_software_identity_keypair(body: dict) -> None:
+    """Enforce V1 kind/encoding, canonical parse, and key correspondence."""
+    private_key = decode_base64url(body["private_key"])
+    public_key = decode_base64url(body["public_key"])
+    key_kind = body["key_kind"]
+
+    if key_kind == "ed25519":
+        if body["private_key_encoding"] != "ed25519-seed-v1":
+            raise ValueError("wrong Ed25519 private-key encoding")
+        if body["public_key_encoding"] != "ed25519-raw-v1":
+            raise ValueError("wrong Ed25519 public-key encoding")
+        if len(private_key) != 32 or len(public_key) != 32:
+            raise ValueError("Ed25519 keys must each be exactly 32 bytes")
+        public_spki = openssl_transform(
+            ["pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+            ED25519_PKCS8_PREFIX + private_key,
+        )
+        if not public_spki.startswith(ED25519_SPKI_PREFIX):
+            raise ValueError("unexpected Ed25519 SubjectPublicKeyInfo encoding")
+        derived_public_key = public_spki[len(ED25519_SPKI_PREFIX) :]
+        if len(derived_public_key) != 32 or derived_public_key != public_key:
+            raise ValueError("Ed25519 public key does not match private seed")
+        return
+
+    if key_kind == "rsa":
+        if body["private_key_encoding"] != "rsa-pkcs8-der-v1":
+            raise ValueError("wrong RSA private-key encoding")
+        if body["public_key_encoding"] != "rsa-pkcs1-der-v1":
+            raise ValueError("wrong RSA public-key encoding")
+        if not private_key or not public_key:
+            raise ValueError("RSA keys must be non-empty")
+
+        openssl_transform(
+            ["rsa", "-inform", "DER", "-check", "-noout"],
+            private_key,
+        )
+        canonical_private = openssl_transform(
+            ["pkey", "-inform", "DER", "-outform", "DER"],
+            private_key,
+        )
+        if canonical_private != private_key:
+            raise ValueError("RSA private key is not canonical PKCS#8 DER")
+
+        canonical_public = openssl_transform(
+            [
+                "rsa",
+                "-RSAPublicKey_in",
+                "-inform",
+                "DER",
+                "-RSAPublicKey_out",
+                "-outform",
+                "DER",
+            ],
+            public_key,
+        )
+        if canonical_public != public_key:
+            raise ValueError("RSA public key is not canonical PKCS#1 DER")
+
+        derived_public_key = openssl_transform(
+            ["rsa", "-inform", "DER", "-RSAPublicKey_out", "-outform", "DER"],
+            private_key,
+        )
+        if derived_public_key != public_key:
+            raise ValueError("RSA public key does not match private key")
+        return
+
+    raise ValueError(f"unsupported software identity key kind: {key_kind}")
 
 
 def parse_uint64(value: str) -> int:
@@ -855,7 +945,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertNotIn("identity_files", host_fields)
         self.assertNotIn("session_logging_enabled", host_fields)
 
-    def test_software_identity_schema_binds_key_kind_encoding_and_ed25519_seed_size(self) -> None:
+    def test_software_identity_schema_and_fixture_enforce_canonical_keypairs(self) -> None:
         body_schema = self.payload["$defs"]["software_identity_body"]
         branches = {
             branch["if"]["properties"]["key_kind"]["const"]: branch["then"][
@@ -872,73 +962,112 @@ class SyncProtocolSpecTests(unittest.TestCase):
             branches["rsa"]["private_key_encoding"]["const"],
             "rsa-pkcs8-der-v1",
         )
-        ed25519_key_shape = branches["ed25519"]["private_key"]["allOf"][1]
-        self.assertEqual(ed25519_key_shape["minLength"], 43)
-        self.assertEqual(ed25519_key_shape["maxLength"], 43)
+        self.assertEqual(
+            branches["ed25519"]["public_key_encoding"]["const"],
+            "ed25519-raw-v1",
+        )
+        self.assertEqual(
+            branches["rsa"]["public_key_encoding"]["const"],
+            "rsa-pkcs1-der-v1",
+        )
+        for field in ("private_key", "public_key"):
+            with self.subTest(field=field):
+                ed25519_key_shape = branches["ed25519"][field]["allOf"][1]
+                self.assertEqual(ed25519_key_shape["minLength"], 43)
+                self.assertEqual(ed25519_key_shape["maxLength"], 43)
         self.assertEqual(
             body_schema["properties"]["private_key"]["allOf"][1]["minLength"],
             1,
         )
-
-        valid_seed = base64.urlsafe_b64encode(b"\x01" * 32).rstrip(b"=").decode()
-        short_seed = base64.urlsafe_b64encode(b"\x01" * 31).rstrip(b"=").decode()
-        long_seed = base64.urlsafe_b64encode(b"\x01" * 33).rstrip(b"=").decode()
-        self.assertEqual(len(valid_seed), 43)
-        self.assertEqual(len(decode_base64url(valid_seed)), 32)
-        self.assertNotEqual(len(short_seed), 43)
-        self.assertNotEqual(len(long_seed), 43)
-        self.assertNotEqual(len(decode_base64url(short_seed)), 32)
-        self.assertNotEqual(len(decode_base64url(long_seed)), 32)
-
-        valid_payload = {
-            "payload_version": 1,
-            "record_type": "software_identity",
-            "body": {
-                "name": "Test key",
-                "notes": "",
-                "key_kind": "ed25519",
-                "private_key_encoding": "ed25519-seed-v1",
-                "private_key": valid_seed,
-                "public_key": "AQ",
-                "fingerprint": "SHA256:test",
-                "requested_biometric_policy": "none",
-                "created_at": "2026-07-26T00:00:00.000Z",
-                "updated_at": "2026-07-26T00:00:00.000Z",
-            },
-        }
-        external_roots = {"wire.schema.json": self.wire}
-        self.assertTrue(
-            schema_matches(
-                valid_payload,
-                self.payload,
-                self.payload,
-                external_roots,
-            )
+        self.assertEqual(
+            body_schema["properties"]["public_key"]["allOf"][1]["minLength"],
+            1,
         )
-        for invalid_kind, invalid_encoding, invalid_key in (
-            ("ed25519", "rsa-pkcs8-der-v1", valid_seed),
-            ("rsa", "ed25519-seed-v1", "MAMCAQE"),
-            ("ed25519", "ed25519-seed-v1", ""),
-            ("ed25519", "ed25519-seed-v1", short_seed),
-            ("ed25519", "ed25519-seed-v1", long_seed),
+        self.assertIn("public_key_encoding", body_schema["required"])
+
+        normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
+        for claim in (
+            "public_key_encoding = ed25519-raw-v1",
+            "public_key_encoding = rsa-pkcs1-der-v1",
+            "require byte-for-byte equality with the received bytes",
+            "derive the canonical public-key bytes from the validated private key and require exact equality",
+            "before persistent Keychain import or any local custody mutation",
         ):
-            with self.subTest(
-                key_kind=invalid_kind,
-                private_key_encoding=invalid_encoding,
-                private_key_length=len(invalid_key),
-            ):
-                invalid_payload = copy.deepcopy(valid_payload)
-                invalid_payload["body"]["key_kind"] = invalid_kind
-                invalid_payload["body"]["private_key_encoding"] = invalid_encoding
-                invalid_payload["body"]["private_key"] = invalid_key
-                self.assertFalse(
+            with self.subTest(claim=claim):
+                self.assertIn(claim, normalized_protocol)
+
+        fixture = self.fixtures["software-identity-keys.json"]
+        self.assertEqual(
+            fixture["status"],
+            "review-pending-executable-software-identity-key-fixture",
+        )
+        self.assertRegex(
+            openssl_transform(["version"], b"").decode("ascii"),
+            r"^OpenSSL 3\.",
+        )
+        external_roots = {"wire.schema.json": self.wire}
+        for name, payload in fixture["canonical_identities"].items():
+            with self.subTest(valid_identity=name):
+                self.assertTrue(
                     schema_matches(
-                        invalid_payload,
+                        payload,
                         self.payload,
                         self.payload,
                         external_roots,
                     )
                 )
+                validate_software_identity_keypair(payload["body"])
+
+        negative_cases = fixture["negative_cases"]
+        self.assertEqual(
+            {case["name"] for case in negative_cases},
+            {
+                "missing-public-key-encoding",
+                "empty-public-key",
+                "empty-private-key",
+                "wrong-ed25519-public-encoding",
+                "wrong-ed25519-private-encoding",
+                "short-ed25519-public-key",
+                "long-ed25519-private-key",
+                "mismatched-ed25519-keypair",
+                "wrong-rsa-public-encoding",
+                "wrong-rsa-private-encoding",
+                "malformed-rsa-pkcs8-private-key",
+                "wrong-rsa-private-algorithm",
+                "noncanonical-rsa-private-trailing-bytes",
+                "malformed-rsa-pkcs1-public-key",
+                "rsa-spki-public-instead-of-pkcs1",
+                "noncanonical-rsa-public-trailing-byte",
+                "mismatched-rsa-keypair",
+            },
+        )
+        for case in negative_cases:
+            with self.subTest(invalid_identity=case["name"]):
+                invalid_payload = copy.deepcopy(
+                    fixture["canonical_identities"][case["base"]]
+                )
+                mutation = case["mutation"]
+                if mutation["operation"] == "remove":
+                    del invalid_payload["body"][mutation["field"]]
+                elif mutation["operation"] == "append":
+                    invalid_payload["body"][mutation["field"]] += mutation["value"]
+                else:
+                    self.assertEqual(mutation["operation"], "replace")
+                    invalid_payload["body"][mutation["field"]] = mutation["value"]
+
+                matches_schema = schema_matches(
+                    invalid_payload,
+                    self.payload,
+                    self.payload,
+                    external_roots,
+                )
+                if case["rejected_by"] == "schema":
+                    self.assertFalse(matches_schema)
+                else:
+                    self.assertEqual(case["rejected_by"], "key_validation")
+                    self.assertTrue(matches_schema)
+                    with self.assertRaises(ValueError):
+                        validate_software_identity_keypair(invalid_payload["body"])
 
     def test_backup_fixture_is_complete_sensitive_and_fail_closed(self) -> None:
         fixture = self.fixtures["api-and-recovery.json"]

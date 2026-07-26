@@ -561,15 +561,30 @@ The body contains `name`, `kind` (`local`, `remote`, or `dynamic`), `bind_host`,
 ### 9.4 `software_identity`
 
 The body contains `name`, `notes`, `key_kind` (`ed25519` or `rsa`), exact
-private-key encoding identifier, private-key bytes, public-key bytes,
-fingerprint, requested local biometric policy, and timestamps. The entire body
-is inside record AEAD. Proposed canonical private encodings are a 32-byte
-Ed25519 seed and PKCS#8 DER for RSA. The payload schema binds `ed25519` only to
-`ed25519-seed-v1` and `rsa` only to `rsa-pkcs8-der-v1`; after canonical
-base64url decode, the client MUST require exactly 32 Ed25519 seed bytes or
-strictly parse a non-empty RSA PKCS#8 DER value matching the declared key kind.
-This export/import path and its local user authorization are
-**REVIEW-PENDING**.
+private- and public-key encoding identifiers, private-key bytes, public-key
+bytes, fingerprint, requested local biometric policy, and timestamps. The
+entire body is inside record AEAD. V1 defines these canonical pairs:
+
+- `ed25519` uses `private_key_encoding = ed25519-seed-v1` for exactly 32 raw
+  seed bytes and `public_key_encoding = ed25519-raw-v1` for exactly 32 raw
+  public-key bytes.
+- `rsa` uses `private_key_encoding = rsa-pkcs8-der-v1` for a non-empty
+  canonical PKCS#8 `PrivateKeyInfo` DER value containing an RSA private key and
+  `public_key_encoding = rsa-pkcs1-der-v1` for a non-empty canonical PKCS#1
+  `RSAPublicKey` DER value.
+
+After canonical base64url decode, the client MUST bind `key_kind` to exactly
+that encoding pair. It MUST enforce both Ed25519 lengths. It MUST strictly parse
+each RSA value as the declared ASN.1 type and algorithm, re-encode it to DER,
+and require byte-for-byte equality with the received bytes; accepting a BER
+variant, trailing bytes, a different algorithm, or an empty value is forbidden.
+For either key kind, the client MUST derive the canonical public-key bytes from
+the validated private key and require exact equality with `public_key`. Any
+encoding, parse, canonicality, or correspondence failure rejects the decrypted
+record before persistent Keychain import or any local custody mutation. The
+fingerprint is recomputed from the validated public key rather than trusted as
+proof of correspondence. This export/import path and its local user
+authorization are **REVIEW-PENDING**.
 
 Restoration writes no plaintext key file. The client authorizes access,
 decrypts in memory, imports directly into device-only Keychain storage, and

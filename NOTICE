@@ -6,3 +6,8 @@ This product is licensed under the Apache License, Version 2.0.
 No third-party runtime or build dependencies are distributed at this scaffold
 stage. External GitHub Actions used by CI are recorded in DEPENDENCIES.json
 and are not redistributed by this repository.
+
+The protocol conformance tests invoke a system-provided OpenSSL 3 command-line
+tool (Apache-2.0) to strictly parse, canonically re-encode, and derive the
+public halves of software-identity key fixtures. OpenSSL is not linked into or
+redistributed by this repository.
