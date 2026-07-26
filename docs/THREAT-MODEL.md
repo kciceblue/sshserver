@@ -128,7 +128,7 @@ V1 does not protect against:
 | Revoked device reconnects | Server rejects token before read/write transaction | Returning local edits require explicit import under a fresh device ID; no implicit resurrection. |
 | Modified ciphertext/tag | AEAD validation fails | Quarantine exact opaque revision; keep good siblings and do not apply local or Keychain mutations. |
 | Record swapping | Record/revision/vault IDs are authenticated as associated data | Reject and quarantine. |
-| Visible vector/tombstone alteration | Vector and tombstone fields are authenticated as associated data | Reject and quarantine; server-owned cursor/time remain non-authoritative. |
+| Visible vector/frontier/tombstone alteration | Vector and tombstone fields are authenticated as associated data; every vector and frontier is nonempty, uniquely keyed, positive-counter, and canonically ordered | Reject empty, duplicate, out-of-order, zero-valued, author-mismatched, or cryptographically invalid input before comparison or recovery import; server-owned cursor/time remain non-authoritative. |
 | Replay of an older individual revision | Durable vectors/counters retain newer siblings | Ignore dominated replay and record diagnostic evidence. |
 | Coherent full-state rollback | Surviving device compares durable envelope generation, author counter, vectors, and checkpoint | Block sync and require recovery. A new device with no checkpoint cannot prove freshness. |
 | Server equivocation/fork | Different clients can receive different valid histories | V1 has no transparency log. It can detect contradictions when histories meet but cannot guarantee timely fork detection. |
@@ -153,7 +153,8 @@ V1 does not protect against:
 | Interrupted passphrase rewrap | Envelope generation CAS leaves one committed envelope | Reload winner; records are unchanged. |
 | Interrupted secret rotation | Active and pending generations remain recoverable until envelope and secret agree | Resume or discard pending state according to two-phase state machine. |
 | Snapshot expires mid-page | Snapshot ID/token is missing or lease expires | Discard all staged pages and begin a fresh cut; never combine snapshots or fall back to an empty delta. |
-| Incompatible protocol/crypto version | Negotiation has no compatible required capability, including `snapshot-collection-markers-v1` and `snapshot-device-registry-v1` for recovery-complete snapshot pages | Preserve opaque data and block affected writes; never downgrade or reset. |
+| Snapshot holder attempts to delay revocation | Snapshot bytes and source-device projection are immutable copies, never locks on live registry rows; each page reauthenticates current device state | Commit revocation immediately and return `token_revoked` on every later page request by that owner. |
+| Incompatible protocol/crypto version | Negotiation has no compatible required capability, or the snapshot caller does not declare the exact canonical `snapshot-collection-markers-v1`, `snapshot-device-registry-v1`, and `snapshot-read-v1` trio | Preserve opaque data and block affected writes; reject snapshot creation with `unsupported_capability` before allocation; never downgrade or reset. |
 
 ## 6. Mode guarantees
 
@@ -248,7 +249,8 @@ The implementation must eventually demonstrate:
 - bounded HTTP parsing, request bodies, pages, sibling counts, and rate limits;
 - stable snapshot cuts, replayable phase-bound page tokens, sibling- and
   collection-marker-complete pagination, complete source-device registry
-  projection, expiry discard, and exact cut-to-delta transition;
+  projection copied independently of live rows, live-state authentication on
+  every page, expiry discard, and exact cut-to-delta transition;
 - constant-time grant/token-hash comparison;
 - structured log redaction tests covering every credential and ciphertext
   field;

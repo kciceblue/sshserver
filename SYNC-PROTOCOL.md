@@ -463,7 +463,15 @@ The server stores one envelope with a monotonically increasing generation.
 Creation uses `expected_generation = "0"` and `new_generation = "1"`.
 Replacement requires `new_generation = expected_generation + 1`. The client
 constructs ciphertext for the new generation before the conditional PUT. A
-generation conflict never overwrites the winner.
+generation conflict never overwrites the winner. Successor arithmetic is
+checked before ciphertext construction. After authenticating and structurally
+validating the request, the server first compares `expected_generation`; a
+stale value returns `generation_conflict`. When the matching stored and
+expected generation is `UInt64.max`, replacement returns non-retryable HTTP 409
+`generation_exhausted` before validating a successor value or envelope and
+before checking cursor capacity. It does not change the envelope, consume a
+cursor, or record a partial request result. Otherwise the server requires the
+exact successor and then checks cursor capacity.
 
 Enabling, changing, disabling, or recovering a passphrase rewraps the same VMK
 and leaves record ciphertext unchanged. A surviving device that already holds
@@ -507,6 +515,17 @@ u16be(vector_entry_count) ||
 for each vector entry sorted by device UUID bytes:
     uuid_bytes(device_id) || u64be(counter)
 ```
+
+Every version vector and collection-marker frontier is nonempty and canonical.
+Entries are strictly increasing by the raw 16 UUID bytes, so each device ID
+appears exactly once. Every encoded counter is in `1...UInt64.max`; a zero
+component is omitted and is invalid if transmitted. A revision's
+`author_counter` is also positive, and its vector contains exactly one
+`author_device_id` entry whose counter equals `author_counter`. Servers and
+clients reject an empty, duplicate, out-of-order, zero-valued, or
+author-mismatched vector or frontier with `invalid_request` before using it for
+comparison, associated-data construction, snapshot staging, or recovery
+import.
 
 All client-supplied server-visible synchronization metadata is authenticated.
 The server-assigned change cursor and receipt time are not part of the record
@@ -688,13 +707,31 @@ Keychain cleanup path.
 
 ### 10.4 Acknowledgement and collection
 
-The server assigns a monotonically increasing change cursor to every accepted
-record revision, envelope change, device-state change, or collection marker.
-The client acknowledges a cursor only in a later request, after every preceding
-change is durably stored or quarantined locally.
+The server assigns a monotonically increasing change cursor exactly once to
+each committed record revision, envelope creation or replacement, device
+enrollment, device revocation or retirement, and collection marker. An exact
+idempotent retry returns the recorded operation result; its original change
+retains the original cursor and the retry consumes no second cursor. A request
+that commits several new cursor-bearing items reserves and
+assigns one cursor per item atomically or commits none. The client acknowledges
+a cursor only in a later request, after every preceding change is durably
+stored or quarantined locally.
 
-The change cursor never wraps. At `UInt64.max` the server rejects every new
-mutation with `server_cursor_exhausted` while preserving read and backup access.
+Token-hash rotation, acknowledgement and last-successful-sync metadata,
+snapshot creation and paging, snapshot lease expiry, backup reads, and the
+pending/recovery-slot bookkeeping of instance-secret rotation do not receive a
+change cursor. The envelope replacement that names a pending instance-secret
+generation remains cursor-bearing.
+
+The change cursor never wraps. At `UInt64.max` the server rejects only a request
+that would commit one or more new cursor-bearing items with HTTP 507
+`server_cursor_exhausted`, before any part of that request mutates state. Exact
+retries of already committed items return their recorded operation results
+without allocating another cursor. Authenticated reads, backups,
+acknowledgement and last-sync updates, token rotation, snapshot operations, and
+other safe non-cursor operations remain available. Beginning an instance-secret
+rotation also preflights capacity for its required envelope replacement;
+exhaustion returns `server_cursor_exhausted` without creating a pending secret.
 
 The proposed minimum tombstone retention is 90 days of accumulated daemon
 uptime. The server increments a durable per-candidate retention-age counter
@@ -791,7 +828,24 @@ Recovery-complete V1 snapshots require `snapshot-read-v1`,
 emitting the required `collection_markers` or `source_devices` response member
 and its corresponding advertised page limit MUST advertise the corresponding
 capability; a client MUST require all three before creating a snapshot and
-fails closed with `unsupported_capability` when any is absent.
+fails closed with `unsupported_capability` when any is absent. The snapshot
+create body MUST declare `required_capabilities` as exactly this canonical,
+UTF-8-byte-sorted array:
+
+```json
+[
+  "snapshot-collection-markers-v1",
+  "snapshot-device-registry-v1",
+  "snapshot-read-v1"
+]
+```
+
+Before allocating a snapshot or retaining its idempotency result, the server
+checks this declaration. A missing, incomplete, duplicate, additional, or
+noncanonically ordered declaration returns HTTP 426 `unsupported_capability`;
+it is not silently sorted or interpreted as the legacy `snapshot-read-v1`
+shape.
+
 `POST /v1/snapshot-reads` atomically chooses `cut_cursor = C`, captures the
 exact envelope at C, and materializes the membership of every retained
 undominated revision, every persistent collection marker, and the complete
@@ -815,10 +869,16 @@ bytes`. Empty phases are skipped, and a page never mixes phases; siblings,
 markers, or device entries may cross a page boundary. Each opaque 32-byte page
 token is bound to snapshot ID, authenticated device ID, cut cursor, phase, and
 the next ordering key. Replaying a page token returns byte-equivalent JSON.
-The server pins included revision bytes and the projected device rows against
-change for the snapshot lease, proposed as 15 minutes of daemon monotonic
-uptime. Collection markers are already persistent. `expires_at` is display
-metadata only.
+At creation the server copies the envelope, included revision bytes, collection
+markers, and projected source-device entries into immutable snapshot storage
+for the lease, proposed as 15 minutes of daemon monotonic uptime. The lease
+never pins or blocks live revision, marker, envelope, or device-registry rows;
+enrollment, revocation, token rotation, acknowledgement, collection, and sync
+continue normally. Every page request authenticates the bearer against the
+current live device registry before consulting the immutable snapshot. If the
+snapshot owner has been revoked, paging returns HTTP 401 `token_revoked`
+immediately; the lease neither delays revocation nor grants another device
+access to the device-bound snapshot. `expires_at` is display metadata only.
 
 The client stages pages under one snapshot ID and atomically replaces its sync
 store only after all pages, the envelope, every AEAD value, every collection
@@ -859,8 +919,8 @@ V1 stable codes include:
 - `unauthorized`, `token_revoked`, `scope_denied`,
   `authenticated_device_mismatch`, `rate_limited`;
 - `grant_expired`, `grant_consumed`, `enrollment_replay_mismatch`;
-- `request_id_reused`, `generation_conflict`, `counter_conflict`,
-  `counter_exhausted`;
+- `request_id_reused`, `generation_conflict`, `generation_exhausted`,
+  `counter_conflict`, `counter_exhausted`;
 - `revision_equivocation`, `too_many_siblings`, `limit_exceeded`;
 - `cursor_expired`, `snapshot_expired`, `snapshot_not_found`,
   `envelope_missing`, `device_not_found`, `zero_active_confirmation_required`;
@@ -879,7 +939,7 @@ localized `message`.
 | 401 | `unauthorized`, `token_revoked` |
 | 403 | `scope_denied`, `authenticated_device_mismatch` |
 | 404 | `envelope_missing`, `device_not_found`, `snapshot_not_found` |
-| 409 | `enrollment_replay_mismatch`, `request_id_reused`, `generation_conflict`, `counter_conflict`, `counter_exhausted`, `revision_equivocation`, `too_many_siblings`, `zero_active_confirmation_required`, `instance_mismatch`, `stale_after_collection` |
+| 409 | `enrollment_replay_mismatch`, `request_id_reused`, `generation_conflict`, `generation_exhausted`, `counter_conflict`, `counter_exhausted`, `revision_equivocation`, `too_many_siblings`, `zero_active_confirmation_required`, `instance_mismatch`, `stale_after_collection` |
 | 410 | `grant_expired`, `grant_consumed`, `cursor_expired`, `snapshot_expired` |
 | 413 | `limit_exceeded` |
 | 426 | `unsupported_protocol`, `unsupported_capability` |
@@ -1084,8 +1144,10 @@ instance.
 
 The proposed crash-safe rotation is two phase:
 
-1. Through verified SSH, the CLI creates a pending random secret and increments
-   `instance_secret_generation`, preserving the active secret.
+1. Through verified SSH, the CLI checks that both
+   `instance_secret_generation` has a successor and the required envelope
+   replacement has cursor capacity. It then creates a pending random secret at
+   exactly `active_generation + 1`, preserving the active secret.
 2. The client receives the pending secret through that SSH channel, derives a
    new wrapping key, and conditionally stores a new VMK envelope naming the
    pending generation.
@@ -1100,6 +1162,18 @@ The proposed crash-safe rotation is two phase:
 
 If no enrolled device holds the VMK, instance-secret rotation is impossible;
 replacing the secret alone would destroy recovery.
+
+Ordinary envelope replacement and instance-secret rotation use checked
+successor arithmetic. If the current envelope generation or active
+instance-secret generation is `UInt64.max`, the server returns non-retryable
+HTTP 409 `generation_exhausted` (and the verified-SSH CLI prints the same stable
+code) before generating ciphertext, creating a pending secret, advancing a
+generation, consuming a cursor, or changing any active/recovery state. This is
+distinct from the offline host-recovery diagnostic
+`recovery_generation_exhausted`. Generation exhaustion takes precedence over
+cursor exhaustion; when a successor exists but its required envelope commit
+does not have cursor capacity, the operation instead fails with
+`server_cursor_exhausted`.
 
 ## 15. Server-visible metadata budget
 
@@ -1145,8 +1219,10 @@ Before this draft becomes approved:
    parser and that all implementation inputs satisfy the permissive-license
    allowlist.
 6. Boundary tests must accept `18446744073709551615`, reject
-   `18446744073709551616` before any cursor/counter arithmetic, and reject a
-   recovery source generation at `UInt64.max` before attempting its successor.
+   `18446744073709551616` before any cursor/counter arithmetic, reject ordinary
+   envelope and instance-secret successor attempts at `UInt64.max` with
+   `generation_exhausted` and no mutation, and reject a recovery source
+   generation at `UInt64.max` before attempting its successor.
 7. The coordinator records the reviewed exact commits and evidence before task
    2.0 is acknowledged. Until then task 2.1 and cryptographic implementation
    remain downstream work.

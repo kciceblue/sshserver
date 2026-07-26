@@ -13,6 +13,11 @@
       "description": "Canonical unsigned decimal in the inclusive range 0 through 18446744073709551615. Implementations MUST also parse with checked uint64 conversion before use.",
       "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
     },
+    "positive_uint64": {
+      "type": "string",
+      "description": "Canonical unsigned decimal in the inclusive range 1 through 18446744073709551615. Zero vector components are omitted and forbidden on the wire.",
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
     "base64url": {
       "type": "string",
       "description": "Unpadded RFC 4648 base64url. After this structural schema match, implementations MUST strictly decode, re-encode without padding, and require byte-for-byte equality to reject noncanonical unused trailing bits.",
@@ -39,7 +44,7 @@
       "required": ["device_id", "counter"],
       "properties": {
         "device_id": {"$ref": "#/$defs/uuid"},
-        "counter": {"$ref": "#/$defs/uint64"}
+        "counter": {"$ref": "#/$defs/positive_uint64"}
       }
     },
     "record_revision": {
@@ -61,11 +66,13 @@
         "record_id": {"$ref": "#/$defs/uuid"},
         "revision_id": {"$ref": "#/$defs/uuid"},
         "author_device_id": {"$ref": "#/$defs/uuid"},
-        "author_counter": {"$ref": "#/$defs/uint64"},
+        "author_counter": {"$ref": "#/$defs/positive_uint64"},
         "version_vector": {
           "type": "array",
+          "description": "Nonempty and strictly increasing by raw UUID bytes with one unique entry per device. The author entry MUST occur exactly once and equal author_counter. Semantic validation rejects duplicate IDs even when their counters differ.",
           "minItems": 1,
           "maxItems": 64,
+          "uniqueItems": true,
           "items": {"$ref": "#/$defs/vector_entry"}
         },
         "payload_schema": {"const": "1"},
@@ -210,8 +217,10 @@
         "collected_revision_id": {"$ref": "#/$defs/uuid"},
         "frontier": {
           "type": "array",
+          "description": "Nonempty and strictly increasing by raw UUID bytes with one unique positive-counter entry per device. Semantic validation rejects duplicate IDs even when their counters differ.",
           "minItems": 1,
           "maxItems": 64,
+          "uniqueItems": true,
           "items": {"$ref": "#/$defs/vector_entry"}
         },
         "barrier_cursor": {"$ref": "#/$defs/uint64"}
@@ -413,13 +422,20 @@
     },
     "snapshot_create_request": {
       "type": "object",
-      "description": "The device_id MUST equal the bearer-authenticated device ID.",
+      "description": "The device_id MUST equal the bearer-authenticated device ID. Before snapshot allocation, required_capabilities MUST be present as the exact canonical array; missing, incomplete, duplicate, additional, or noncanonical declarations return HTTP 426 unsupported_capability.",
       "additionalProperties": false,
-      "required": ["protocol_version", "device_id", "request_id"],
+      "required": ["protocol_version", "device_id", "request_id", "required_capabilities"],
       "properties": {
         "protocol_version": {"const": "1"},
         "device_id": {"$ref": "#/$defs/uuid"},
-        "request_id": {"$ref": "#/$defs/uuid"}
+        "request_id": {"$ref": "#/$defs/uuid"},
+        "required_capabilities": {
+          "const": [
+            "snapshot-collection-markers-v1",
+            "snapshot-device-registry-v1",
+            "snapshot-read-v1"
+          ]
+        }
       }
     },
     "snapshot_create_response": {
@@ -691,6 +707,7 @@
                 "enrollment_replay_mismatch",
                 "envelope_missing",
                 "generation_conflict",
+                "generation_exhausted",
                 "grant_consumed",
                 "grant_expired",
                 "instance_mismatch",

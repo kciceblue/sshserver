@@ -302,6 +302,8 @@
     "source_registry_leaves_no_fresh_enrollment_slot": "recovery_device_capacity_exhausted",
     "identity_mismatch": "instance_mismatch",
     "source_generation_has_no_uint64_successor": "recovery_generation_exhausted",
+    "malformed_version_vector_or_frontier": "refuse_recovery_import",
+    "manifest_count_or_digest_mismatch": "refuse_recovery_import",
     "missing_sibling_tombstone_or_collection_marker": "manifest_digest_mismatch",
     "interrupted_import": "discard_or_resume_inert_staging_state",
     "old_host_returns": "treat_as_abandoned_fork_and_never_sync_both"

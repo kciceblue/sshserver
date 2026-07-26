@@ -5,7 +5,12 @@
   "create_request": {
     "protocol_version": "1",
     "device_id": "00000000-0000-4000-8000-000000000003",
-    "request_id": "00000000-0000-4000-8000-000000000040"
+    "request_id": "00000000-0000-4000-8000-000000000040",
+    "required_capabilities": [
+      "snapshot-collection-markers-v1",
+      "snapshot-device-registry-v1",
+      "snapshot-read-v1"
+    ]
   },
   "create_response": {
     "protocol_version": "1",
@@ -162,6 +167,20 @@
       }
     }
   ],
+  "lease_and_revocation": {
+    "snapshot_storage": "immutable_materialized_projection",
+    "live_device_rows_pinned": false,
+    "live_mutations_blocked": false,
+    "page_requests_authenticate_current_live_device_state": true,
+    "owner_revoked_during_lease": {
+      "device_id": "00000000-0000-4000-8000-000000000003",
+      "revocation_committed_immediately": true,
+      "snapshot_lease_deferred_revocation": false,
+      "subsequent_page_result": "token_revoked",
+      "subsequent_page_http_status": 401,
+      "page_bytes_returned": false
+    }
+  },
   "delta_transition_request": {
     "protocol_version": "1",
     "device_id": "00000000-0000-4000-8000-000000000003",
@@ -202,6 +221,7 @@
   },
   "expected": {
     "membership_frozen_at_cut_cursor": true,
+    "immutable_projection_materialized_at_creation": true,
     "page_replay_is_byte_equivalent": true,
     "ordering_key": ["record_id_uuid_bytes", "revision_id_uuid_bytes"],
     "page_phases": ["record_revisions", "record_revisions", "collection_markers", "source_devices"],

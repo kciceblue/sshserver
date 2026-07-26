@@ -89,6 +89,7 @@
   "errors": [
     {"http_status": 401, "code": "token_revoked", "retryable": false},
     {"http_status": 409, "code": "generation_conflict", "retryable": true},
+    {"http_status": 409, "code": "generation_exhausted", "retryable": false},
     {"http_status": 409, "code": "revision_equivocation", "retryable": false},
     {"http_status": 410, "code": "cursor_expired", "retryable": false},
     {"http_status": 403, "code": "authenticated_device_mismatch", "retryable": false},

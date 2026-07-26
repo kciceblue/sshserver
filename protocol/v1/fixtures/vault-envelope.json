@@ -47,6 +47,19 @@
     {"name": "create", "expected_generation": "0", "new_generation": "1", "result": "commit"},
     {"name": "same_generation_retry", "expected_generation": "1", "new_generation": "2", "result": "commit_once"},
     {"name": "stale_writer", "expected_generation": "1", "new_generation": "2", "stored_generation": "2", "result": "generation_conflict"},
-    {"name": "skip_generation", "expected_generation": "2", "new_generation": "4", "result": "invalid_request"}
+    {"name": "skip_generation", "expected_generation": "2", "new_generation": "4", "result": "invalid_request"},
+    {
+      "name": "generation_exhausted",
+      "expected_generation": "18446744073709551615",
+      "new_generation": "18446744073709551615",
+      "stored_generation": "18446744073709551615",
+      "operation": "conditional_replacement_at_no_successor_boundary",
+      "result": "generation_exhausted",
+      "http_status": 409,
+      "retryable": false,
+      "checked_before_successor_and_cursor_capacity": true,
+      "state_mutated": false,
+      "cursor_consumed": false
+    }
   ]
 }

@@ -52,6 +52,80 @@
     "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "ciphertext": "AAAAAAAAAAAAAAAAAAAAAA"
   },
+  "vector_validation": {
+    "canonical_order": "strict_raw_uuid_bytes",
+    "zero_components": "omitted_and_forbidden_on_wire",
+    "malformed_cases": [
+      {
+        "name": "empty_vector",
+        "version_vector": [],
+        "result": "invalid_request"
+      },
+      {
+        "name": "duplicate_device_different_counter",
+        "version_vector": [
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"},
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"}
+        ],
+        "result": "invalid_request"
+      },
+      {
+        "name": "out_of_order",
+        "version_vector": [
+          {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"},
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+        ],
+        "result": "invalid_request"
+      },
+      {
+        "name": "zero_component",
+        "version_vector": [
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "0"}
+        ],
+        "result": "invalid_request"
+      },
+      {
+        "name": "author_counter_mismatch",
+        "version_vector": [
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"}
+        ],
+        "result": "invalid_request"
+      }
+    ],
+    "malformed_frontier_cases": [
+      {
+        "name": "empty_frontier",
+        "frontier": [],
+        "result": "invalid_request"
+      },
+      {
+        "name": "duplicate_device_different_counter_frontier",
+        "frontier": [
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"},
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "2"}
+        ],
+        "result": "invalid_request"
+      },
+      {
+        "name": "out_of_order_frontier",
+        "frontier": [
+          {"device_id": "00000000-0000-4000-8000-000000000011", "counter": "1"},
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "1"}
+        ],
+        "result": "invalid_request"
+      },
+      {
+        "name": "zero_component_frontier",
+        "frontier": [
+          {"device_id": "00000000-0000-4000-8000-000000000010", "counter": "0"}
+        ],
+        "result": "invalid_request"
+      }
+    ],
+    "normal_upload_result": "accepted",
+    "normal_collection_marker_result": "accepted",
+    "malformed_recovery_import_result": "refuse_recovery_import"
+  },
   "expected": {
     "siblings_before_resolution": 2,
     "undominated_after_resolution": 1,

@@ -58,6 +58,11 @@ DEVICE_LOCAL_FIELDS = {
 BACKUP_MANIFEST_PATHS = frozenset({"config.json", "instance-secret", "sync.db"})
 ED25519_PKCS8_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+SNAPSHOT_REQUIRED_CAPABILITIES = [
+    "snapshot-collection-markers-v1",
+    "snapshot-device-registry-v1",
+    "snapshot-read-v1",
+]
 
 
 def read_json(path: Path) -> dict:
@@ -202,14 +207,73 @@ def parse_uint64(value: str) -> int:
     return parsed
 
 
-def vector_map(revision: dict) -> dict[str, int]:
-    entries = revision["version_vector"]
+def canonical_vector_map(entries: list[dict]) -> dict[str, int]:
+    if not entries:
+        raise ValueError("empty vector or frontier")
     ids = [entry["device_id"] for entry in entries]
-    if ids != sorted(ids):
-        raise ValueError("vector entries are not sorted")
+    uuid_keys = [uuid.UUID(device_id).bytes for device_id in ids]
+    if uuid_keys != sorted(uuid_keys):
+        raise ValueError("vector or frontier entries are not sorted")
     if len(ids) != len(set(ids)):
-        raise ValueError("duplicate device vector entry")
-    return {entry["device_id"]: parse_uint64(entry["counter"]) for entry in entries}
+        raise ValueError("duplicate device vector or frontier entry")
+    counters = {
+        entry["device_id"]: parse_uint64(entry["counter"])
+        for entry in entries
+    }
+    if any(counter == 0 for counter in counters.values()):
+        raise ValueError("zero vector or frontier component")
+    return counters
+
+
+def vector_map(revision: dict) -> dict[str, int]:
+    return canonical_vector_map(revision["version_vector"])
+
+
+def validate_revision_vector(revision: dict) -> dict[str, int]:
+    author_counter = parse_uint64(revision["author_counter"])
+    if author_counter == 0:
+        raise ValueError("zero author counter")
+    vector = vector_map(revision)
+    if vector.get(revision["author_device_id"]) != author_counter:
+        raise ValueError("author vector entry mismatch")
+    return vector
+
+
+def validate_snapshot_capability_declaration(request: dict) -> None:
+    if request.get("required_capabilities") != SNAPSHOT_REQUIRED_CAPABILITIES:
+        raise ValueError("unsupported_capability")
+
+
+def recovery_pages_sha256(pages: list[dict]) -> str:
+    digest = hashlib.sha256()
+    for page in pages:
+        body = json.dumps(
+            page,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        digest.update(struct.pack(">Q", len(body)))
+        digest.update(body)
+    return digest.hexdigest()
+
+
+def validate_recovery_manifest_pages(manifest: dict, pages: list[dict]) -> None:
+    expected_counts = {
+        "page_count": len(pages),
+        "revision_count": sum(len(page["revisions"]) for page in pages),
+        "collection_marker_count": sum(
+            len(page["collection_markers"]) for page in pages
+        ),
+        "source_device_count": sum(
+            len(page["source_devices"]) for page in pages
+        ),
+    }
+    for field, expected in expected_counts.items():
+        if parse_uint64(manifest[field]) != expected:
+            raise ValueError(f"{field} mismatch")
+    if manifest["pages_sha256"] != recovery_pages_sha256(pages):
+        raise ValueError("pages_sha256 mismatch")
 
 
 def source_device_counter_map(entries: list[dict]) -> dict[str, int]:
@@ -490,7 +554,11 @@ class SyncProtocolSpecTests(unittest.TestCase):
         revoke_statuses = set(
             self.openapi["paths"]["/v1/devices/{device_id}/revoke"]["post"]["responses"]
         )
-        self.assertIn("404", revoke_statuses)
+        self.assertTrue({"404", "507"}.issubset(revoke_statuses))
+        envelope_put_statuses = set(
+            self.openapi["paths"]["/v1/vault-envelope"]["put"]["responses"]
+        )
+        self.assertIn("507", envelope_put_statuses)
         rotation_statuses = set(
             self.openapi["paths"]["/v1/device-token-rotations"]["post"]["responses"]
         )
@@ -582,6 +650,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
         for required in (
             "token_revoked",
             "generation_conflict",
+            "generation_exhausted",
             "revision_equivocation",
             "cursor_expired",
             "unsupported_protocol",
@@ -608,6 +677,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertNotIn("restore_incompatible", error_codes)
         self.assertNotIn("unsupported_response_field", error_codes)
         self.assertEqual(self.openapi["x-jat-error-status-map"]["unsupported_protocol"], 426)
+        self.assertEqual(self.openapi["x-jat-error-status-map"]["generation_exhausted"], 409)
         self.assertEqual(self.openapi["x-jat-error-status-map"]["server_cursor_exhausted"], 507)
         self.assertEqual(self.openapi["x-jat-error-status-map"]["device_not_found"], 404)
         self.assertEqual(
@@ -616,9 +686,26 @@ class SyncProtocolSpecTests(unittest.TestCase):
         )
         envelope_schema = defs["vault_envelope"]
         self.assertEqual(len(envelope_schema["allOf"]), 2)
+        self.assertEqual(
+            defs["record_revision"]["properties"]["author_counter"]["$ref"],
+            "#/$defs/positive_uint64",
+        )
+        self.assertEqual(
+            defs["vector_entry"]["properties"]["counter"]["$ref"],
+            "#/$defs/positive_uint64",
+        )
+        for field_schema in (
+            defs["record_revision"]["properties"]["version_vector"],
+            defs["collection_marker"]["properties"]["frontier"],
+        ):
+            self.assertEqual(field_schema["minItems"], 1)
+            self.assertTrue(field_schema["uniqueItems"])
 
     def test_uint64_schema_and_semantic_parser_enforce_the_exact_maximum(self) -> None:
         pattern = re.compile(self.wire["$defs"]["uint64"]["pattern"])
+        positive_pattern = re.compile(
+            self.wire["$defs"]["positive_uint64"]["pattern"]
+        )
         accepted = ("0", "1", "9999999999999999999", "18446744073709551615")
         rejected = (
             "",
@@ -633,11 +720,16 @@ class SyncProtocolSpecTests(unittest.TestCase):
             with self.subTest(value=value, result="accepted"):
                 self.assertIsNotNone(pattern.fullmatch(value))
                 self.assertEqual(parse_uint64(value), int(value))
+                if value == "0":
+                    self.assertIsNone(positive_pattern.fullmatch(value))
+                else:
+                    self.assertIsNotNone(positive_pattern.fullmatch(value))
         for value in rejected:
             with self.subTest(value=value, result="rejected"):
                 self.assertIsNone(pattern.fullmatch(value))
                 with self.assertRaises(ValueError):
                     parse_uint64(value)
+                self.assertIsNone(positive_pattern.fullmatch(value))
 
     def test_base64url_schema_and_semantic_parser_require_canonical_bits(
         self,
@@ -786,9 +878,28 @@ class SyncProtocolSpecTests(unittest.TestCase):
             },
             {"memory_kib": 65536, "iterations": 3, "parallelism": 1, "output_length": 32},
         )
-        cases = {case["name"]: case["result"] for case in fixture["cases"]}
-        self.assertEqual(cases["stale_writer"], "generation_conflict")
-        self.assertEqual(cases["skip_generation"], "invalid_request")
+        cases = {case["name"]: case for case in fixture["cases"]}
+        self.assertEqual(cases["stale_writer"]["result"], "generation_conflict")
+        self.assertEqual(cases["skip_generation"]["result"], "invalid_request")
+        exhausted = cases["generation_exhausted"]
+        self.assertEqual(
+            parse_uint64(exhausted["stored_generation"]),
+            (1 << 64) - 1,
+        )
+        self.assertEqual(
+            exhausted["expected_generation"],
+            exhausted["stored_generation"],
+        )
+        self.assertEqual(
+            exhausted["new_generation"],
+            exhausted["stored_generation"],
+        )
+        self.assertEqual(exhausted["result"], "generation_exhausted")
+        self.assertEqual(exhausted["http_status"], 409)
+        self.assertFalse(exhausted["retryable"])
+        self.assertTrue(exhausted["checked_before_successor_and_cursor_capacity"])
+        self.assertFalse(exhausted["state_mutated"])
+        self.assertFalse(exhausted["cursor_consumed"])
 
         crypto = self.fixtures["crypto-review-vectors.json"]
         self.assertEqual(crypto["proposed_argon2id"]["version"], 19)
@@ -819,9 +930,9 @@ class SyncProtocolSpecTests(unittest.TestCase):
         for revision in (first, second, resolution):
             self._assert_record_revision_shape(revision)
 
-        first_vector = vector_map(first)
-        second_vector = vector_map(second)
-        resolution_vector = vector_map(resolution)
+        first_vector = validate_revision_vector(first)
+        second_vector = validate_revision_vector(second)
+        resolution_vector = validate_revision_vector(resolution)
         self.assertFalse(dominates(first_vector, second_vector))
         self.assertFalse(dominates(second_vector, first_vector))
         self.assertTrue(dominates(resolution_vector, first_vector))
@@ -836,6 +947,95 @@ class SyncProtocolSpecTests(unittest.TestCase):
             fixture["expected"]["remote_identity_tombstone_local_key_action"],
             "unlink_shared_record_and_quarantine_local_key_as_orphan",
         )
+        vector_validation = fixture["vector_validation"]
+        self.assertEqual(
+            vector_validation["canonical_order"],
+            "strict_raw_uuid_bytes",
+        )
+        self.assertEqual(vector_validation["normal_upload_result"], "accepted")
+        self.assertTrue(validate_revision_vector(first))
+        structurally_rejected = {"empty_vector", "zero_component"}
+        record_schema = self.wire["$defs"]["record_revision"]
+        self.assertEqual(
+            {case["name"] for case in vector_validation["malformed_cases"]},
+            {
+                "empty_vector",
+                "duplicate_device_different_counter",
+                "out_of_order",
+                "zero_component",
+                "author_counter_mismatch",
+            },
+        )
+        for case in vector_validation["malformed_cases"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(case["result"], "invalid_request")
+                candidate = copy.deepcopy(first)
+                candidate["version_vector"] = case["version_vector"]
+                with self.assertRaises(ValueError):
+                    validate_revision_vector(candidate)
+                recovery_page = copy.deepcopy(
+                    self.fixtures["host-loss-recovery.json"]["import_pages"][0]
+                )
+                recovery_revision = recovery_page["revisions"][0]
+                recovery_revision["version_vector"] = case["version_vector"]
+                with self.assertRaises(ValueError):
+                    validate_revision_vector(recovery_revision)
+                self.assertEqual(
+                    schema_matches(candidate, record_schema, self.wire),
+                    case["name"] not in structurally_rejected,
+                )
+        self.assertEqual(
+            vector_validation["malformed_recovery_import_result"],
+            "refuse_recovery_import",
+        )
+        canonical_marker = next(
+            marker
+            for page in self.fixtures["full-snapshot-recovery.json"]["pages"]
+            for marker in page["response"]["collection_markers"]
+        )
+        self.assertEqual(
+            vector_validation["normal_collection_marker_result"],
+            "accepted",
+        )
+        self.assertTrue(canonical_vector_map(canonical_marker["frontier"]))
+        marker_schema = self.wire["$defs"]["collection_marker"]
+        structurally_rejected_frontiers = {
+            "empty_frontier",
+            "zero_component_frontier",
+        }
+        recovery_marker_page = next(
+            page
+            for page in self.fixtures["host-loss-recovery.json"]["import_pages"]
+            if page["collection_markers"]
+        )
+        self.assertEqual(
+            {
+                case["name"]
+                for case in vector_validation["malformed_frontier_cases"]
+            },
+            {
+                "empty_frontier",
+                "duplicate_device_different_counter_frontier",
+                "out_of_order_frontier",
+                "zero_component_frontier",
+            },
+        )
+        for case in vector_validation["malformed_frontier_cases"]:
+            with self.subTest(frontier_case=case["name"]):
+                self.assertEqual(case["result"], "invalid_request")
+                marker = copy.deepcopy(canonical_marker)
+                marker["frontier"] = case["frontier"]
+                with self.assertRaises(ValueError):
+                    canonical_vector_map(marker["frontier"])
+                self.assertEqual(
+                    schema_matches(marker, marker_schema, self.wire),
+                    case["name"] not in structurally_rejected_frontiers,
+                )
+                recovery_page = copy.deepcopy(recovery_marker_page)
+                recovery_marker = recovery_page["collection_markers"][0]
+                recovery_marker["frontier"] = case["frontier"]
+                with self.assertRaises(ValueError):
+                    canonical_vector_map(recovery_marker["frontier"])
 
     def test_tombstone_fixture_requires_ack_retention_and_zero_device_freeze(self) -> None:
         fixture = self.fixtures["tombstone-retirement.json"]
@@ -900,6 +1100,15 @@ class SyncProtocolSpecTests(unittest.TestCase):
             "zero_active_confirmation_required",
         )
         self.assertFalse(revocation["revocation_erases_cached_plaintext_or_vmk"])
+        self.assertFalse(revocation["snapshot_lease_may_delay_or_block_revocation"])
+        self.assertEqual(
+            revocation["revoked_snapshot_owner_page_result"],
+            "token_revoked",
+        )
+        self.assertEqual(
+            revocation["revoked_snapshot_owner_page_http_status"],
+            401,
+        )
         secret_rotation = fixture["instance_secret_rotation"]
         self.assertEqual(secret_rotation["rotation_without_device_held_vmk"], "forbidden")
         self.assertGreaterEqual(len(secret_rotation["states"]), 5)
@@ -907,6 +1116,119 @@ class SyncProtocolSpecTests(unittest.TestCase):
             secret_rotation["backup_while_pending_or_recovery_slot_exists"],
             "refused_rotation_in_progress",
         )
+        generation_exhaustion = secret_rotation["generation_exhaustion"]
+        self.assertEqual(
+            parse_uint64(generation_exhaustion["active_generation"]),
+            (1 << 64) - 1,
+        )
+        self.assertEqual(
+            generation_exhaustion["result"],
+            "generation_exhausted",
+        )
+        self.assertEqual(generation_exhaustion["http_status"], 409)
+        self.assertFalse(generation_exhaustion["retryable"])
+        self.assertFalse(generation_exhaustion["pending_secret_created"])
+        self.assertFalse(
+            generation_exhaustion["active_or_recovery_state_mutated"]
+        )
+        self.assertFalse(generation_exhaustion["cursor_consumed"])
+
+        snapshot_negotiation = fixture[
+            "snapshot_create_capability_negotiation"
+        ]
+        self.assertEqual(
+            snapshot_negotiation["required_exact"],
+            SNAPSHOT_REQUIRED_CAPABILITIES,
+        )
+        self.assertTrue(snapshot_negotiation["checked_before_snapshot_creation"])
+        self.assertEqual(
+            {case["name"] for case in snapshot_negotiation["cases"]},
+            {
+                "exact_canonical_declaration",
+                "missing_declaration",
+                "incomplete_declaration",
+                "noncanonical_order",
+                "duplicate_declaration",
+                "additional_unknown_capability",
+            },
+        )
+        create_schema = self.wire["$defs"]["snapshot_create_request"]
+        base_request = self.fixtures["full-snapshot-recovery.json"][
+            "create_request"
+        ]
+        for case in snapshot_negotiation["cases"]:
+            with self.subTest(snapshot_capability_case=case["name"]):
+                request = copy.deepcopy(base_request)
+                if case.get("omit_required_capabilities"):
+                    request.pop("required_capabilities")
+                else:
+                    request["required_capabilities"] = case[
+                        "request_required_capabilities"
+                    ]
+                if case["result"] == "snapshot_created":
+                    validate_snapshot_capability_declaration(request)
+                    self.assertTrue(
+                        schema_matches(request, create_schema, self.wire)
+                    )
+                    self.assertTrue(case["snapshot_created"])
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"^unsupported_capability$",
+                    ):
+                        validate_snapshot_capability_declaration(request)
+                    self.assertFalse(
+                        schema_matches(request, create_schema, self.wire)
+                    )
+                    self.assertEqual(case["http_status"], 426)
+                    self.assertFalse(case["snapshot_created"])
+
+        cursor_contract = fixture["cursor_contract"]
+        self.assertEqual(
+            set(cursor_contract["cursor_bearing_transitions"]),
+            {
+                "device_enrollment",
+                "vault_envelope_change",
+                "record_revision",
+                "device_revocation_or_retirement",
+                "collection_marker",
+            },
+        )
+        self.assertFalse(
+            cursor_contract["exact_idempotent_retry_consumes_second_cursor"]
+        )
+        self.assertEqual(
+            set(cursor_contract["non_cursor_transitions"]),
+            {
+                "device_token_hash_rotation",
+                "ack_cursor_update",
+                "last_successful_sync_update",
+                "snapshot_creation_or_page",
+                "snapshot_lease_expiry",
+                "backup_read",
+            },
+        )
+        exhausted_cursor = cursor_contract["at_uint64_max"]
+        for operation in ("new_envelope_put", "new_device_revocation"):
+            self.assertEqual(
+                exhausted_cursor[operation]["result"],
+                "server_cursor_exhausted",
+            )
+            self.assertEqual(exhausted_cursor[operation]["http_status"], 507)
+            self.assertFalse(exhausted_cursor[operation]["state_mutated"])
+        self.assertFalse(
+            exhausted_cursor["exact_committed_retry"][
+                "additional_cursor_consumed"
+            ]
+        )
+        for operation in (
+            "token_rotation",
+            "acknowledgement_only_sync",
+            "snapshot_read",
+            "authenticated_reads_and_backups",
+        ):
+            self.assertEqual(exhausted_cursor[operation], "allowed")
+
         version_results = {case["result"]: case for case in fixture["version_negotiation"]}
         self.assertEqual(version_results["unsupported_protocol"]["http_status"], 426)
         unsupported_capabilities = [
@@ -1242,6 +1564,9 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
         self.assertFalse(ordering["duplicates_allowed"])
         self.assertEqual(ordering["unsorted_error"], "invalid_request")
+        errors = {case["code"]: case for case in fixture["errors"]}
+        self.assertEqual(errors["generation_exhausted"]["http_status"], 409)
+        self.assertFalse(errors["generation_exhausted"]["retryable"])
 
     def test_full_snapshot_is_stable_sibling_complete_and_transitions_to_delta(self) -> None:
         fixture = self.fixtures["full-snapshot-recovery.json"]
@@ -1250,6 +1575,14 @@ class SyncProtocolSpecTests(unittest.TestCase):
         assert_uuid_v4(self, create_request["device_id"])
         assert_uuid_v4(self, create_request["request_id"])
         assert_uuid_v4(self, create_response["snapshot_id"])
+        validate_snapshot_capability_declaration(create_request)
+        self.assertTrue(
+            schema_matches(
+                create_request,
+                self.wire["$defs"]["snapshot_create_request"],
+                self.wire,
+            )
+        )
         cut = parse_uint64(create_response["cut_cursor"])
         self.assertEqual(len(decode_base64url(create_response["first_page_token"])), 32)
         self.assertEqual(
@@ -1316,8 +1649,18 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual({item["record_id"] for item in revisions}, {revisions[0]["record_id"]})
         self.assertEqual(sum(not item["tombstone"] for item in revisions), 1)
         self.assertEqual(sum(item["tombstone"] for item in revisions), 1)
-        self.assertFalse(dominates(vector_map(revisions[0]), vector_map(revisions[1])))
-        self.assertFalse(dominates(vector_map(revisions[1]), vector_map(revisions[0])))
+        self.assertFalse(
+            dominates(
+                validate_revision_vector(revisions[0]),
+                validate_revision_vector(revisions[1]),
+            )
+        )
+        self.assertFalse(
+            dominates(
+                validate_revision_vector(revisions[1]),
+                validate_revision_vector(revisions[0]),
+            )
+        )
         marker_keys = [
             (
                 uuid.UUID(item["record_id"]).bytes,
@@ -1348,7 +1691,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
         referenced_counters: dict[str, int] = {}
         for revision in revisions:
             self.assertIn(revision["author_device_id"], source_counters)
-            for device_id, counter in vector_map(revision).items():
+            for device_id, counter in validate_revision_vector(revision).items():
                 referenced_counters[device_id] = max(
                     referenced_counters.get(device_id, 0),
                     counter,
@@ -1368,6 +1711,24 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertIn(never_authored, source_counters)
         self.assertEqual(source_counters[never_authored], 0)
         self.assertNotIn(never_authored, referenced_counters)
+
+        lease = fixture["lease_and_revocation"]
+        self.assertEqual(
+            lease["snapshot_storage"],
+            "immutable_materialized_projection",
+        )
+        self.assertFalse(lease["live_device_rows_pinned"])
+        self.assertFalse(lease["live_mutations_blocked"])
+        self.assertTrue(lease["page_requests_authenticate_current_live_device_state"])
+        revoked_owner = lease["owner_revoked_during_lease"]
+        self.assertTrue(revoked_owner["revocation_committed_immediately"])
+        self.assertFalse(revoked_owner["snapshot_lease_deferred_revocation"])
+        self.assertEqual(revoked_owner["subsequent_page_result"], "token_revoked")
+        self.assertEqual(revoked_owner["subsequent_page_http_status"], 401)
+        self.assertFalse(revoked_owner["page_bytes_returned"])
+        self.assertTrue(
+            fixture["expected"]["immutable_projection_materialized_at_creation"]
+        )
 
         delta_request = fixture["delta_transition_request"]
         delta_response = fixture["delta_transition_response"]
@@ -1565,7 +1926,6 @@ class SyncProtocolSpecTests(unittest.TestCase):
             source["source_device_count"],
         )
         self.assertEqual(parse_uint64(manifest["page_count"]), len(pages))
-        digest = hashlib.sha256()
         for page in pages:
             self.assertEqual(
                 set(page),
@@ -1578,15 +1938,38 @@ class SyncProtocolSpecTests(unittest.TestCase):
                     self.wire,
                 )
             )
-            body = json.dumps(
-                page,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-            ).encode("utf-8")
-            digest.update(struct.pack(">Q", len(body)))
-            digest.update(body)
-        self.assertEqual(digest.hexdigest(), manifest["pages_sha256"])
+        validate_recovery_manifest_pages(manifest, pages)
+        self.assertEqual(
+            recovery_pages_sha256(pages),
+            manifest["pages_sha256"],
+        )
+        for field in (
+            "page_count",
+            "revision_count",
+            "collection_marker_count",
+            "source_device_count",
+        ):
+            with self.subTest(recovery_manifest_mismatch=field):
+                mismatched_manifest = copy.deepcopy(manifest)
+                mismatched_manifest[field] = str(
+                    parse_uint64(mismatched_manifest[field]) + 1
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"^{field} mismatch$",
+                ):
+                    validate_recovery_manifest_pages(
+                        mismatched_manifest,
+                        pages,
+                    )
+        digest_mismatch = copy.deepcopy(manifest)
+        digest_mismatch["pages_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, r"^pages_sha256 mismatch$"):
+            validate_recovery_manifest_pages(digest_mismatch, pages)
+        mutated_pages = copy.deepcopy(pages)
+        mutated_pages[-1]["source_devices"][0]["max_author_counter"] = "1"
+        with self.assertRaisesRegex(ValueError, r"^pages_sha256 mismatch$"):
+            validate_recovery_manifest_pages(manifest, mutated_pages)
         self.assertEqual(
             [page["phase"] for page in pages],
             imported["page_phases"],
@@ -1676,7 +2059,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
         referenced_counters: dict[str, int] = {}
         for revision in imported_revisions:
             self.assertIn(revision["author_device_id"], source_registry)
-            for device_id, counter in vector_map(revision).items():
+            for device_id, counter in validate_revision_vector(revision).items():
                 referenced_counters[device_id] = max(
                     referenced_counters.get(device_id, 0),
                     counter,
@@ -1946,9 +2329,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
             assert_uuid_v4(self, revision[field])
         self.assertEqual(len(decode_base64url(revision["nonce"])), 24)
         self.assertGreaterEqual(len(decode_base64url(revision["ciphertext"])), 16)
-        author_counter = parse_uint64(revision["author_counter"])
-        vector = vector_map(revision)
-        self.assertEqual(vector[revision["author_device_id"]], author_counter)
+        self.assertTrue(validate_revision_vector(revision))
 
 
 if __name__ == "__main__":

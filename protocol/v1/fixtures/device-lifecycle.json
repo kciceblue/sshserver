@@ -26,7 +26,10 @@
     "ordinary_device_result": "revoked_before_response_commit",
     "last_device_without_confirmation": "zero_active_confirmation_required",
     "last_device_with_allow_zero_active": "revoked_and_collection_frozen",
-    "revocation_erases_cached_plaintext_or_vmk": false
+    "revocation_erases_cached_plaintext_or_vmk": false,
+    "snapshot_lease_may_delay_or_block_revocation": false,
+    "revoked_snapshot_owner_page_result": "token_revoked",
+    "revoked_snapshot_owner_page_http_status": 401
   },
   "instance_secret_rotation": {
     "active_generation": "1",
@@ -42,7 +45,127 @@
     "interruption_after_envelope": "resume_promotion_with_both_secrets_recoverable",
     "rotation_without_device_held_vmk": "forbidden",
     "backup_while_active_only": "allowed_with_stable_manifest",
-    "backup_while_pending_or_recovery_slot_exists": "refused_rotation_in_progress"
+    "backup_while_pending_or_recovery_slot_exists": "refused_rotation_in_progress",
+    "generation_exhaustion": {
+      "active_generation": "18446744073709551615",
+      "operation": "begin_checked_successor_rotation",
+      "result": "generation_exhausted",
+      "http_status": 409,
+      "retryable": false,
+      "pending_secret_created": false,
+      "active_or_recovery_state_mutated": false,
+      "cursor_consumed": false
+    }
+  },
+  "snapshot_create_capability_negotiation": {
+    "required_exact": [
+      "snapshot-collection-markers-v1",
+      "snapshot-device-registry-v1",
+      "snapshot-read-v1"
+    ],
+    "cases": [
+      {
+        "name": "exact_canonical_declaration",
+        "request_required_capabilities": [
+          "snapshot-collection-markers-v1",
+          "snapshot-device-registry-v1",
+          "snapshot-read-v1"
+        ],
+        "result": "snapshot_created",
+        "snapshot_created": true
+      },
+      {
+        "name": "missing_declaration",
+        "omit_required_capabilities": true,
+        "result": "unsupported_capability",
+        "http_status": 426,
+        "snapshot_created": false
+      },
+      {
+        "name": "incomplete_declaration",
+        "request_required_capabilities": [
+          "snapshot-collection-markers-v1",
+          "snapshot-read-v1"
+        ],
+        "result": "unsupported_capability",
+        "http_status": 426,
+        "snapshot_created": false
+      },
+      {
+        "name": "noncanonical_order",
+        "request_required_capabilities": [
+          "snapshot-read-v1",
+          "snapshot-collection-markers-v1",
+          "snapshot-device-registry-v1"
+        ],
+        "result": "unsupported_capability",
+        "http_status": 426,
+        "snapshot_created": false
+      },
+      {
+        "name": "duplicate_declaration",
+        "request_required_capabilities": [
+          "snapshot-collection-markers-v1",
+          "snapshot-device-registry-v1",
+          "snapshot-device-registry-v1",
+          "snapshot-read-v1"
+        ],
+        "result": "unsupported_capability",
+        "http_status": 426,
+        "snapshot_created": false
+      },
+      {
+        "name": "additional_unknown_capability",
+        "request_required_capabilities": [
+          "snapshot-collection-markers-v1",
+          "snapshot-device-registry-v1",
+          "snapshot-future-v2",
+          "snapshot-read-v1"
+        ],
+        "result": "unsupported_capability",
+        "http_status": 426,
+        "snapshot_created": false
+      }
+    ],
+    "checked_before_snapshot_creation": true
+  },
+  "cursor_contract": {
+    "cursor_bearing_transitions": [
+      "device_enrollment",
+      "vault_envelope_change",
+      "record_revision",
+      "device_revocation_or_retirement",
+      "collection_marker"
+    ],
+    "non_cursor_transitions": [
+      "device_token_hash_rotation",
+      "ack_cursor_update",
+      "last_successful_sync_update",
+      "snapshot_creation_or_page",
+      "snapshot_lease_expiry",
+      "backup_read"
+    ],
+    "exact_idempotent_retry_consumes_second_cursor": false,
+    "at_uint64_max": {
+      "new_envelope_put": {
+        "result": "server_cursor_exhausted",
+        "http_status": 507,
+        "state_mutated": false
+      },
+      "new_device_revocation": {
+        "result": "server_cursor_exhausted",
+        "http_status": 507,
+        "state_mutated": false
+      },
+      "exact_committed_retry": {
+        "result": "recorded_success_original_change_retained",
+        "additional_cursor_consumed": false
+      },
+      "token_rotation": "allowed",
+      "acknowledgement_only_sync": "allowed",
+      "snapshot_read": "allowed",
+      "authenticated_reads_and_backups": "allowed"
+    }
   },
   "version_negotiation": [
     {"client_min": "1", "client_max": "1", "server_min": "1", "server_max": "1", "result": "protocol_1"},

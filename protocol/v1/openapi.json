@@ -19,6 +19,7 @@
     "enrollment_replay_mismatch": 409,
     "request_id_reused": 409,
     "generation_conflict": 409,
+    "generation_exhausted": 409,
     "counter_conflict": 409,
     "counter_exhausted": 409,
     "revision_equivocation": 409,
@@ -149,6 +150,7 @@
       },
       "put": {
         "operationId": "putVaultEnvelope",
+        "description": "Conditional cursor-bearing envelope creation or replacement. After expected_generation matches, a stored generation of UInt64.max returns non-retryable 409 generation_exhausted before successor/envelope semantic validation and before cursor capacity; otherwise a new commit at server cursor UInt64.max returns 507 server_cursor_exhausted. Either failure occurs before mutation. An exact idempotent retry returns the recorded result and consumes no second cursor.",
         "security": [{"deviceBearer": []}],
         "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
         "requestBody": {
@@ -175,7 +177,8 @@
           "413": {"$ref": "#/components/responses/Error"},
           "426": {"$ref": "#/components/responses/Error"},
           "429": {"$ref": "#/components/responses/Error"},
-          "500": {"$ref": "#/components/responses/Error"}
+          "500": {"$ref": "#/components/responses/Error"},
+          "507": {"$ref": "#/components/responses/Error"}
         }
       }
     },
@@ -217,6 +220,7 @@
     "/v1/snapshot-reads": {
       "post": {
         "operationId": "createSnapshotRead",
+        "description": "The request must declare exactly the canonical sorted required-capability trio snapshot-collection-markers-v1, snapshot-device-registry-v1, and snapshot-read-v1. Missing, incomplete, duplicate, additional, or noncanonical declarations return 426 unsupported_capability before snapshot allocation. Creation copies an immutable projection and never pins live device rows.",
         "security": [{"deviceBearer": []}],
         "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
         "requestBody": {
@@ -259,6 +263,7 @@
     "/v1/snapshot-reads/{snapshot_id}/pages": {
       "post": {
         "operationId": "readSnapshotPage",
+        "description": "Authenticates the bearer against current live device state before reading immutable snapshot storage. Revocation is never delayed by a snapshot lease; a revoked snapshot owner receives 401 token_revoked.",
         "security": [{"deviceBearer": []}],
         "parameters": [
           {"$ref": "#/components/parameters/ProtocolVersion"},
@@ -324,6 +329,7 @@
     "/v1/devices/{device_id}/revoke": {
       "post": {
         "operationId": "revokeDevice",
+        "description": "Cursor-bearing durable revocation. Live device state changes immediately and is never blocked by a snapshot lease. A new revocation at server cursor UInt64.max returns 507 server_cursor_exhausted before mutation; an exact idempotent retry returns the recorded device result without consuming another cursor.",
         "security": [{"deviceBearer": []}],
         "parameters": [
           {"$ref": "#/components/parameters/ProtocolVersion"},
@@ -359,14 +365,15 @@
           "409": {"$ref": "#/components/responses/Error"},
           "426": {"$ref": "#/components/responses/Error"},
           "429": {"$ref": "#/components/responses/Error"},
-          "500": {"$ref": "#/components/responses/Error"}
+          "500": {"$ref": "#/components/responses/Error"},
+          "507": {"$ref": "#/components/responses/Error"}
         }
       }
     },
     "/v1/device-token-rotations": {
       "post": {
         "operationId": "rotateDeviceToken",
-        "description": "Self-only: request device_id must equal the bearer-authenticated device or HTTP 403 authenticated_device_mismatch is returned before mutation.",
+        "description": "Self-only, non-cursor-bearing token-hash replacement: request device_id must equal the bearer-authenticated device or HTTP 403 authenticated_device_mismatch is returned before mutation. It remains available at server cursor UInt64.max.",
         "security": [{"deviceBearer": []}],
         "parameters": [{"$ref": "#/components/parameters/ProtocolVersion"}, {"$ref": "#/components/parameters/RequestID"}],
         "requestBody": {
