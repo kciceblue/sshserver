@@ -1512,10 +1512,24 @@ The honest server may persist only:
 - random device IDs, token/grant hashes and scopes, status, created/revoked/
   last-sync times, acknowledgements, and maximum counters;
 - random record/revision IDs, author device/counter, version vectors,
-  tombstone state, nonce, ciphertext length, receipt time, and change cursor;
+  tombstone state, nonce, exact opaque authenticated ciphertext bytes,
+  nullable collection-witness authenticator bytes, ciphertext length, receipt
+  time, change cursor, retention age, and immutable content addresses;
+- persistent collection-marker tuples (record and witness revision IDs, exact
+  frontier, exact non-null witness authenticator, and barrier cursor), plus
+  snapshot IDs, cuts, leases, page tokens/order keys, and immutable revision
+  content-address references required to serve a stable snapshot;
+- idempotency receipt device/request IDs, raw authenticated-body fingerprints,
+  recorded response bytes, and retention-expiry state;
 - envelope version, mode, KDF parameters/salts, nonce, wrapped bytes, and
   generation numbers; and
 - bounded operational health, error, and rate-limit counters.
+
+Record ciphertext and collection-witness bytes are opaque stored values. The
+server neither decrypts nor parses them, and a client verifies their AEAD/HMAC
+authentication before using them. The allowlist permits retaining the exact
+bytes and the server state necessary to return immutable revisions and stable
+snapshots; it does not permit retaining plaintext or private-key material.
 
 It MUST NOT persist plaintext host aliases, usernames, addresses, ports,
 snippets, commands, known-host keys/patterns, identity labels, private keys,

@@ -912,6 +912,53 @@ class SyncProtocolSpecTests(unittest.TestCase):
             normalized_threat,
         )
 
+    def test_server_persistence_keeps_required_opaque_revision_state_only(self) -> None:
+        fixture = self.fixtures["server-persistence-boundary.json"]
+        record_state = set(fixture["permitted_persistence"]["record_revision"])
+        self.assertTrue(
+            {
+                "authenticated_ciphertext_bytes",
+                "collection_witness_authenticator",
+                "immutable_content_address",
+            }.issubset(record_state)
+        )
+        self.assertEqual(
+            set(fixture["permitted_persistence"]),
+            {
+                "record_revision",
+                "collection_marker",
+                "stable_snapshot",
+                "idempotency_receipt",
+            },
+        )
+        self.assertFalse(
+            fixture["server_handling"]["decrypts_or_parses_record_ciphertext"]
+        )
+        self.assertTrue(
+            fixture["server_handling"]["client_verifies_record_aead_before_use"]
+        )
+        self.assertTrue(
+            fixture["server_handling"][
+                "client_verifies_non_null_witness_hmac_before_use"
+            ]
+        )
+        prohibited = set(fixture["prohibited_persistence"])
+        self.assertTrue(
+            {"record_plaintext", "private_key", "vmk", "passphrase"}.issubset(
+                prohibited
+            )
+        )
+
+        normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
+        for claim in (
+            "exact opaque authenticated ciphertext bytes",
+            "nullable collection-witness authenticator bytes",
+            "server neither decrypts nor parses them",
+            "client verifies their AEAD/HMAC authentication before using them",
+        ):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, normalized_protocol)
+
     def test_public_draft_contains_no_private_product_or_infrastructure_details(self) -> None:
         public_text = self.protocol_text + self.threat_text
         for forbidden in (

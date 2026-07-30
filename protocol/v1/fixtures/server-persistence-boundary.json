@@ -1,0 +1,56 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-semantics",
+  "description": "The server durably retains the exact opaque authenticated revision bytes and bounded synchronization state needed for replay-safe deltas and stable snapshot reads, without decrypting, parsing, or retaining application plaintext or private-key material.",
+  "permitted_persistence": {
+    "record_revision": [
+      "record_id",
+      "revision_id",
+      "author_device_id",
+      "author_counter",
+      "version_vector",
+      "tombstone",
+      "nonce",
+      "authenticated_ciphertext_bytes",
+      "collection_witness_authenticator",
+      "receipt_time",
+      "change_cursor",
+      "retention_age",
+      "immutable_content_address"
+    ],
+    "collection_marker": [
+      "record_id",
+      "witness_revision_id",
+      "frontier",
+      "collection_witness_authenticator",
+      "barrier_cursor"
+    ],
+    "stable_snapshot": [
+      "snapshot_id",
+      "cut_cursor",
+      "lease_expiry",
+      "page_token_and_order_key",
+      "immutable_revision_content_address_reference"
+    ],
+    "idempotency_receipt": [
+      "authenticated_device_id",
+      "request_id",
+      "raw_authenticated_body_fingerprint",
+      "recorded_response_bytes",
+      "retention_expiry"
+    ]
+  },
+  "server_handling": {
+    "decrypts_or_parses_record_ciphertext": false,
+    "client_verifies_record_aead_before_use": true,
+    "client_verifies_non_null_witness_hmac_before_use": true
+  },
+  "prohibited_persistence": [
+    "record_plaintext",
+    "parsed_private_key",
+    "private_key",
+    "vmk",
+    "passphrase",
+    "keychain_persistent_reference"
+  ]
+}
