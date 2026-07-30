@@ -108,6 +108,29 @@ def decode_base64url(value: str) -> bytes:
     return decoded
 
 
+def validate_known_host_public_key(body: dict) -> bytes:
+    """Check the non-cryptographic SSH public-key blob/type boundary."""
+    algorithm = body["key_algorithm"]
+    if not re.fullmatch(r"[A-Za-z0-9@._+-]{1,128}", algorithm):
+        raise ValueError("invalid known-host key algorithm")
+    blob = decode_base64url(body["public_key"])
+    if not blob:
+        raise ValueError("empty known-host public key")
+    if len(blob) < 5:
+        raise ValueError("truncated known-host key type")
+    key_type_length = struct.unpack(">I", blob[:4])[0]
+    key_type_end = 4 + key_type_length
+    if key_type_length == 0 or key_type_end >= len(blob):
+        raise ValueError("truncated known-host public key")
+    try:
+        key_type = blob[4:key_type_end].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError("non-ASCII known-host key type") from error
+    if key_type != algorithm:
+        raise ValueError("known-host key algorithm mismatch")
+    return blob
+
+
 def lp(value: bytes) -> bytes:
     return struct.pack(">I", len(value)) + value
 
@@ -929,8 +952,20 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 "collection_marker",
                 "stable_snapshot",
                 "idempotency_receipt",
+                "instance_secret_rotation",
             },
         )
+        rotation = fixture["permitted_persistence"]["instance_secret_rotation"]
+        self.assertEqual(
+            rotation["active_slot"], ["instance_secret_bytes", "generation"]
+        )
+        for slot in ("pending_slot", "recovery_slot"):
+            with self.subTest(slot=slot):
+                self.assertEqual(rotation[slot]["maximum_slots"], 1)
+                self.assertEqual(
+                    rotation[slot]["state"],
+                    ["instance_secret_bytes", "generation"],
+                )
         self.assertFalse(
             fixture["server_handling"]["decrypts_or_parses_record_ciphertext"]
         )
@@ -955,6 +990,66 @@ class SyncProtocolSpecTests(unittest.TestCase):
             "nullable collection-witness authenticator bytes",
             "server neither decrypts nor parses them",
             "client verifies their AEAD/HMAC authentication before using them",
+            "active 32-byte instance-secret bytes and generation",
+            "at most one pending 32-byte instance-secret slot",
+            "at most one old 32-byte recovery slot",
+            "not a VMK or passphrase",
+        ):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, normalized_protocol)
+
+    def test_known_host_public_key_is_nonempty_and_matches_its_algorithm(self) -> None:
+        fixture = self.fixtures["known-host-public-key.json"]
+        canonical = fixture["canonical_payload"]
+        external_roots = {"wire.schema.json": self.wire}
+        self.assertTrue(
+            schema_matches(canonical, self.payload, self.payload, external_roots)
+        )
+        validate_known_host_public_key(canonical["body"])
+
+        body_schema = self.payload["$defs"]["known_host_body"]
+        self.assertEqual(
+            body_schema["properties"]["public_key"]["allOf"][1]["minLength"],
+            2,
+        )
+        self.assertEqual(
+            body_schema["properties"]["key_algorithm"]["maxLength"], 128
+        )
+
+        self.assertEqual(
+            {case["name"] for case in fixture["negative_cases"]},
+            {
+                "empty-public-key",
+                "truncated-key-type-length",
+                "missing-key-parameters",
+                "declared-algorithm-mismatch",
+            },
+        )
+        for case in fixture["negative_cases"]:
+            with self.subTest(case=case["name"]):
+                candidate = copy.deepcopy(canonical)
+                mutation = case["mutation"]
+                candidate["body"][mutation["field"]] = mutation["value"]
+                matches_schema = schema_matches(
+                    candidate,
+                    self.payload,
+                    self.payload,
+                    external_roots,
+                )
+                if case["rejected_by"] == "schema":
+                    self.assertFalse(matches_schema)
+                else:
+                    self.assertEqual(case["rejected_by"], "key_validation")
+                    self.assertTrue(matches_schema)
+                    with self.assertRaises(ValueError):
+                        validate_known_host_public_key(candidate["body"])
+
+        normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
+        for claim in (
+            "complete SSH public-key blob",
+            "require its ASCII bytes to equal `key_algorithm` byte-for-byte",
+            "OpenSSH public-key parser selected by that declared algorithm",
+            "server continues to store opaque ciphertext and never parses known-host data",
         ):
             with self.subTest(claim=claim):
                 self.assertIn(claim, normalized_protocol)

@@ -764,8 +764,19 @@ never claims to reconstruct the original private key.
 The body contains an ordered array of host patterns, marker (`none`,
 `cert_authority`, or `revoked`), public-key algorithm, public-key blob,
 optional comment, and timestamps. Plain and hashed patterns remain encrypted
-from the sync server. Task 1.6 must implement this shape as its sync-ready
-known-host model.
+from the sync server. `public_key` is the canonical unpadded-base64url
+encoding of the complete SSH public-key blob, not a display fingerprint. Before
+persisting a decrypted `known_host`, a client MUST strictly decode and
+re-encode that value, reject an empty or structurally truncated blob, read its
+leading RFC 4251 key-type string, and require its ASCII bytes to equal
+`key_algorithm` byte-for-byte. It MUST then use the OpenSSH public-key parser
+selected by that declared algorithm to reject malformed or unsupported key
+parameters before persistence. This is client-side validation only; the sync
+server continues to store opaque ciphertext and never parses known-host data.
+The algorithm-specific parser behavior remains **REVIEW-PENDING** with Task
+2.0; this draft does not add a runtime crypto implementation. Task 1.6's
+sync-ready known-host model and the eventual Task 2.3 sync import must preserve
+this shape.
 
 ### 9.7 Explicitly device-local state
 
@@ -1523,6 +1534,9 @@ The honest server may persist only:
   recorded response bytes, and retention-expiry state;
 - envelope version, mode, KDF parameters/salts, nonce, wrapped bytes, and
   generation numbers; and
+- active 32-byte instance-secret bytes and generation, plus at most one
+  pending 32-byte instance-secret slot and at most one old 32-byte recovery
+  slot, each with its generation and bounded rotation/lock state; and
 - bounded operational health, error, and rate-limit counters.
 
 Record ciphertext and collection-witness bytes are opaque stored values. The
@@ -1530,6 +1544,9 @@ server neither decrypts nor parses them, and a client verifies their AEAD/HMAC
 authentication before using them. The allowlist permits retaining the exact
 bytes and the server state necessary to return immutable revisions and stable
 snapshots; it does not permit retaining plaintext or private-key material.
+The instance-secret exception is host configuration needed to unwrap the
+envelope after restart: it permits exactly the active, pending, and recovery
+slots above, not a VMK or passphrase.
 
 It MUST NOT persist plaintext host aliases, usernames, addresses, ports,
 snippets, commands, known-host keys/patterns, identity labels, private keys,

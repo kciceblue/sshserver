@@ -38,7 +38,31 @@
       "raw_authenticated_body_fingerprint",
       "recorded_response_bytes",
       "retention_expiry"
-    ]
+    ],
+    "instance_secret_rotation": {
+      "active_slot": [
+        "instance_secret_bytes",
+        "generation"
+      ],
+      "pending_slot": {
+        "maximum_slots": 1,
+        "state": [
+          "instance_secret_bytes",
+          "generation"
+        ]
+      },
+      "recovery_slot": {
+        "maximum_slots": 1,
+        "state": [
+          "instance_secret_bytes",
+          "generation"
+        ]
+      },
+      "rotation_state": [
+        "phase",
+        "lock_state"
+      ]
+    }
   },
   "server_handling": {
     "decrypts_or_parses_record_ciphertext": false,

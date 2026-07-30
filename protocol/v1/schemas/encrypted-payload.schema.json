@@ -313,8 +313,23 @@
           "items": {"type": "string", "minLength": 1, "maxLength": 4096}
         },
         "marker": {"type": "string", "enum": ["none", "cert_authority", "revoked"]},
-        "key_algorithm": {"type": "string", "minLength": 1, "maxLength": 512},
-        "public_key": {"$ref": "wire.schema.json#/$defs/base64url"},
+        "key_algorithm": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9@._+-]+$",
+          "description": "ASCII OpenSSH public-key algorithm. Before persistence, the decoded public_key blob's RFC 4251 key-type string must equal this value byte-for-byte and the client must validate key parameters with the matching algorithm parser."
+        },
+        "public_key": {
+          "allOf": [
+            {"$ref": "wire.schema.json#/$defs/base64url"},
+            {
+              "type": "string",
+              "minLength": 2,
+              "description": "Canonical unpadded base64url of a nonempty complete SSH public-key blob. Before persistence, strictly decode/re-encode it, require a nonempty RFC 4251 key-type string exactly matching key_algorithm, and reject truncated or algorithm-malformed parameters."
+            }
+          ]
+        },
         "comment": {"$ref": "#/$defs/nullable_string"},
         "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
         "updated_at": {"$ref": "wire.schema.json#/$defs/timestamp"}

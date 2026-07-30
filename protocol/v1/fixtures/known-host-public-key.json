@@ -1,0 +1,40 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-client-known-host-validation",
+  "description": "Known-host public-key blobs are canonical base64url-encoded complete SSH public-key blobs. The decoded RFC 4251 key-type string must exactly match key_algorithm before the client runs the declared algorithm's public-key parser and persists the decrypted record.",
+  "canonical_payload": {
+    "payload_version": 1,
+    "record_type": "known_host",
+    "body": {
+      "patterns": ["sync.example.test"],
+      "marker": "none",
+      "key_algorithm": "ssh-ed25519",
+      "public_key": "AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g",
+      "comment": null,
+      "created_at": "2026-07-30T00:00:00.000Z",
+      "updated_at": "2026-07-30T00:00:00.000Z"
+    }
+  },
+  "negative_cases": [
+    {
+      "name": "empty-public-key",
+      "mutation": {"field": "public_key", "value": ""},
+      "rejected_by": "schema"
+    },
+    {
+      "name": "truncated-key-type-length",
+      "mutation": {"field": "public_key", "value": "AAAACw"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "missing-key-parameters",
+      "mutation": {"field": "public_key", "value": "AAAAC3NzaC1lZDI1NTE5"},
+      "rejected_by": "key_validation"
+    },
+    {
+      "name": "declared-algorithm-mismatch",
+      "mutation": {"field": "key_algorithm", "value": "ssh-rsa"},
+      "rejected_by": "key_validation"
+    }
+  ]
+}
