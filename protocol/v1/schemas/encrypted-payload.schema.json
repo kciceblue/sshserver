@@ -25,6 +25,13 @@
         {"type": "string"}
       ]
     },
+    "openssh_sha256_fingerprint": {
+      "type": "string",
+      "minLength": 50,
+      "maxLength": 50,
+      "pattern": "^SHA256:[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]$",
+      "description": "Canonical OpenSSH SHA-256 fingerprint: the literal SHA256: followed by the unpadded standard-base64 encoding of exactly one 32-byte SHA-256 digest. The final-character class enforces zero unused trailing bits."
+    },
     "common_outer": {
       "type": "object",
       "additionalProperties": false,
@@ -257,7 +264,10 @@
             }
           ]
         },
-        "fingerprint": {"type": "string", "minLength": 1, "maxLength": 512},
+        "fingerprint": {
+          "$ref": "#/$defs/openssh_sha256_fingerprint",
+          "description": "OpenSSH SHA-256 fingerprint recomputed from the canonical key-kind-bound ssh-ed25519 or ssh-rsa public blob and required to match exactly before persistence."
+        },
         "requested_biometric_policy": {"type": "string", "enum": ["none", "current_set"]},
         "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
         "updated_at": {"$ref": "wire.schema.json#/$defs/timestamp"}
@@ -305,10 +315,7 @@
           ]
         },
         "fingerprint": {
-          "type": "string",
-          "minLength": 50,
-          "maxLength": 50,
-          "pattern": "^SHA256:[A-Za-z0-9+/]{43}$",
+          "$ref": "#/$defs/openssh_sha256_fingerprint",
           "description": "OpenSSH SHA-256 fingerprint recomputed from the canonical ecdsa-sha2-nistp256 public blob and required to match exactly before persistence."
         },
         "origin_device_id": {"$ref": "wire.schema.json#/$defs/uuid"},

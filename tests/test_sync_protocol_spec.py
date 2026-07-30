@@ -248,6 +248,92 @@ def openssl_transform(arguments: list[str], input_bytes: bytes) -> bytes:
     return result.stdout
 
 
+def ssh_string(value: bytes) -> bytes:
+    return struct.pack(">I", len(value)) + value
+
+
+def ssh_mpint_from_unsigned(value: bytes) -> bytes:
+    value = value.lstrip(b"\x00")
+    if not value:
+        raise ValueError("SSH public-key integers must be positive")
+    if value[0] & 0x80:
+        value = b"\x00" + value
+    return ssh_string(value)
+
+
+def read_der_value(
+    encoded: bytes, offset: int, expected_tag: int
+) -> tuple[bytes, int]:
+    if offset + 2 > len(encoded) or encoded[offset] != expected_tag:
+        raise ValueError("unexpected or truncated DER value")
+    offset += 1
+    first_length = encoded[offset]
+    offset += 1
+    if first_length < 0x80:
+        length = first_length
+    else:
+        length_octets = first_length & 0x7F
+        if (
+            length_octets == 0
+            or length_octets > 4
+            or offset + length_octets > len(encoded)
+            or encoded[offset] == 0
+        ):
+            raise ValueError("invalid DER length")
+        length = int.from_bytes(
+            encoded[offset : offset + length_octets], "big"
+        )
+        if length < 0x80:
+            raise ValueError("noncanonical DER length")
+        offset += length_octets
+    end = offset + length
+    if end > len(encoded):
+        raise ValueError("truncated DER value")
+    return encoded[offset:end], end
+
+
+def read_positive_der_integer(encoded: bytes, offset: int) -> tuple[bytes, int]:
+    value, end = read_der_value(encoded, offset, 0x02)
+    if not value or value[0] & 0x80:
+        raise ValueError("RSA integers must be positive")
+    if len(value) > 1 and value[0] == 0 and not value[1] & 0x80:
+        raise ValueError("noncanonical DER integer")
+    unsigned = value.lstrip(b"\x00")
+    if not unsigned:
+        raise ValueError("RSA integers must be nonzero")
+    return unsigned, end
+
+
+def ssh_rsa_public_blob(public_key: bytes) -> bytes:
+    sequence, outer_end = read_der_value(public_key, 0, 0x30)
+    if outer_end != len(public_key):
+        raise ValueError("trailing RSA public-key bytes")
+    modulus, offset = read_positive_der_integer(sequence, 0)
+    exponent, offset = read_positive_der_integer(sequence, offset)
+    if offset != len(sequence):
+        raise ValueError("unexpected RSA public-key fields")
+    return (
+        ssh_string(b"ssh-rsa")
+        + ssh_mpint_from_unsigned(exponent)
+        + ssh_mpint_from_unsigned(modulus)
+    )
+
+
+def openssh_sha256_fingerprint(public_blob: bytes) -> str:
+    digest = hashlib.sha256(public_blob).digest()
+    return "SHA256:" + base64.b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def software_identity_fingerprint(key_kind: str, public_key: bytes) -> str:
+    if key_kind == "ed25519":
+        public_blob = ssh_string(b"ssh-ed25519") + ssh_string(public_key)
+    elif key_kind == "rsa":
+        public_blob = ssh_rsa_public_blob(public_key)
+    else:
+        raise ValueError(f"unsupported software identity key kind: {key_kind}")
+    return openssh_sha256_fingerprint(public_blob)
+
+
 def validate_software_identity_keypair(body: dict) -> None:
     """Enforce V1 kind/encoding, canonical parse, and key correspondence."""
     private_key = decode_base64url(body["private_key"])
@@ -270,9 +356,7 @@ def validate_software_identity_keypair(body: dict) -> None:
         derived_public_key = public_spki[len(ED25519_SPKI_PREFIX) :]
         if len(derived_public_key) != 32 or derived_public_key != public_key:
             raise ValueError("Ed25519 public key does not match private seed")
-        return
-
-    if key_kind == "rsa":
+    elif key_kind == "rsa":
         if body["private_key_encoding"] != "rsa-pkcs8-der-v1":
             raise ValueError("wrong RSA private-key encoding")
         if body["public_key_encoding"] != "rsa-pkcs1-der-v1":
@@ -320,22 +404,20 @@ def validate_software_identity_keypair(body: dict) -> None:
         )
         if derived_public_key != public_key:
             raise ValueError("RSA public key does not match private key")
-        return
+    else:
+        raise ValueError(f"unsupported software identity key kind: {key_kind}")
 
-    raise ValueError(f"unsupported software identity key kind: {key_kind}")
+    if software_identity_fingerprint(key_kind, public_key) != body["fingerprint"]:
+        raise ValueError("software identity public-key fingerprint mismatch")
 
 
 def ssh_fingerprint_p256(public_key: bytes) -> str:
-    def ssh_string(value: bytes) -> bytes:
-        return struct.pack(">I", len(value)) + value
-
     public_blob = (
         ssh_string(b"ecdsa-sha2-nistp256")
         + ssh_string(b"nistp256")
         + ssh_string(public_key)
     )
-    digest = hashlib.sha256(public_blob).digest()
-    return "SHA256:" + base64.b64encode(digest).rstrip(b"=").decode("ascii")
+    return openssh_sha256_fingerprint(public_blob)
 
 
 def validate_secure_enclave_public_key(body: dict) -> None:
@@ -2792,6 +2874,17 @@ class SyncProtocolSpecTests(unittest.TestCase):
             1,
         )
         self.assertIn("public_key_encoding", body_schema["required"])
+        self.assertEqual(
+            body_schema["properties"]["fingerprint"]["$ref"],
+            "#/$defs/openssh_sha256_fingerprint",
+        )
+        fingerprint_schema = self.payload["$defs"]["openssh_sha256_fingerprint"]
+        self.assertEqual(fingerprint_schema["minLength"], 50)
+        self.assertEqual(fingerprint_schema["maxLength"], 50)
+        self.assertEqual(
+            fingerprint_schema["pattern"],
+            r"^SHA256:[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]$",
+        )
 
         normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
         for claim in (
@@ -2799,6 +2892,9 @@ class SyncProtocolSpecTests(unittest.TestCase):
             "public_key_encoding = rsa-pkcs1-der-v1",
             "require byte-for-byte equality with the received bytes",
             "derive the canonical public-key bytes from the validated private key and require exact equality",
+            'ssh_string("ssh-ed25519") || ssh_string(raw_public_key_32)',
+            'ssh_string("ssh-rsa") || ssh_mpint(e) || ssh_mpint(n)',
+            "unpadded standard RFC 4648 Base64 encoding of `SHA-256(public_key_blob)`",
             "before persistent Keychain import or any local custody mutation",
         ):
             with self.subTest(claim=claim):
@@ -2838,6 +2934,8 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 "short-ed25519-public-key",
                 "long-ed25519-private-key",
                 "mismatched-ed25519-keypair",
+                "mismatched-ed25519-fingerprint",
+                "noncanonical-fingerprint-base64",
                 "wrong-rsa-public-encoding",
                 "wrong-rsa-private-encoding",
                 "malformed-rsa-pkcs8-private-key",
@@ -2847,6 +2945,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 "rsa-spki-public-instead-of-pkcs1",
                 "noncanonical-rsa-public-trailing-byte",
                 "mismatched-rsa-keypair",
+                "mismatched-rsa-fingerprint",
             },
         )
         for case in negative_cases:

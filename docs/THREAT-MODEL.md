@@ -197,11 +197,12 @@ restore it directly into device-only Keychain storage. No plaintext temporary
 file, sync log, JSON library field, or crash report is allowed. Before any
 persistent import, the client strictly validates the protocol's kind-bound
 canonical Ed25519/RSA private and public encodings, derives the public key from
-the private key, and requires an exact match. An empty, malformed,
-non-canonical, wrong-kind, or mismatched pair is rejected as an invalid
-decrypted record without a Keychain or local-custody mutation. The encoding
-contract, export/import implementation, local authorization, and Keychain
-access policy remain review-pending.
+the private key, requires an exact match, and recomputes the exact OpenSSH
+SHA-256 fingerprint over the key-kind-bound `ssh-ed25519` or `ssh-rsa` public
+blob. An empty, malformed, non-canonical, wrong-kind, mismatched-key, or
+fingerprint-mismatched record is rejected without a Keychain or local-custody
+mutation. The encoding and fingerprint contract, export/import implementation,
+local authorization, and Keychain access policy remain review-pending.
 
 ### 7.2 Secure Enclave identities
 

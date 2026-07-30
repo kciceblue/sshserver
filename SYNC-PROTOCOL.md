@@ -725,10 +725,27 @@ variant, trailing bytes, a different algorithm, or an empty value is forbidden.
 For either key kind, the client MUST derive the canonical public-key bytes from
 the validated private key and require exact equality with `public_key`. Any
 encoding, parse, canonicality, or correspondence failure rejects the decrypted
-record before persistent Keychain import or any local custody mutation. The
-fingerprint is recomputed from the validated public key rather than trusted as
-proof of correspondence. This export/import path and its local user
-authorization are **REVIEW-PENDING**.
+record before persistent Keychain import or any local custody mutation.
+
+The fingerprint uses the OpenSSH SHA-256 display form over a key-kind-bound
+RFC 4251 public-key blob. Let `ssh_string(x) = u32be(len(x)) || x`, and let
+`ssh_mpint(x)` be the shortest positive RFC 4251 `mpint`, prepending one zero
+octet only when the high bit of the first magnitude octet is set:
+
+- Ed25519 uses
+  `ssh_string("ssh-ed25519") || ssh_string(raw_public_key_32)`.
+- RSA strictly parses modulus `n` and public exponent `e` from the canonical
+  PKCS#1 `RSAPublicKey` and uses
+  `ssh_string("ssh-rsa") || ssh_mpint(e) || ssh_mpint(n)`. The `ssh-rsa`
+  public-key type is fixed for this blob even when an ordinary SSH connection
+  negotiates an RSA-SHA2 signature algorithm.
+
+`fingerprint` is the ASCII literal `SHA256:` followed by the unpadded standard
+RFC 4648 Base64 encoding of `SHA-256(public_key_blob)`. It is exactly 50 ASCII
+characters. The client MUST recompute it from the validated public key and
+require byte-for-byte equality before persistent Keychain import; the supplied
+value is never trusted as proof of correspondence. This fingerprint contract,
+export/import path, and local user authorization are **REVIEW-PENDING**.
 
 Restoration writes no plaintext key file. The client authorizes access,
 decrypts in memory, imports directly into device-only Keychain storage, and
