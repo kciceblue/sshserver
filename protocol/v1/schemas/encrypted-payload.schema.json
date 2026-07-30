@@ -129,7 +129,33 @@
         "notes": {"type": "string", "maxLength": 65536},
         "created_at": {"$ref": "wire.schema.json#/$defs/timestamp"},
         "updated_at": {"$ref": "wire.schema.json#/$defs/timestamp"}
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": {"kind": {"enum": ["local", "remote"]}}
+          },
+          "then": {
+            "properties": {
+              "destination_host": {"type": "string", "minLength": 1},
+              "destination_port": {"type": "integer", "minimum": 1, "maximum": 65535}
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": {"kind": {"const": "dynamic"}}
+          },
+          "then": {
+            "properties": {
+              "destination_host": {"type": "null"},
+              "destination_port": {"type": "null"}
+            }
+          }
+        }
+      ]
     },
     "forward_payload": {
       "type": "object",

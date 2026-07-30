@@ -62,7 +62,18 @@
         "phase",
         "lock_state"
       ]
-    }
+    },
+    "loopback_server_configuration": [
+      "resolved_loopback_address_set",
+      "listener_port",
+      "configuration_version"
+    ],
+    "installation_transaction": [
+      "install_state_marker",
+      "generation",
+      "phase",
+      "complete_resume_or_rollback_state"
+    ]
   },
   "server_handling": {
     "decrypts_or_parses_record_ciphertext": false,
@@ -70,6 +81,7 @@
     "client_verifies_non_null_witness_hmac_before_use": true
   },
   "prohibited_persistence": [
+    "application_plaintext",
     "record_plaintext",
     "parsed_private_key",
     "private_key",

@@ -103,7 +103,7 @@
         "ciphertext": {
           "allOf": [{"$ref": "#/$defs/base64url"}],
           "minLength": 22,
-          "maxLength": 699072
+          "maxLength": 699051
         }
       }
     },

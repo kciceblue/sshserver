@@ -1,0 +1,79 @@
+{
+  "fixture_version": 1,
+  "status": "review-pending-schema-semantics",
+  "description": "Forward profiles require a usable destination for local and remote forwarding, while dynamic forwarding carries no ignored destination fields.",
+  "canonical_payloads": {
+    "local": {
+      "payload_version": 1,
+      "record_type": "forward_profile",
+      "body": {
+        "name": "local database",
+        "kind": "local",
+        "bind_host": "127.0.0.1",
+        "listen_port": 15432,
+        "destination_host": "database.internal",
+        "destination_port": 5432,
+        "notes": "",
+        "created_at": "2026-07-30T00:00:00.000Z",
+        "updated_at": "2026-07-30T00:00:00.000Z"
+      }
+    },
+    "remote": {
+      "payload_version": 1,
+      "record_type": "forward_profile",
+      "body": {
+        "name": "remote metrics",
+        "kind": "remote",
+        "bind_host": "127.0.0.1",
+        "listen_port": 18080,
+        "destination_host": "metrics.internal",
+        "destination_port": 8080,
+        "notes": "",
+        "created_at": "2026-07-30T00:00:00.000Z",
+        "updated_at": "2026-07-30T00:00:00.000Z"
+      }
+    },
+    "dynamic": {
+      "payload_version": 1,
+      "record_type": "forward_profile",
+      "body": {
+        "name": "dynamic proxy",
+        "kind": "dynamic",
+        "bind_host": "127.0.0.1",
+        "listen_port": 1080,
+        "destination_host": null,
+        "destination_port": null,
+        "notes": "",
+        "created_at": "2026-07-30T00:00:00.000Z",
+        "updated_at": "2026-07-30T00:00:00.000Z"
+      }
+    }
+  },
+  "negative_cases": [
+    {
+      "name": "local-null-destination-host",
+      "base": "local",
+      "mutation": {"field": "destination_host", "value": null}
+    },
+    {
+      "name": "remote-empty-destination-host",
+      "base": "remote",
+      "mutation": {"field": "destination_host", "value": ""}
+    },
+    {
+      "name": "local-null-destination-port",
+      "base": "local",
+      "mutation": {"field": "destination_port", "value": null}
+    },
+    {
+      "name": "dynamic-destination-host",
+      "base": "dynamic",
+      "mutation": {"field": "destination_host", "value": "ignored.internal"}
+    },
+    {
+      "name": "dynamic-destination-port",
+      "base": "dynamic",
+      "mutation": {"field": "destination_port", "value": 443}
+    }
+  ]
+}

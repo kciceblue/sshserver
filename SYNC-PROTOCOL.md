@@ -697,8 +697,10 @@ The body contains `name`, `command`, `notes`, `created_at`, and `updated_at`.
 ### 9.3 `forward_profile`
 
 The body contains `name`, `kind` (`local`, `remote`, or `dynamic`), `bind_host`,
-`listen_port`, optional destination host/port, `notes`, `created_at`, and
-`updated_at`.
+`listen_port`, destination host/port, `notes`, `created_at`, and `updated_at`.
+For `local` and `remote`, destination host MUST be nonempty and destination
+port MUST be in `1...65535`. For `dynamic`, both destination fields MUST be
+`null`; a dynamic forward never carries an ignored target.
 
 ### 9.4 `software_identity`
 
@@ -1537,6 +1539,10 @@ The honest server may persist only:
 - active 32-byte instance-secret bytes and generation, plus at most one
   pending 32-byte instance-secret slot and at most one old 32-byte recovery
   slot, each with its generation and bounded rotation/lock state; and
+- bounded loopback-only listener configuration (resolved loopback address set,
+  one TCP port, and configuration version), plus a durable installation
+  transaction marker containing only its generation, phase, and
+  complete/resume-or-rollback state; and
 - bounded operational health, error, and rate-limit counters.
 
 Record ciphertext and collection-witness bytes are opaque stored values. The
@@ -1547,10 +1553,14 @@ snapshots; it does not permit retaining plaintext or private-key material.
 The instance-secret exception is host configuration needed to unwrap the
 envelope after restart: it permits exactly the active, pending, and recovery
 slots above, not a VMK or passphrase.
+The listener configuration and installation marker permit safe restart and
+resume only; neither may contain encrypted application payloads, application
+plaintext, credentials, or user settings.
 
-It MUST NOT persist plaintext host aliases, usernames, addresses, ports,
-snippets, commands, known-host keys/patterns, identity labels, private keys,
-passphrases, VMKs, device labels, local file paths, or application settings.
+It MUST NOT persist plaintext host aliases, usernames, application destination
+addresses or ports, snippets, commands, known-host keys/patterns, identity
+labels, private keys, passphrases, VMKs, device labels, local file paths, or
+application settings.
 
 SSH and operating-system logs remain outside the service and can reveal the
 selected Unix account, connection source, and timing. The threat model states

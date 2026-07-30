@@ -953,6 +953,8 @@ class SyncProtocolSpecTests(unittest.TestCase):
                 "stable_snapshot",
                 "idempotency_receipt",
                 "instance_secret_rotation",
+                "loopback_server_configuration",
+                "installation_transaction",
             },
         )
         rotation = fixture["permitted_persistence"]["instance_secret_rotation"]
@@ -966,6 +968,23 @@ class SyncProtocolSpecTests(unittest.TestCase):
                     rotation[slot]["state"],
                     ["instance_secret_bytes", "generation"],
                 )
+        self.assertEqual(
+            fixture["permitted_persistence"]["loopback_server_configuration"],
+            [
+                "resolved_loopback_address_set",
+                "listener_port",
+                "configuration_version",
+            ],
+        )
+        self.assertEqual(
+            fixture["permitted_persistence"]["installation_transaction"],
+            [
+                "install_state_marker",
+                "generation",
+                "phase",
+                "complete_resume_or_rollback_state",
+            ],
+        )
         self.assertFalse(
             fixture["server_handling"]["decrypts_or_parses_record_ciphertext"]
         )
@@ -979,9 +998,13 @@ class SyncProtocolSpecTests(unittest.TestCase):
         )
         prohibited = set(fixture["prohibited_persistence"])
         self.assertTrue(
-            {"record_plaintext", "private_key", "vmk", "passphrase"}.issubset(
-                prohibited
-            )
+            {
+                "application_plaintext",
+                "record_plaintext",
+                "private_key",
+                "vmk",
+                "passphrase",
+            }.issubset(prohibited)
         )
 
         normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
@@ -994,6 +1017,78 @@ class SyncProtocolSpecTests(unittest.TestCase):
             "at most one pending 32-byte instance-secret slot",
             "at most one old 32-byte recovery slot",
             "not a VMK or passphrase",
+            "bounded loopback-only listener configuration",
+            "durable installation transaction marker",
+            "application plaintext, credentials, or user settings",
+        ):
+            with self.subTest(claim=claim):
+                self.assertIn(claim, normalized_protocol)
+
+    def test_record_ciphertext_encoded_limit_is_exactly_512_kib_decoded(self) -> None:
+        ciphertext_schema = self.wire["$defs"]["record_revision"]["properties"][
+            "ciphertext"
+        ]
+        maximum_decoded_bytes = 512 * 1024
+        maximum_encoded = base64.urlsafe_b64encode(
+            b"\x00" * maximum_decoded_bytes
+        ).rstrip(b"=").decode("ascii")
+        one_byte_over = base64.urlsafe_b64encode(
+            b"\x00" * (maximum_decoded_bytes + 1)
+        ).rstrip(b"=").decode("ascii")
+        self.assertEqual(len(maximum_encoded), 699051)
+        self.assertEqual(ciphertext_schema["maxLength"], len(maximum_encoded))
+        self.assertEqual(
+            len(decode_base64url(maximum_encoded)),
+            maximum_decoded_bytes,
+        )
+        self.assertTrue(schema_matches(maximum_encoded, ciphertext_schema, self.wire))
+        self.assertEqual(len(one_byte_over), 699052)
+        self.assertFalse(schema_matches(one_byte_over, ciphertext_schema, self.wire))
+
+    def test_forward_profiles_require_targets_unless_dynamic(self) -> None:
+        fixture = self.fixtures["forward-profile-validation.json"]
+        external_roots = {"wire.schema.json": self.wire}
+        for kind, payload in fixture["canonical_payloads"].items():
+            with self.subTest(kind=kind):
+                self.assertTrue(
+                    schema_matches(
+                        payload,
+                        self.payload,
+                        self.payload,
+                        external_roots,
+                    )
+                )
+
+        self.assertEqual(
+            {case["name"] for case in fixture["negative_cases"]},
+            {
+                "local-null-destination-host",
+                "remote-empty-destination-host",
+                "local-null-destination-port",
+                "dynamic-destination-host",
+                "dynamic-destination-port",
+            },
+        )
+        for case in fixture["negative_cases"]:
+            with self.subTest(case=case["name"]):
+                candidate = copy.deepcopy(
+                    fixture["canonical_payloads"][case["base"]]
+                )
+                mutation = case["mutation"]
+                candidate["body"][mutation["field"]] = mutation["value"]
+                self.assertFalse(
+                    schema_matches(
+                        candidate,
+                        self.payload,
+                        self.payload,
+                        external_roots,
+                    )
+                )
+
+        normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
+        for claim in (
+            "For `local` and `remote`, destination host MUST be nonempty",
+            "For `dynamic`, both destination fields MUST be `null`",
         ):
             with self.subTest(claim=claim):
                 self.assertIn(claim, normalized_protocol)
