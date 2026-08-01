@@ -138,6 +138,101 @@ class DependencyLicensePolicyTests(unittest.TestCase):
             checker.validate_repository(self.root, go_modules_json=module_graph), []
         )
 
+    def test_nested_go_module_graph_is_inventoried_and_deduplicated(self) -> None:
+        module_graph = self.add_go_fixture()
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        (runtime / "go.mod").write_text(
+            "module example.com/server/runtime\n\ngo 1.24\n", encoding="utf-8"
+        )
+        nested_graph = "\n".join(
+            (
+                json.dumps(
+                    {"Path": "example.com/server/runtime", "Main": True}
+                ),
+                json.dumps(
+                    {
+                        "Path": "example.com/permitted/module",
+                        "Version": "v1.2.3",
+                    }
+                ),
+            )
+        )
+
+        self.assertEqual(
+            checker.validate_repository(
+                self.root,
+                go_modules_json={".": module_graph, "runtime": nested_graph},
+            ),
+            [],
+        )
+
+    def test_local_go_replacement_must_remain_inside_repository(self) -> None:
+        self.add_go_fixture()
+        inventory = json.loads(
+            (self.root / "DEPENDENCIES.json").read_text(encoding="utf-8")
+        )
+        inventory["dependencies"][-1]["replacement"] = "../outside@local"
+        self.write_inventory(inventory["dependencies"])
+        graph = "\n".join(
+            (
+                json.dumps({"Path": "example.com/server", "Main": True}),
+                json.dumps(
+                    {
+                        "Path": "example.com/permitted/module",
+                        "Version": "v1.2.3",
+                        "Replace": {"Path": "../outside"},
+                    }
+                ),
+            )
+        )
+
+        errors = checker.validate_repository(self.root, go_modules_json=graph)
+
+        self.assertTrue(any("escapes repository" in item for item in errors), errors)
+
+    def test_each_nested_graph_occurrence_validates_replacement(self) -> None:
+        module_graph = self.add_go_fixture()
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        (runtime / "go.mod").write_text(
+            "module example.com/server/runtime\n\ngo 1.24\n", encoding="utf-8"
+        )
+        (runtime / "inside").mkdir()
+        (runtime / "inside" / "go.mod").write_text(
+            "module example.com/permitted/module\n\ngo 1.24\n", encoding="utf-8"
+        )
+        inventory = json.loads(
+            (self.root / "DEPENDENCIES.json").read_text(encoding="utf-8")
+        )
+        inventory["dependencies"][-1]["replacement"] = "./inside@local"
+        self.write_inventory(inventory["dependencies"])
+        nested_graph = "\n".join(
+            (
+                json.dumps({"Path": "example.com/server/runtime", "Main": True}),
+                json.dumps(
+                    {
+                        "Path": "example.com/permitted/module",
+                        "Version": "v1.2.3",
+                        "Replace": {"Path": "./inside"},
+                    }
+                ),
+            )
+        )
+
+        errors = checker.validate_repository(
+            self.root,
+            go_modules_json={
+                ".": module_graph,
+                "runtime": nested_graph,
+                "runtime/inside": json.dumps(
+                    {"Path": "example.com/permitted/module", "Main": True}
+                ),
+            },
+        )
+
+        self.assertTrue(any("stale replacement" in item for item in errors), errors)
+
     def test_valid_nonredistributed_test_tool_passes(self) -> None:
         self.write_inventory([CHECKOUT, SYSTEM_OPENSSL])
         (self.root / "NOTICE").write_text(
@@ -218,6 +313,48 @@ class DependencyLicensePolicyTests(unittest.TestCase):
         )
 
         self.assertTrue(any("too short" in item for item in errors), errors)
+
+    def test_shared_license_bundle_requires_selector_labels(self) -> None:
+        self.add_go_fixture()
+        inventory = json.loads(
+            (self.root / "DEPENDENCIES.json").read_text(encoding="utf-8")
+        )
+        second = dict(inventory["dependencies"][-1])
+        second.update(
+            {
+                "module": "example.com/permitted/second",
+                "name": "second permitted module",
+                "selector": "example.com/permitted/second@v2.0.0",
+                "version": "v2.0.0",
+            }
+        )
+        inventory["dependencies"].append(second)
+        self.write_inventory(inventory["dependencies"])
+        (self.root / "NOTICE").write_text(
+            "example.com/permitted/module\nexample.com/permitted/second\n",
+            encoding="utf-8",
+        )
+        graph = "\n".join(
+            (
+                json.dumps({"Path": "example.com/server", "Main": True}),
+                json.dumps(
+                    {
+                        "Path": "example.com/permitted/module",
+                        "Version": "v1.2.3",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "Path": "example.com/permitted/second",
+                        "Version": "v2.0.0",
+                    }
+                ),
+            )
+        )
+
+        errors = checker.validate_repository(self.root, go_modules_json=graph)
+
+        self.assertTrue(any("shared license bundle" in item for item in errors), errors)
 
     def test_unhandled_package_manifest_fails_closed(self) -> None:
         (self.root / "package.json").write_text("{}\n", encoding="utf-8")

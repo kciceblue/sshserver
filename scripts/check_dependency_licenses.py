@@ -92,28 +92,33 @@ def _parse_json_stream(payload: str, errors: list[str]) -> list[dict[str, Any]]:
     return values
 
 
-def _go_module_graph(root: Path, errors: list[str]) -> str | None:
+def _go_module_graph(module_root: Path, repository_root: Path, errors: list[str]) -> str | None:
+    module_label = str(module_root.relative_to(repository_root)) or "."
     try:
         result = subprocess.run(
             ["go", "list", "-mod=readonly", "-m", "-json", "all"],
-            cwd=root,
+            cwd=module_root,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
     except OSError as error:
-        errors.append(f"cannot execute `go list` for dependency discovery: {error}")
+        errors.append(
+            f"cannot execute `go list` for dependency discovery in {module_label}: {error}"
+        )
         return None
     if result.returncode != 0:
         detail = result.stderr.strip() or f"exit status {result.returncode}"
-        errors.append(f"`go list -mod=readonly -m -json all` failed: {detail}")
+        errors.append(
+            f"`go list -mod=readonly -m -json all` failed in {module_label}: {detail}"
+        )
         return None
     return result.stdout
 
 
 def validate_repository(
-    root: Path, *, go_modules_json: str | None = None
+    root: Path, *, go_modules_json: str | dict[str, str] | None = None
 ) -> list[str]:
     """Return policy violations for *root*; an empty result means success."""
 
@@ -150,6 +155,7 @@ def validate_repository(
         raw_dependencies = []
 
     dependencies: dict[str, dict[str, Any]] = {}
+    go_license_files: dict[str, list[str]] = {}
     third_party_directory = root / "ThirdPartyLicenses"
     for index, dependency in enumerate(raw_dependencies):
         label = f"dependency entry {index}"
@@ -198,6 +204,7 @@ def validate_repository(
             if not isinstance(license_file, str) or not license_file.strip():
                 errors.append(f"{label} has no license_file")
             else:
+                go_license_files.setdefault(license_file, []).append(selector)
                 path = root / license_file
                 if not _inside(path, third_party_directory):
                     errors.append(
@@ -244,6 +251,19 @@ def validate_repository(
                         f"{label} version_pattern must be "
                         f"{required_tool['version_pattern']!r}"
                     )
+
+    for license_file, selectors in sorted(go_license_files.items()):
+        if len(selectors) < 2:
+            continue
+        try:
+            license_text = (root / license_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        for selector in selectors:
+            if selector not in license_text:
+                errors.append(
+                    f"shared license bundle {license_file} does not label {selector}"
+                )
 
     discovered_actions: set[str] = set()
     workflow_directory = root / ".github" / "workflows"
@@ -298,16 +318,32 @@ def validate_repository(
             "unsupported dependency manifest(s) require a fail-closed parser "
             "before merge: " + ", ".join(map(str, unsupported_manifests))
         )
-    if (root / "go.sum").exists() and not (root / "go.mod").is_file():
-        errors.append("go.sum exists without go.mod")
+    for go_sum in sorted(
+        path
+        for path in root.rglob("go.sum")
+        if ".git" not in path.parts and "vendor" not in path.parts
+    ):
+        if not (go_sum.parent / "go.mod").is_file():
+            errors.append(
+                f"{go_sum.relative_to(root)} exists without adjacent go.mod"
+            )
 
     discovered_modules: set[str] = set()
-    if (root / "go.mod").is_file():
-        module_payload = (
-            go_modules_json
-            if go_modules_json is not None
-            else _go_module_graph(root, errors)
-        )
+    go_module_roots = sorted(
+        path.parent
+        for path in root.rglob("go.mod")
+        if ".git" not in path.parts and "vendor" not in path.parts
+    )
+    for module_root in go_module_roots:
+        module_label = str(module_root.relative_to(root)) or "."
+        if isinstance(go_modules_json, str):
+            module_payload = go_modules_json if module_label == "." else None
+        elif isinstance(go_modules_json, dict):
+            module_payload = go_modules_json.get(module_label)
+        else:
+            module_payload = None
+        if module_payload is None:
+            module_payload = _go_module_graph(module_root, root, errors)
         if module_payload is not None:
             for module in _parse_json_stream(module_payload, errors):
                 if module.get("Main") is True:
@@ -318,18 +354,18 @@ def validate_repository(
                     errors.append("go module graph contains a dependency without Path")
                     continue
                 selector = f"{module_path}@{version}"
-                if selector in discovered_modules:
-                    errors.append(f"go module graph contains duplicate {selector}")
-                    continue
-                discovered_modules.add(selector)
                 dependency = dependencies.get(selector)
+                first_occurrence = selector not in discovered_modules
+                if first_occurrence:
+                    discovered_modules.add(selector)
+                    if dependency is None:
+                        errors.append(f"unlisted Go module: {selector}")
+                    elif dependency.get("usage") != "go-module":
+                        errors.append(
+                            f"{selector} is used as a Go module but inventoried otherwise"
+                        )
                 if dependency is None:
-                    errors.append(f"unlisted Go module: {selector}")
                     continue
-                if dependency.get("usage") != "go-module":
-                    errors.append(
-                        f"{selector} is used as a Go module but inventoried otherwise"
-                    )
                 replacement = module.get("Replace")
                 if isinstance(replacement, dict):
                     replacement_path = replacement.get("Path")
@@ -344,6 +380,26 @@ def validate_repository(
                             f"{selector} replacement must be inventoried as "
                             f"{expected_replacement}"
                         )
+                    if replacement_version == "local" and isinstance(
+                        replacement_path, str
+                    ):
+                        replacement_location = Path(replacement_path)
+                        if replacement_location.is_absolute():
+                            errors.append(
+                                f"{selector} local replacement path must be relative"
+                            )
+                        else:
+                            replacement_root = module_root / replacement_location
+                            if not _inside(replacement_root, root):
+                                errors.append(
+                                    f"{selector} local replacement escapes repository"
+                                )
+                            elif not (replacement_root / "go.mod").is_file():
+                                errors.append(
+                                    f"{selector} local replacement has no go.mod"
+                                )
+                elif dependency.get("replacement") is not None:
+                    errors.append(f"{selector} has a stale replacement inventory field")
 
     listed_modules = {
         selector

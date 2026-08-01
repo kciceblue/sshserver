@@ -91,7 +91,18 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("runs-on: macos-15", workflow)
         self.assertIn("brew install openssl@3", workflow)
         self.assertIn("run: make kat", workflow)
-        self.assertIn("needs: [policy, crypto_kat]", workflow)
+        self.assertIn("needs: [policy, crypto_kat, runtime_matrix]", workflow)
+        for runner in (
+            "ubuntu-24.04",
+            "ubuntu-24.04-arm",
+            "macos-15-intel",
+            "macos-15",
+        ):
+            self.assertIn(f"runner: {runner}", workflow)
+        self.assertIn("go-version-file: runtime/go.mod", workflow)
+        self.assertIn("--execute-native", workflow)
+        self.assertIn("TestRuntimeUserServiceSSHTunnel", workflow)
+        self.assertIn("RUNTIME_RESULT: ${{ needs.runtime_matrix.result }}", workflow)
         self.assertIn("pull_request_number:", workflow)
         self.assertIn('context="Repository policy"', workflow)
         self.assertIn("statuses: write", workflow)
@@ -104,6 +115,17 @@ class RepositoryPolicyTests(unittest.TestCase):
             workflow,
         )
         self.assertIn('test "$checked_out_sha" = "$EXPECTED_HEAD_SHA"', workflow)
+
+    def test_complete_check_binds_trimmed_runtime_vendor(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn(
+            "check: license-check runtime-vendor-check crypto-evidence-check",
+            makefile,
+        )
+        self.assertIn(
+            "runtime-vendor-check:\n\t$(PYTHON) scripts/check_runtime_vendor.py",
+            makefile,
+        )
 
     def test_repository_uses_full_apache_2_license(self) -> None:
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")

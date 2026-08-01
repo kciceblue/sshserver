@@ -72,6 +72,43 @@
       "selector": "golang.org/x/text@v0.40.0",
       "usage": "go-module",
       "version": "v0.40.0"
+    },
+    {
+      "license": "MIT",
+      "license_file": "ThirdPartyLicenses/runtime-go-modules-LICENSES.txt",
+      "module": "github.com/ncruces/go-sqlite3",
+      "name": "Pure-Go SQLite wrapper",
+      "replacement": "./third_party/go-sqlite3@local",
+      "selector": "github.com/ncruces/go-sqlite3@v0.32.0",
+      "usage": "go-module",
+      "version": "v0.32.0"
+    },
+    {
+      "license": "MIT",
+      "license_file": "ThirdPartyLicenses/runtime-go-modules-LICENSES.txt",
+      "module": "github.com/ncruces/julianday",
+      "name": "SQLite Julian day helpers",
+      "selector": "github.com/ncruces/julianday@v1.0.0",
+      "usage": "go-module",
+      "version": "v1.0.0"
+    },
+    {
+      "license": "Apache-2.0",
+      "license_file": "ThirdPartyLicenses/runtime-go-modules-LICENSES.txt",
+      "module": "github.com/tetratelabs/wazero",
+      "name": "WebAssembly runtime",
+      "selector": "github.com/tetratelabs/wazero@v1.11.0",
+      "usage": "go-module",
+      "version": "v1.11.0"
+    },
+    {
+      "license": "BSD-3-Clause",
+      "license_file": "ThirdPartyLicenses/runtime-go-modules-LICENSES.txt",
+      "module": "golang.org/x/sys",
+      "name": "Runtime system-call support",
+      "selector": "golang.org/x/sys@v0.41.0",
+      "usage": "go-module",
+      "version": "v0.41.0"
     }
   ],
   "policy": "go-modules-ci-actions-and-test-tools",
