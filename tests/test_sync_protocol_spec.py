@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PROTOCOL_ROOT = ROOT / "protocol" / "v1"
 SCHEMA_ROOT = PROTOCOL_ROOT / "schemas"
 FIXTURE_ROOT = PROTOCOL_ROOT / "fixtures"
+CONFORMANCE_ROOT = PROTOCOL_ROOT / "conformance"
 
 EXPECTED_ROUTES = {
     "/v1/healthz",
@@ -920,6 +921,8 @@ class SyncProtocolSpecTests(unittest.TestCase):
             path.name: read_json(path)
             for path in sorted(FIXTURE_ROOT.glob("*.json"))
         }
+        cls.approved_profile = read_json(CONFORMANCE_ROOT / "approved-profile.json")
+        cls.kat_evidence = read_json(CONFORMANCE_ROOT / "kat-evidence.json")
 
     def test_every_protocol_artifact_is_valid_duplicate_free_json(self) -> None:
         json_paths = sorted(PROTOCOL_ROOT.rglob("*.json"))
@@ -987,16 +990,28 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertGreaterEqual(non_null_revision_authenticator_count, 5)
         self.assertGreaterEqual(marker_count, 4)
 
-    def test_review_status_is_unambiguous_and_does_not_claim_approval(self) -> None:
-        self.assertIn("not approved for implementation or release", self.protocol_text)
-        self.assertIn("REVIEW-PENDING", self.protocol_text)
-        self.assertIn("Tom review required", self.threat_text)
-        self.assertNotIn("Tom approved", self.protocol_text)
-        self.assertNotIn("Tom approved", self.threat_text)
+    def test_owner_approval_and_conformance_status_are_unambiguous(self) -> None:
+        self.assertIn("owner-approved profile", self.protocol_text)
+        self.assertIn("independent conformance verified", self.protocol_text)
+        self.assertIn("owner-approved threat profile", self.threat_text)
+        self.assertNotIn("REVIEW-PENDING", self.protocol_text)
+        self.assertNotIn("review-pending", self.threat_text)
         crypto = self.fixtures["crypto-review-vectors.json"]
-        self.assertEqual(crypto["status"], "tom-review-required-no-expected-outputs")
-        self.assertTrue(all(value is None for value in crypto["expected"].values()))
-        self.assertIn("before removing review-pending status", crypto["exit_condition"])
+        self.assertEqual(
+            crypto["status"],
+            "owner-approved-independent-swift-go-verified",
+        )
+        self.assertTrue(
+            all(value is not None for value in crypto["expected"].values())
+        )
+        self.assertIn("Satisfied on 2026-08-01", crypto["exit_condition"])
+        self.assertEqual(self.approved_profile["status"], "owner-approved")
+        self.assertEqual(
+            self.approved_profile["approved_commit"],
+            "1a4951947efbef1827b1fcba4be89a7781405c5d",
+        )
+        self.assertEqual(self.kat_evidence["status"], "verified")
+        self.assertEqual(self.kat_evidence["result"], "byte-for-byte-match")
 
     def test_locked_boundaries_and_key_quarantine_invariant_are_present(self) -> None:
         normalized_protocol = re.sub(r"\s+", " ", self.protocol_text)
@@ -1688,7 +1703,41 @@ class SyncProtocolSpecTests(unittest.TestCase):
             crypto["expected"],
         )
         self.assertIn("authorized_superseding_record_ad_hex", crypto["expected"])
-        self.assertTrue(all(value is None for value in crypto["expected"].values()))
+        expected = crypto["expected"]
+        self.assertTrue(all(value is not None for value in expected.values()))
+        for field in (
+            "base_wrap_key_hex",
+            "passphrase_material_hex",
+            "passphrase_wrap_key_hex",
+            "record_key_hex",
+            "collection_witness_key_hex",
+        ):
+            self.assertEqual(len(bytes.fromhex(expected[field])), 32)
+        for field in ("base_wrapped_vmk_hex", "passphrase_wrapped_vmk_hex"):
+            self.assertEqual(len(bytes.fromhex(expected[field])), 48)
+        self.assertEqual(
+            len(
+                decode_base64url(
+                    expected[
+                        "authorized_collection_witness_authenticator_base64url"
+                    ]
+                )
+            ),
+            32,
+        )
+        plaintext_length = len(
+            bytes.fromhex(crypto["inputs"]["record_plaintext_utf8_hex"])
+        )
+        for field in (
+            "initial_live_record_ciphertext_hex",
+            "authorized_superseding_record_ciphertext_hex",
+        ):
+            self.assertEqual(
+                len(bytes.fromhex(expected[field])), plaintext_length + 16
+            )
+        self.assertEqual(expected["tampered_ad_result"], "authentication_failed")
+        self.assertEqual(expected["wrong_passphrase_result"], "authentication_failed")
+        self.assertTrue(expected["rewrap_preserves_vmk"])
         record_cases = crypto["inputs"]["record_cases"]
         initial_live = record_cases["initial_live_null_authorization"]
         self.assertEqual(initial_live["collection_witness_authenticator_kind"], 0)
@@ -2759,7 +2808,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
         fixture = self.fixtures["secure-enclave-identity.json"]
         self.assertEqual(
             fixture["status"],
-            "review-pending-executable-public-only-secure-enclave-fixture",
+            "owner-approved-executable-public-only-secure-enclave-fixture",
         )
         canonical = fixture["canonical_identity"]
         external_roots = {"wire.schema.json": self.wire}
@@ -2903,7 +2952,7 @@ class SyncProtocolSpecTests(unittest.TestCase):
         fixture = self.fixtures["software-identity-keys.json"]
         self.assertEqual(
             fixture["status"],
-            "review-pending-executable-software-identity-key-fixture",
+            "owner-approved-executable-software-identity-key-fixture",
         )
         self.assertRegex(
             openssl_transform(["version"], b"").decode("ascii"),

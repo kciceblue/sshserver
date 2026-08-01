@@ -3,11 +3,18 @@ Copyright 2026 Hengyu Xu
 
 This product is licensed under the Apache License, Version 2.0.
 
-No third-party runtime or build dependencies are distributed at this scaffold
-stage. External GitHub Actions used by CI are recorded in DEPENDENCIES.json
-and are not redistributed by this repository.
+The independent Go cryptographic conformance implementation uses
+golang.org/x/crypto v0.54.0 and golang.org/x/sys v0.47.0. Its complete Go
+module graph also inventories golang.org/x/net v0.56.0, golang.org/x/term
+v0.45.0, and golang.org/x/text v0.40.0. These modules are copyright The Go
+Authors and licensed under the BSD 3-Clause License; their complete license
+texts are in ThirdPartyLicenses/.
 
-The protocol conformance tests invoke a system-provided OpenSSL 3 command-line
-tool (Apache-2.0) to strictly parse, validate, canonically re-encode, and derive
-the public halves of software-identity and public-only Secure Enclave identity
-fixtures. OpenSSL is not linked into or redistributed by this repository.
+External GitHub Actions used by CI are recorded in DEPENDENCIES.json and are
+not redistributed by this repository.
+
+The protocol conformance tests invoke an explicitly selected OpenSSL 3.6.3
+command-line tool (Apache-2.0) for Argon2id and to strictly parse, validate,
+canonically re-encode, and derive the public halves of software-identity and
+public-only Secure Enclave identity fixtures. OpenSSL is not linked into or
+redistributed by this repository.

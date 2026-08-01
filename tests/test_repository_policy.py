@@ -85,6 +85,13 @@ class RepositoryPolicyTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
+        self.assertIn("uses: actions/setup-go@v6", workflow)
+        self.assertIn("go-version-file: go.mod", workflow)
+        self.assertIn("fetch-depth: 0", workflow)
+        self.assertIn("runs-on: macos-15", workflow)
+        self.assertIn("brew install openssl@3", workflow)
+        self.assertIn("run: make kat", workflow)
+        self.assertIn("needs: [policy, crypto_kat]", workflow)
         self.assertIn("pull_request_number:", workflow)
         self.assertIn('context="Repository policy"', workflow)
         self.assertIn("statuses: write", workflow)

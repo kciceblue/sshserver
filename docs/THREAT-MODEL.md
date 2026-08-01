@@ -1,11 +1,13 @@
 # Sync threat model
 
-Status: **task 2.0 review draft — Tom review required**
+Status: **task 2.0 owner-approved threat profile — conformance verified**
 
-This document analyzes the proposed V1 contract in
-[`SYNC-PROTOCOL.md`](../SYNC-PROTOCOL.md). Locked product boundaries are
-distinguished from review-pending protocol and cryptographic choices. It does
-not claim that the proposed crypto profile has been approved or implemented.
+This document analyzes the owner-approved V1 contract in
+[`SYNC-PROTOCOL.md`](../SYNC-PROTOCOL.md). The exact approval revision and
+independent Swift/Go evidence are recorded in
+[`protocol/v1/conformance/`](../protocol/v1/conformance/). Approval of this
+threat profile does not claim that downstream server or client implementation
+tasks are complete.
 
 ## 1. Assets
 
@@ -100,8 +102,8 @@ but cannot erase data or keys already present on that device.
    to deltas without a pagination gap, resurrection window, or reusable
    retired identity.
 
-These goals become claims only after Tom approves the exact construction and
-the Swift and Go conformance suites pass reviewed vectors.
+These goals are approved protocol claims: Tom approved the exact construction,
+and the independent Swift and Go conformance suites pass the reviewed vectors.
 
 ## 4. Explicit non-goals
 
@@ -148,7 +150,7 @@ V1 does not protect against:
 | Lost one device | Other device or verified SSH path survives | Revoke token. Secure Enclave key on lost device is unrecoverable and must be replaced. |
 | Lost host, surviving device | Surviving client has VMK and a completed snapshot containing every sibling/tombstone/vector/nullable authorization, both source generations, each non-null monotonic marker witness tuple, and the complete source device registry at cut C | Verify AEAD, every non-null revision authorization, and every marker HMAC client-side; preserve instance/vault IDs, take checked independent successors, rewrap the same VMK, atomically import exact opaque revisions/markers/device IDs, rebuild cursor floor C while reserving enrollment, re-verify from the activated destination, and never sync the abandoned fork. Projection-only, marker-incomplete, inferred-registry, capacity-exhausted, or cryptographically invalid recovery fails closed. |
 | Lost instance secret, surviving device | Client still holds VMK | Create a new secret and conditionally rewrap. Never replace secret without a device-held VMK. |
-| Lost passphrase, surviving device | Device already holds VMK | After local authorization, set a new passphrase envelope. This proposed recovery requires Tom approval. |
+| Lost passphrase, surviving device | Device already holds VMK | After local authorization, set a new passphrase envelope under the owner-approved recovery profile. |
 | Lost all devices, base mode | Host secret plus envelope can unwrap VMK | Enroll through verified SSH. Software identities recover; Secure Enclave private keys do not. |
 | Lost all devices, passphrase mode | Host alone cannot unwrap VMK | Enroll through SSH and supply passphrase. Losing passphrase too is intentionally unrecoverable. |
 | Partial or path-aliased backup/restore | Manifest, checksum, schema, IDs, file-mode, fixed canonical path allowlist, and persistent collection-marker count validation fail before extraction | Keep old instance untouched; restore only into isolation. Require exact ASCII `config.json`, `instance-secret`, and `sync.db` once each, reject case aliases and unlisted archive members, and never reconstruct or omit marker frontiers. |
@@ -201,8 +203,9 @@ the private key, requires an exact match, and recomputes the exact OpenSSH
 SHA-256 fingerprint over the key-kind-bound `ssh-ed25519` or `ssh-rsa` public
 blob. An empty, malformed, non-canonical, wrong-kind, mismatched-key, or
 fingerprint-mismatched record is rejected without a Keychain or local-custody
-mutation. The encoding and fingerprint contract, export/import implementation,
-local authorization, and Keychain access policy remain review-pending.
+mutation. The encoding and fingerprint contract, export/import behavior, local
+authorization, and Keychain access policy are owner-approved; runtime evidence
+remains a downstream client task.
 
 ### 7.2 Secure Enclave identities
 
@@ -214,8 +217,8 @@ wrong-length, wrong-prefix, off-curve, non-canonical, and fingerprint-mismatched
 values are rejected before local state or custody changes. Other devices
 display an unavailable placeholder and must not imply the private key was
 backed up. Device loss means replacement and remote reauthorization, not key
-recovery. This validation and the local custody boundary remain Tom-review
-gates.
+recovery. This validation and the local custody boundary are owner-approved;
+runtime evidence remains a downstream client task.
 
 ### 7.3 Deletion authority
 
@@ -284,9 +287,9 @@ The implementation must eventually demonstrate:
 - crash/restart tests at each durable state-machine boundary; and
 - no server vault-crypto dependency or private-key parser.
 
-## 10. Tom review checklist
+## 10. Owner review record
 
-Tom's recorded review must explicitly accept or revise:
+Tom's exact-revision approval recorded on 2026-08-01 accepts:
 
 1. HTTP/1.1 JSON over SSH-forwarded loopback and the listener/limit profile.
 2. Random sizes, token/grant hashing, client-generated token model, scopes,
@@ -311,5 +314,6 @@ Tom's recorded review must explicitly accept or revise:
    successors, complete source-device reconstruction, reserved enrollment
    cursor/device capacity, and stale-after-collection reconstruction.
 
-Until those answers and exact conformance results are recorded, this threat
-model is a review artifact rather than a completed security claim.
+The durable approval link, reviewed source hashes, immutable input hash, and
+exact conformance results are recorded in
+`protocol/v1/conformance/approved-profile.json` and `kat-evidence.json`.

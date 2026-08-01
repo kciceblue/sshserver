@@ -1,7 +1,7 @@
 {
   "fixture_version": 1,
-  "status": "tom-review-required-no-expected-outputs",
-  "description": "The proposed construction inputs are frozen for review, but expected cryptographic values are intentionally absent until Tom approves the profile and independent Swift/Go implementations agree.",
+  "status": "owner-approved-independent-swift-go-verified",
+  "description": "Tom approved the immutable construction inputs at commit 1a4951947efbef1827b1fcba4be89a7781405c5d. The expected values below were retained only after independent Swift and Go implementations agreed byte-for-byte.",
   "proposed_suite": "jat-xchacha-hkdf-argon2id-draft2",
   "inputs": {
     "protocol_major": 1,
@@ -63,22 +63,22 @@
     "output_length": 32
   },
   "expected": {
-    "base_wrap_key_hex": null,
-    "base_envelope_ad_hex": null,
-    "base_wrapped_vmk_hex": null,
-    "passphrase_material_hex": null,
-    "passphrase_wrap_key_hex": null,
-    "passphrase_wrapped_vmk_hex": null,
-    "record_key_hex": null,
-    "collection_witness_key_hex": null,
-    "authorized_collection_witness_authenticator_base64url": null,
-    "initial_live_record_ad_hex": null,
-    "initial_live_record_ciphertext_hex": null,
-    "authorized_superseding_record_ad_hex": null,
-    "authorized_superseding_record_ciphertext_hex": null,
-    "tampered_ad_result": null,
-    "wrong_passphrase_result": null,
-    "rewrap_preserves_vmk": null
+    "base_wrap_key_hex": "a751ff484e4539cd3b7b5f584d58d19b34d1eef3eeb67b180497e4d94b58ca44",
+    "base_envelope_ad_hex": "000000184a4154207661756c7420656e76656c6f7065204144207631000100020000000000004000800000000000000100000000000040008000000000000002000000000000000100000000000000010000000020404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f0000000000000000000000000000000000000000",
+    "base_wrapped_vmk_hex": "0bf33482c247f7faabe8785d13b855fde37b77403c838c125ad16efb138043ff207ab9f13c2b609e98e48bf0adf12df6",
+    "passphrase_material_hex": "a29c4ea38608d37dbcb5ed97b7daec605420f0b632e57403e9411353577dca20",
+    "passphrase_wrap_key_hex": "a217029fe17fe60781d335d8cb6ffebe2cd761e614924856b28536efcbff4a86",
+    "passphrase_wrapped_vmk_hex": "902331e9f5467e4166910d58439bd4016eb2b2bab8e4f876407f3cb53d5d984aa4af59234027e5c992abbe601439cb65",
+    "record_key_hex": "c91052d5016457acd09dae7844738b493e8a3c1bafe71578974b5ae794fa93c4",
+    "collection_witness_key_hex": "1673c83f8c66796601810b53cb8939587bd9668c64fae53708fddf34bccffc29",
+    "authorized_collection_witness_authenticator_base64url": "AdMHmB2beIoRvsgYiolY9UH_AuwiaK9t3mivjX1FOJM",
+    "initial_live_record_ad_hex": "000000194a4154207265636f7264207265766973696f6e2041442076310001000200000000000040008000000000000001000000000000400080000000000000020000000000004000800000000000002000000000000040008000000000000021000000000000400080000000000000100000000000000001000100000100000000000040008000000000000010000000000000000100",
+    "initial_live_record_ciphertext_hex": "aafc55dcc6b319ea5990763086f7f5c48e5de89af74eb25cbefc5482a9079f70d3f93abd1b88aede32589e63b9c7389603edd13f725b5a739b92e77e7cba885fefbed867b8ecb2c2a97cbb967a4db40a24a5afa06106131d3556e38fe3f5b5f7b362114fab7886a806276d91137a1b7a564cf95e937d0200768648f8aab525b50ec78e8c053268ab8ccf8bc7c2ab30070b1578d264370409956e99bbec2ab4eea5f8f8969f685cccbbd0db8d59d9cf4be6a43d33cd707f504ae67ceb39f7e340daf812f15409cf",
+    "authorized_superseding_record_ad_hex": "000000194a4154207265636f7264207265766973696f6e204144207631000100020000000000004000800000000000000100000000000040008000000000000002000000000000400080000000000000200000000000004000800000000000002200000000000040008000000000000010000000000000000200010000010000000000004000800000000000001000000000000000020101d307981d9b788a11bec8188a8958f541ff02ec2268af6dde68af8d7d453893",
+    "authorized_superseding_record_ciphertext_hex": "551ced329da4d16354ada54eb455cc9d12d9217d6f9be2c839fde03d5ad7333702d0b58204d06da1174ab7e57208b64bdcb5f3aaeeab718d7f0a0ef40bd5c9eb87f3e2a6a7fb4bd6076f0b5e65736a843264a68d86847dd7ec74b7c6131f1d28dd0571512c39323da1d610c09b8d94b7840bfa6bdc6f3401bf28dba1cc8ec5a66bd40f6ffaea12f1dd5966d4b8fd3690e16014897af8e8c29fb1970f20822c53884ba06fd065d33ace3c4e7f83e2c06679d2f6bdf1573f03401b43b51c14ba4727b5e817a6c0a3",
+    "tampered_ad_result": "authentication_failed",
+    "wrong_passphrase_result": "authentication_failed",
+    "rewrap_preserves_vmk": true
   },
-  "exit_condition": "Replace every null under expected with independently verified reviewed values before removing review-pending status; the initial-live input authorization remains intentionally null."
+  "exit_condition": "Satisfied on 2026-08-01: every expected value is owner-reviewed and independently verified by Swift and Go; the initial-live input authorization remains intentionally null."
 }

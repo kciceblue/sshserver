@@ -12,6 +12,57 @@
       "name": "actions/checkout",
       "selector": "actions/checkout@v4",
       "usage": "ci-action"
+    },
+    {
+      "license": "MIT",
+      "name": "actions/setup-go",
+      "selector": "actions/setup-go@v6",
+      "usage": "ci-action"
+    },
+    {
+      "license": "BSD-3-Clause",
+      "license_file": "ThirdPartyLicenses/golang.org-x-crypto-LICENSE",
+      "module": "golang.org/x/crypto",
+      "name": "Go supplementary cryptography libraries",
+      "selector": "golang.org/x/crypto@v0.54.0",
+      "usage": "go-module",
+      "version": "v0.54.0"
+    },
+    {
+      "license": "BSD-3-Clause",
+      "license_file": "ThirdPartyLicenses/golang.org-x-net-LICENSE",
+      "module": "golang.org/x/net",
+      "name": "Go supplementary network libraries",
+      "selector": "golang.org/x/net@v0.56.0",
+      "usage": "go-module",
+      "version": "v0.56.0"
+    },
+    {
+      "license": "BSD-3-Clause",
+      "license_file": "ThirdPartyLicenses/golang.org-x-sys-LICENSE",
+      "module": "golang.org/x/sys",
+      "name": "Go supplementary system libraries",
+      "selector": "golang.org/x/sys@v0.47.0",
+      "usage": "go-module",
+      "version": "v0.47.0"
+    },
+    {
+      "license": "BSD-3-Clause",
+      "license_file": "ThirdPartyLicenses/golang.org-x-term-LICENSE",
+      "module": "golang.org/x/term",
+      "name": "Go terminal support libraries",
+      "selector": "golang.org/x/term@v0.45.0",
+      "usage": "go-module",
+      "version": "v0.45.0"
+    },
+    {
+      "license": "BSD-3-Clause",
+      "license_file": "ThirdPartyLicenses/golang.org-x-text-LICENSE",
+      "module": "golang.org/x/text",
+      "name": "Go text processing libraries",
+      "selector": "golang.org/x/text@v0.40.0",
+      "usage": "go-module",
+      "version": "v0.40.0"
     }
   ],
   "policy": "go-modules-and-ci-actions",

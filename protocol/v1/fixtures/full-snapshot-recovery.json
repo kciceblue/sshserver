@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-semantics",
+  "status": "owner-approved-semantics",
   "description": "Stable full-snapshot pagination retains both sides of an edit/delete conflict, every persistent collection frontier, and the complete source device registry, then transitions to deltas strictly after the cut cursor.",
   "create_request": {
     "protocol_version": "1",

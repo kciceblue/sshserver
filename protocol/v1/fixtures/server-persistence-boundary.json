@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-semantics",
+  "status": "owner-approved-semantics",
   "description": "The server durably retains the exact opaque authenticated revision bytes and bounded synchronization state needed for replay-safe deltas and stable snapshot reads, without decrypting, parsing, or retaining application plaintext or private-key material.",
   "permitted_persistence": {
     "record_revision": [

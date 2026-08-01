@@ -10,21 +10,20 @@ client and the canonical product plan live in separate repositories. The
 server implementation has not started yet; this scaffold establishes the
 licensing and contribution controls required before feature work begins.
 
-## Protocol review draft
+## Approved protocol profile
 
 Task 2.0's public [sync protocol](SYNC-PROTOCOL.md) and
-[threat model](docs/THREAT-MODEL.md) are review drafts. Their exact HTTP,
-credential, cryptographic, retention, and recovery profiles are deliberately
-marked **REVIEW-PENDING** and are not approved for implementation or release.
-Machine-readable schemas, OpenAPI, and non-cryptographic shape fixtures live in
-[`protocol/v1/`](protocol/v1/). The crypto fixture intentionally has no expected
-outputs until the owner review and independent Swift/Go verification required
-by the protocol are complete.
+[threat model](docs/THREAT-MODEL.md) define the owner-approved HTTP, credential,
+cryptographic, retention, and recovery profile. Machine-readable schemas,
+OpenAPI, and fixtures live in [`protocol/v1/`](protocol/v1/). The exact approval
+revision, frozen hashes, populated known-answer vectors, and independent
+Swift/Go byte-for-byte evidence are retained in
+[`protocol/v1/conformance/`](protocol/v1/conformance/).
 
-The draft does not start the server implementation. It preserves the locked
-boundaries that the server remains loopback-only, stores opaque client-encrypted
-records, performs no vault cryptography, parses no private keys, and is never
-installed on ordinary SSH targets.
+The approved specification does not start the server implementation. It
+preserves the locked boundaries that the server remains loopback-only, stores
+opaque client-encrypted records, performs no vault cryptography, parses no
+private keys, and is never installed on ordinary SSH targets.
 
 ## Development policy
 
@@ -33,6 +32,16 @@ Run the complete local policy suite before proposing a change:
 ```sh
 make check
 ```
+
+On macOS, reproduce both independent cryptographic implementations as well:
+
+```sh
+make kat
+```
+
+This requires the reviewed Homebrew `openssl@3` version 3.6.3, or an explicit
+absolute `JAT_OPENSSL_BIN` path to that exact provider. Stock macOS LibreSSL is
+not used.
 
 Only MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0, and ISC product/runtime
 dependencies and implementation inputs are permitted. Every Go module must be

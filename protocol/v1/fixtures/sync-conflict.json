@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-shape-only",
+  "status": "owner-approved-shape-only",
   "description": "Vector and conflict semantics. Ciphertexts are structural placeholders and are not valid AEAD outputs.",
   "record_id": "00000000-0000-4000-8000-000000000020",
   "device_a": "00000000-0000-4000-8000-000000000010",

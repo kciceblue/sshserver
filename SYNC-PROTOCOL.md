@@ -1,24 +1,25 @@
 # Just Another Terminal sync protocol
 
-Status: **task 2.0 review draft — not approved for implementation or release**
+Status: **task 2.0 owner-approved profile — independent conformance verified**
 
-This document is the proposed public contract between the Just Another
-Terminal client and its optional single-user sync server. It is deliberately
-precise so the Swift client and Go server can be implemented independently,
-but the items labelled **REVIEW-PENDING** remain subject to Tom's protocol and
-cryptography review. Until that review is recorded, this document is not a
-shipping cryptographic profile and task 2.0 is not complete.
+This document is the approved public contract between the Just Another
+Terminal client and its optional single-user sync server. Tom approved the
+exact P1-P6 profile at commit
+`1a4951947efbef1827b1fcba4be89a7781405c5d`; independent Swift and Go
+implementations then agreed byte-for-byte on the reviewed vectors. The durable
+approval, frozen source hashes, and conformance evidence live in
+`protocol/v1/conformance/`.
 
-The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY describe the behavior of
-this draft. They become normative only when the review-pending status is
-removed.
+The words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY describe normative V1
+behavior. Implementation and release evidence remain separate downstream
+tasks.
 
 ## 1. Status and decision boundary
 
 ### 1.1 Locked product constraints
 
 The following constraints are already locked by the canonical coordinator
-decisions and are not reopened by this draft:
+decisions and are not reopened by this specification:
 
 - **LOCKED — client-side encryption:** the client creates the random vault
   master key (VMK), encrypts records with XChaCha20-Poly1305, and creates the
@@ -41,24 +42,25 @@ decisions and are not reopened by this draft:
   concurrent values remain explicit conflicts, and tombstones are collected
   only after active-device acknowledgement or a documented retirement rule.
 
-### 1.2 Review-pending profile
+### 1.2 Approved V1 profile
 
-The following exact choices are a coherent proposal, not an approval:
+The following exact choices form the owner-approved V1 profile:
 
-| ID | Proposed V1 choice | Status |
+| ID | Approved V1 choice | Status |
 | --- | --- | --- |
-| P1 | HTTP/1.1 JSON over SSH-forwarded loopback TCP | **REVIEW-PENDING** |
-| P2 | 256-bit instance secret, VMK, enrollment grant, and device token | **REVIEW-PENDING** |
-| P3 | HKDF-SHA-256 domain separation plus XChaCha20-Poly1305 for VMK wrapping | **REVIEW-PENDING** |
-| P4 | Argon2id version `0x13` (decimal 19): 64 MiB, 3 iterations, parallelism 1, 32-byte output | **REVIEW-PENDING; device calibration required** |
-| P5 | Client-generated device tokens for retry-safe enrollment and rotation | **REVIEW-PENDING** |
-| P6 | The metadata, limits, retention, recovery, and last-device rules below | **REVIEW-PENDING** |
+| P1 | HTTP/1.1 JSON over SSH-forwarded loopback TCP | **APPROVED** |
+| P2 | 256-bit instance secret, VMK, enrollment grant, and device token | **APPROVED** |
+| P3 | HKDF-SHA-256 domain separation plus XChaCha20-Poly1305 for VMK wrapping | **APPROVED** |
+| P4 | Argon2id version `0x13` (decimal 19): 64 MiB, 3 iterations, parallelism 1, 32-byte output | **APPROVED; device calibration required** |
+| P5 | Client-generated device tokens for retry-safe enrollment and rotation | **APPROVED** |
+| P6 | The metadata, limits, retention, recovery, and last-device rules below | **APPROVED** |
 
-Implementations MUST NOT ship P1–P6 until Tom approves the exact profile and
-the fixtures in `protocol/v1/fixtures/crypto-review-vectors.json` contain
-independently verified cryptographic outputs.
+Implementations MUST preserve the exact approved P1-P6 profile and the
+independently verified outputs in
+`protocol/v1/fixtures/crypto-review-vectors.json`; any profile or vector change
+requires a new owner review and conformance record.
 
-The proposed wire suite is
+The approved wire suite is
 `jat-xchacha-hkdf-argon2id-draft2`, with numeric suite ID 2 in canonical
 associated data. It supersedes the never-shipped draft1 proposal because
 draft2 adds explicit nullable collection-witness authorization to record
@@ -112,11 +114,11 @@ V1 does not provide:
 IDs are independently generated UUID version 4 values. They are serialized as
 lowercase canonical UUID strings. Reuse of a retired `device_id` is forbidden.
 
-## 4. Wire encoding and limits — REVIEW-PENDING P1/P6
+## 4. Wire encoding and limits — APPROVED P1/P6
 
 ### 4.1 HTTP and JSON
 
-The proposed V1 endpoint is HTTP/1.1 on `127.0.0.1:37421` and `[::1]:37421`.
+The V1 endpoint is HTTP/1.1 on `127.0.0.1:37421` and `[::1]:37421`.
 The port MAY be configured, but every resolved listener address MUST be
 loopback. Startup MUST fail rather than bind a wildcard or non-loopback
 address. The client reaches the endpoint through an SSH local forward.
@@ -196,7 +198,7 @@ CSPRNG:
 
 - a UUIDv4 `instance_id`;
 - a UUIDv4 `vault_id`; and
-- a 32-byte `instance_secret` (**REVIEW-PENDING P2**).
+- a 32-byte `instance_secret` (**APPROVED P2**).
 
 The instance secret is stored separately from the ciphertext database in a
 regular file owned by the selected Unix account, mode `0600`. Its parent
@@ -253,9 +255,9 @@ The app treats host-key verification failure, malformed output, a changed
 `instance_id`, or a changed `vault_id` as blocking. It does not retry against a
 different host automatically.
 
-## 6. Enrollment and device tokens — REVIEW-PENDING P2/P5
+## 6. Enrollment and device tokens — APPROVED P2/P5
 
-The proposed retry-safe enrollment is client-token-generated:
+The retry-safe enrollment is client-token-generated:
 
 1. The client generates a new `device_id`, `enrollment_id`, and 32-byte device
    token with its CSPRNG.
@@ -329,7 +331,7 @@ An interrupted first enrollment may leave one active device and no envelope.
 The exact enrollment tuple remains retryable, and the administration CLI can
 revoke that device. Re-running installation never resets this state.
 
-The proposed hash is:
+The token hash is:
 
 ```text
 SHA-256(
@@ -419,7 +421,7 @@ can enroll only with a fresh SSH-created grant. Vault deletion is a separate
 explicit administration operation and is never implied by last-device
 revocation.
 
-## 7. Vault cryptography — REVIEW-PENDING P2/P3/P4
+## 7. Vault cryptography — APPROVED P2/P3/P4
 
 ### 7.1 Inputs
 
@@ -436,7 +438,7 @@ is a fatal local error; the client does not send the affected write.
 
 ### 7.2 Passphrase bytes
 
-The proposed client normalizes the user-entered passphrase to Unicode NFC,
+The client normalizes the user-entered passphrase to Unicode NFC,
 does not trim or case-fold it, and encodes it as UTF-8. The confirmation UI
 must compare normalized byte strings. Empty passphrases are rejected.
 
@@ -528,9 +530,9 @@ Enabling, changing, disabling, or recovering a passphrase rewraps the same VMK
 and leaves record ciphertext unchanged. A surviving device that already holds
 the VMK can replace a lost passphrase after local user authorization; the old
 passphrase is not cryptographically required. This recovery behavior and the
-warning for disabling passphrase mode require explicit Tom approval.
+warning for disabling passphrase mode are part of the owner-approved profile.
 
-## 8. Encrypted record revisions — REVIEW-PENDING P3/P6
+## 8. Encrypted record revisions — APPROVED P3/P6
 
 For each `record_id`, derive a record key:
 
@@ -745,7 +747,8 @@ RFC 4648 Base64 encoding of `SHA-256(public_key_blob)`. It is exactly 50 ASCII
 characters. The client MUST recompute it from the validated public key and
 require byte-for-byte equality before persistent Keychain import; the supplied
 value is never trusted as proof of correspondence. This fingerprint contract,
-export/import path, and local user authorization are **REVIEW-PENDING**.
+export/import path, and local user authorization are owner-approved; runtime
+implementation evidence remains a downstream client task.
 
 Restoration writes no plaintext key file. The client authorizes access,
 decrypts in memory, imports directly into device-only Keychain storage, and
@@ -770,8 +773,9 @@ trusted.
 
 The body MUST NOT contain a private key, wrapped private key, Keychain
 persistent reference, custody generation, or cleanup authority. The public-key
-encoding, parsing, fingerprint verification, and local custody behavior remain
-**REVIEW-PENDING** and require Tom's review before implementation or merge.
+encoding, parsing, fingerprint verification, and local custody behavior are
+owner-approved; runtime implementation evidence remains a downstream client
+task.
 
 On any device without the matching local key, this record is an unavailable
 device-bound placeholder. The UI must say that the private key was not backed
@@ -792,8 +796,8 @@ leading RFC 4251 key-type string, and require its ASCII bytes to equal
 selected by that declared algorithm to reject malformed or unsupported key
 parameters before persistence. This is client-side validation only; the sync
 server continues to store opaque ciphertext and never parses known-host data.
-The algorithm-specific parser behavior remains **REVIEW-PENDING** with Task
-2.0; this draft does not add a runtime crypto implementation. Task 1.6's
+The algorithm-specific parser behavior is owner-approved with Task 2.0; this
+specification does not add a runtime crypto implementation. Task 1.6's
 sync-ready known-host model and the eventual Task 2.3 sync import must preserve
 this shape.
 
@@ -923,7 +927,7 @@ other safe non-cursor operations remain available. Beginning an instance-secret
 rotation also preflights capacity for its required envelope replacement;
 exhaustion returns `server_cursor_exhausted` without creating a pending secret.
 
-The proposed minimum tombstone retention is 90 days of accumulated daemon
+The minimum tombstone retention is 90 days of accumulated daemon
 uptime. The server increments a durable per-candidate retention-age counter
 only from positive monotonic elapsed time while the daemon runs, checkpointing
 before collection. Restart downtime earns no age. Wall-clock jumps can alter
@@ -1053,7 +1057,7 @@ device must enroll with a fresh device ID. Its stale library is treated as an
 explicit import and cannot resurrect deleted data automatically. With no
 active devices, collection is frozen.
 
-## 11. API operations — REVIEW-PENDING P1/P5/P6
+## 11. API operations — APPROVED P1/P5/P6
 
 `protocol/v1/openapi.json` is the machine-readable route and object contract.
 The required operations are:
@@ -1177,7 +1181,7 @@ device ID, cut cursor, phase, and the next ordering key. Replaying a page token
 returns byte-equivalent JSON.
 At creation the server copies the envelope, collection markers, projected
 source-device entries, ordered membership keys, content addresses, and paging
-metadata into immutable snapshot metadata for the lease, proposed as 15
+metadata into immutable snapshot metadata for the lease, fixed at 15
 minutes of daemon monotonic uptime. It does not duplicate the full revision
 payload bytes per snapshot. Each revision membership entry retains a reference
 to the server's existing immutable, content-addressed revision object; the
@@ -1322,7 +1326,7 @@ The HMAC proves marker tuple integrity, not completeness or maximality. A newly
 recovered device with no external checkpoint cannot distinguish a coherent old
 backup or valid older marker from the latest state.
 
-## 14. Backup, restore, and lifecycle recovery — REVIEW-PENDING P6
+## 14. Backup, restore, and lifecycle recovery — APPROVED P6
 
 ### 14.1 Backup set
 
@@ -1501,7 +1505,7 @@ instance.
 
 ### 14.4 Instance-secret rotation
 
-The proposed crash-safe rotation is two phase:
+The crash-safe rotation is two phase:
 
 1. Through verified SSH, the CLI checks that both
    `instance_secret_generation` has a successor and the required envelope
@@ -1585,15 +1589,16 @@ that limitation rather than claiming traffic anonymity.
 
 ## 16. Conformance evidence and review exit
 
-Before this draft becomes approved:
+The Task 2.0 approval gate is satisfied as follows:
 
-1. Tom must approve P1–P6 and the threat guarantees in
-   `docs/THREAT-MODEL.md`.
-2. `crypto-review-vectors.json` must replace its shape-only outputs with
-   reviewed known-answer values for both modes, record encryption, wrong
-   passphrase, tampered associated data, and passphrase rewrap.
-3. Independent Swift and Go implementations must consume the same immutable
-   fixtures and agree byte-for-byte.
+1. Tom approved P1–P6 and the threat guarantees in
+   `docs/THREAT-MODEL.md` at the exact commit recorded in
+   `protocol/v1/conformance/approved-profile.json`.
+2. `crypto-review-vectors.json` contains reviewed known-answer values for both
+   modes, record encryption, wrong passphrase, tampered associated data, and
+   passphrase rewrap.
+3. Independent Swift and Go implementations consume the same immutable
+   fixtures and agree byte-for-byte; `make kat` reproduces that result.
 4. Wire fixtures must demonstrate enrollment retry, self-only token rotation,
    deterministic mutation order, sibling-complete snapshot pagination and delta
    transition, per-prior-sibling snapshot continuity without aggregate-vector
@@ -1614,5 +1619,5 @@ Before this draft becomes approved:
    `generation_exhausted` and no mutation, and reject a recovery source
    generation at `UInt64.max` before attempting its successor.
 7. The coordinator records the reviewed exact commits and evidence before task
-   2.0 is acknowledged. Until then task 2.1 and cryptographic implementation
-   remain downstream work.
+   2.0 is acknowledged. Task 2.1 and cryptographic implementation remain
+   downstream work; this approval does not claim they are implemented.

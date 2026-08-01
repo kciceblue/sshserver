@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "status": "verified",
+  "approved_profile_commit": "1a4951947efbef1827b1fcba4be89a7781405c5d",
+  "approved_profile_manifest_sha256": "9a97982aa35b414efeb42a8908260b8a83947621b333a8d64a3c5900ad3eb487",
+  "fixture": "protocol/v1/fixtures/crypto-review-vectors.json",
+  "fixture_sha256": "dc21f9ce7f881784636bf2569240a247e89d914d317c10116183d715548847fa",
+  "immutable_crypto_input_sha256": "ca6ae94cb8fc8ca110f650fecddcb5764ba5636de61cd1a791499060a774c1f0",
+  "expected_output_sha256": "da0c40c70d2527025e804cd7d819135929a71eacbcfe50368d2f2d7fafb1d4d7",
+  "implementations": {
+    "go": {
+      "path": "conformance/go/main.go",
+      "source_sha256": "acb6fa921a906f7d1eefb75f2baf24be7e79f9087e978365453815170bcafc0c",
+      "provider": "golang.org/x/crypto@v0.54.0",
+      "output_sha256": "da0c40c70d2527025e804cd7d819135929a71eacbcfe50368d2f2d7fafb1d4d7"
+    },
+    "swift": {
+      "path": "conformance/swift/CryptoKAT.swift",
+      "source_sha256": "7cdd7fe651881e52a26959d33e8bd09b86f5fbb7d6be275bc242094efd8bc114",
+      "provider": "CryptoKit + independent HChaCha20 + OpenSSL 3.6.3 Argon2id",
+      "output_sha256": "da0c40c70d2527025e804cd7d819135929a71eacbcfe50368d2f2d7fafb1d4d7"
+    }
+  },
+  "evidence_checker": {
+    "path": "scripts/check_crypto_kats.py",
+    "source_sha256": "7767bf94cc664095572ea81b2fe9bf2ab3414d7af37061e797ee78b6ecc9d331"
+  },
+  "go_dependency_file_sha256": {
+    "go.mod": "fb39e4470fa5e4ad2bc61347a0a39e88d34d4651da7fc02728601504c27e6094",
+    "go.sum": "35d90f337f5d66adb44fa40fa561bad727d28cb8bcb4ba3e5195f9fdacfe8507"
+  },
+  "openssl_provider": {
+    "license": "Apache-2.0",
+    "selection": "explicit JAT_OPENSSL_BIN or Homebrew openssl@3",
+    "usage": "Swift Argon2id conformance only; not linked or redistributed",
+    "version": "OpenSSL 3.6.3 9 Jun 2026 (Library: OpenSSL 3.6.3 9 Jun 2026)"
+  },
+  "negative_cases": {
+    "tampered_associated_data": "authentication_failed",
+    "wrong_passphrase": "authentication_failed"
+  },
+  "rewrap_preserves_vmk": true,
+  "result": "byte-for-byte-match"
+}

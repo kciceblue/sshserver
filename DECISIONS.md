@@ -39,7 +39,7 @@ public contribution.
 - **Rationale:** Sync must not turn device-bound or exportable user credentials into plaintext server data.
 - **Evidence:** Canonical decision D3, projected publicly by task 0.2; implementation evidence is required by tasks 2.1 through 2.3.
 - **Closing task:** 0.2 publishes the decision; cryptographic enforcement closes in client task 2.2.
-- **Task 2.0 draft:** The public [protocol](SYNC-PROTOCOL.md#9-encrypted-application-payload-registry) and [threat model](docs/THREAT-MODEL.md#7-key-custody-boundary) specify the non-exportable Secure Enclave boundary and remote-tombstone quarantine invariant. Exact cryptography and Keychain behavior remain review-pending.
+- **Task 2.0 evidence:** The owner-approved public [protocol](SYNC-PROTOCOL.md#9-encrypted-application-payload-registry), [threat model](docs/THREAT-MODEL.md#7-key-custody-boundary), and [exact-revision approval record](protocol/v1/conformance/approved-profile.json) specify the non-exportable Secure Enclave boundary and remote-tombstone quarantine invariant. Runtime client evidence remains a downstream task.
 
 Exportable private keys may reach the server only inside authenticated
 ciphertext. Device-bound private keys never reach the server; only their public
@@ -51,7 +51,7 @@ keys and non-secret metadata may be represented in synchronized records.
 - **Rationale:** The optional sync host should store opaque data and the minimum metadata needed for synchronization, while an optional user passphrase provides a stronger mode against host-only compromise.
 - **Evidence:** Canonical decision D4, projected publicly by task 0.2; the threat model and wire-level evidence close at 2.0 and 2.2.
 - **Closing task:** 0.2 publishes the decision; protocol details close at 2.0.
-- **Task 2.0 draft:** The public [protocol](SYNC-PROTOCOL.md#7-vault-cryptography--review-pending-p2p3p4), [threat model](docs/THREAT-MODEL.md#6-mode-guarantees), and [review fixtures](protocol/v1/fixtures/) make the proposed byte-level boundary inspectable. They are not completion evidence until Tom reviews the exact profile and independent implementations fill the known-answer vectors.
+- **Task 2.0 evidence:** The public [protocol](SYNC-PROTOCOL.md#7-vault-cryptography--approved-p2p3p4), [threat model](docs/THREAT-MODEL.md#6-mode-guarantees), [populated fixtures](protocol/v1/fixtures/), and [independent Swift/Go conformance evidence](protocol/v1/conformance/) close the exact byte-level profile gate at owner-approved commit `1a4951947efbef1827b1fcba4be89a7781405c5d`.
 
 Clients encrypt records and create the wrapped vault-key envelope. The server
 stores ciphertext, the wrapped envelope, and minimum synchronization metadata.
@@ -103,7 +103,7 @@ and must never be installed or required on ordinary SSH targets.
 - **Rationale:** Reusing a verified SSH connection avoids requiring a publicly exposed sync endpoint and anchors installation and enrollment to a host the user has selected.
 - **Evidence:** Canonical decision D10, projected publicly by task 0.2; protocol evidence closes at 2.0 and deployment evidence at 2.5.
 - **Closing task:** 0.2 publishes the decision; protocol details close at 2.0.
-- **Task 2.0 draft:** The public [bootstrap and transport contract](SYNC-PROTOCOL.md#5-installation-instance-state-and-ssh-bootstrap) and [OpenAPI draft](protocol/v1/openapi.json) restrict V1 to a loopback endpoint reached through verified SSH. HTTP/JSON and its exact limits remain review-pending.
+- **Task 2.0 evidence:** The owner-approved public [bootstrap and transport contract](SYNC-PROTOCOL.md#5-installation-instance-state-and-ssh-bootstrap), [OpenAPI contract](protocol/v1/openapi.json), and [approval record](protocol/v1/conformance/approved-profile.json) restrict V1 to a loopback endpoint reached through verified SSH and close its exact HTTP/JSON limit profile.
 
 Installation and enrollment occur through a verified SSH session. The service
 binds locally on the selected host, and normal sync reaches it through an SSH
@@ -115,7 +115,7 @@ forward by default. A public sync port is not required.
 - **Rationale:** Sync may carry restorable software-backed identities without implying that device-bound private keys are exportable.
 - **Evidence:** Canonical decision D12, projected publicly by task 0.2; record-shape and cryptographic evidence close at 2.2 and 2.3.
 - **Closing task:** 0.2 publishes the decision; client enforcement closes at 2.2.
-- **Task 2.0 draft:** The allowlisted [encrypted payload schema](protocol/v1/schemas/encrypted-payload.schema.json) excludes Secure Enclave private material and device-local custody authority. Software-private-key encoding and local export/import authorization remain review-pending.
+- **Task 2.0 evidence:** The owner-approved [encrypted payload schema](protocol/v1/schemas/encrypted-payload.schema.json), [identity contract](SYNC-PROTOCOL.md#9-encrypted-application-payload-registry), and [approval record](protocol/v1/conformance/approved-profile.json) exclude Secure Enclave private material and device-local custody authority. Runtime export/import evidence remains a downstream client task.
 
 Software-backed private keys may be synchronized only as authenticated
 ciphertext. Device-bound identities synchronize only their public key and

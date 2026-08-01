@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-shape-only",
+  "status": "owner-approved-shape-only",
   "description": "Deterministic wire-shape fixture. All-zero test credentials are intentionally non-random and MUST NOT be used as cryptographic known-answer values or production secrets.",
   "ssh_bootstrap": {
     "protocol_version": "1",

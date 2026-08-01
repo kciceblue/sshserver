@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-executable-public-only-secure-enclave-fixture",
+  "status": "owner-approved-executable-public-only-secure-enclave-fixture",
   "description": "Deterministic public-only P-256 identity fixture. The public point was generated and validated locally with the Apache-2.0 OpenSSL CLI; no private key is committed.",
   "canonical_identity": {
     "payload_version": 1,

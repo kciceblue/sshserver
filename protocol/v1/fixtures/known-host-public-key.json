@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-client-known-host-validation",
+  "status": "owner-approved-client-known-host-validation",
   "description": "Known-host public-key blobs are canonical base64url-encoded complete SSH public-key blobs. The decoded RFC 4251 key-type string must exactly match key_algorithm before the client runs the declared algorithm's public-key parser and persists the decrypted record.",
   "canonical_payload": {
     "payload_version": 1,

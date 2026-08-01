@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-semantics",
+  "status": "owner-approved-semantics",
   "device_id": "00000000-0000-4000-8000-000000000003",
   "token_rotation": {
     "rotation_id": "00000000-0000-4000-8000-000000000031",

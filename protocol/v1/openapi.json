@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Just Another Terminal Sync API",
-    "version": "1.0.0-review-draft",
-    "description": "Task 2.0 review-pending API. It is reachable only through an SSH-forwarded loopback listener and is not approved for shipping."
+    "version": "1.0.0",
+    "description": "Owner-approved Task 2.0 API contract. It is reachable only through an SSH-forwarded loopback listener; runtime implementation and release evidence remain downstream tasks."
   },
   "x-jat-error-status-map": {
     "invalid_request": 400,

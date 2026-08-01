@@ -1,7 +1,7 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-shape-only",
-  "description": "Envelope shape and generation/CAS cases. wrapped_vmk values are placeholders, not valid XChaCha20-Poly1305 outputs.",
+  "status": "owner-approved-shape-only",
+  "description": "Approved envelope shape and generation/CAS cases. wrapped_vmk values remain shape placeholders; reviewed XChaCha20-Poly1305 outputs live in crypto-review-vectors.json.",
   "base_mode": {
     "expected_generation": "0",
     "new_generation": "1",

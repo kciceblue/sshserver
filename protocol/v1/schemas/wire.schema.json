@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/kciceblue/sshserver/protocol/v1/schemas/wire.schema.json",
   "title": "Just Another Terminal sync protocol V1 wire objects",
-  "description": "Review-pending task 2.0 schema. It is not an approved shipping crypto profile.",
+  "description": "Owner-approved Task 2.0 wire schema; runtime implementation and release evidence remain downstream tasks.",
   "$defs": {
     "uuid": {
       "type": "string",

@@ -1,5 +1,5 @@
 {
-  "status": "review-pending-executable-software-identity-key-fixture",
+  "status": "owner-approved-executable-software-identity-key-fixture",
   "description": "Executable canonical encoding and private/public correspondence fixtures. These values exercise the review artifact only and do not approve the Keychain import implementation.",
   "canonical_identities": {
     "ed25519": {

@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-semantics",
+  "status": "owner-approved-semantics",
   "strategy": "identity_preserving_recovery",
   "description": "V1 preserves instance and vault IDs so every authenticated revision, persistent collection frontier, and source device identity can be imported without weakening a tombstone barrier or reusing an old device ID. A migration to new IDs would require full decrypt and re-encrypt and is intentionally not implied by host recovery.",
   "source_completed_snapshot": {

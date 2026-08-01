@@ -1,6 +1,6 @@
 {
   "fixture_version": 1,
-  "status": "review-pending-schema-semantics",
+  "status": "owner-approved-schema-semantics",
   "description": "Forward profiles require a usable destination for local and remote forwarding, while dynamic forwarding carries no ignored destination fields.",
   "canonical_payloads": {
     "local": {
