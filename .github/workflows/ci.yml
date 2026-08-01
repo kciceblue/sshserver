@@ -83,10 +83,64 @@ jobs:
       - name: Reproduce independent Swift and Go vectors
         run: make kat
 
+  runtime_matrix:
+    name: Runtime ${{ matrix.goos }} ${{ matrix.goarch }}
+    needs: policy
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact validated revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.policy.outputs.validated_head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.policy.outputs.validated_head_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - name: Set up Go from the reviewed runtime manifest
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: runtime/go.mod
+          cache-dependency-path: runtime/go.sum
+      - name: Build and execute the native single-file runtime
+        env:
+          RUNTIME_VERSION: ${{ needs.policy.outputs.validated_head_sha }}
+        run: |
+          make runtime-build-one RUNTIME_GOOS=${{ matrix.goos }} RUNTIME_GOARCH=${{ matrix.goarch }} VERSION="$RUNTIME_VERSION"
+          python3 scripts/check_runtime_release.py \
+            --dist dist \
+            --version "$RUNTIME_VERSION" \
+            --target ${{ matrix.goos }}/${{ matrix.goarch }} \
+            --execute-native
+      - name: Verify the macOS user service through an SSH tunnel
+        if: runner.os == 'macOS'
+        env:
+          JAT_RUNTIME_SERVICE_BINARY: ${{ github.workspace }}/dist/sshserver-${{ matrix.goos }}-${{ matrix.goarch }}
+        run: go test -mod=readonly -run '^TestRuntimeUserServiceSSHTunnel$' -v ./integration
+
   report:
     name: Publish repository-policy status
     if: always() && inputs.pull_request_number > 0
-    needs: [policy, crypto_kat]
+    needs: [policy, crypto_kat, runtime_matrix]
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
@@ -98,6 +152,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pull_request_number }}
           POLICY_RESULT: ${{ needs.policy.result }}
           KAT_RESULT: ${{ needs.crypto_kat.result }}
+          RUNTIME_RESULT: ${{ needs.runtime_matrix.result }}
           VALIDATED_HEAD_SHA: ${{ needs.policy.outputs.validated_head_sha }}
         run: |
           set -euo pipefail
@@ -105,10 +160,10 @@ jobs:
           current_head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)"
           test "$current_head_sha" = "$VALIDATED_HEAD_SHA"
           state=failure
-          description="Manual repository policy or crypto KAT failed"
-          if [ "$POLICY_RESULT" = success ] && [ "$KAT_RESULT" = success ]; then
+          description="Manual policy, crypto KAT, or runtime matrix failed"
+          if [ "$POLICY_RESULT" = success ] && [ "$KAT_RESULT" = success ] && [ "$RUNTIME_RESULT" = success ]; then
             state=success
-            description="Manual repository policy and crypto KAT passed"
+            description="Manual policy, crypto KAT, and runtime matrix passed"
           fi
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${VALIDATED_HEAD_SHA}" \
             -f state="$state" \
