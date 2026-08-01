@@ -24,12 +24,31 @@ import (
 
 const serviceLabel = "com.kciceblue.sshserver"
 
+type runtimeStartMode string
+
+const (
+	runtimeUserService runtimeStartMode = "user-service"
+	runtimeForeground  runtimeStartMode = "foreground"
+)
+
 // TestRuntimeUserServiceSSHTunnel is an opt-in, native integration test. It
 // proves that the release binary runs under the native user service manager
-// and that /v1/healthz remains reachable only through an SSH local-forwarding
-// channel. Routine `go test ./...` runs compile this test but skip the service
-// mutation unless JAT_RUNTIME_SERVICE_BINARY names an exact native binary.
+// and that /v1/healthz remains reachable through an authenticated SSH
+// local-forwarding channel.
 func TestRuntimeUserServiceSSHTunnel(t *testing.T) {
+	testRuntimeSSHTunnel(t, runtimeUserService)
+}
+
+// TestRuntimeForegroundSSHTunnel proves the documented no-service-manager
+// fallback through the same authenticated SSH forwarding path. Routine
+// `go test ./...` runs compile both tests but skip process/service mutation
+// unless JAT_RUNTIME_SERVICE_BINARY names an exact native binary.
+func TestRuntimeForegroundSSHTunnel(t *testing.T) {
+	testRuntimeSSHTunnel(t, runtimeForeground)
+}
+
+func testRuntimeSSHTunnel(t *testing.T, startMode runtimeStartMode) {
+	t.Helper()
 	binary := os.Getenv("JAT_RUNTIME_SERVICE_BINARY")
 	if binary == "" {
 		t.Skip("set JAT_RUNTIME_SERVICE_BINARY to run the native service/tunnel test")
@@ -73,23 +92,31 @@ func TestRuntimeUserServiceSSHTunnel(t *testing.T) {
 	stateDir := filepath.Join(scratch, "state")
 	serverAddress := reserveLoopbackAddress(t)
 	run(t, binary, "init", "--state-dir", stateDir, "--listen", serverAddress)
-	serviceFile := filepath.Join(scratch, serviceLabel+serviceSuffix())
-	run(
-		t,
-		binary,
-		"service",
-		"install",
-		"--platform",
-		runtime.GOOS,
-		"--binary",
-		binary,
-		"--state-dir",
-		stateDir,
-		"--output",
-		serviceFile,
-	)
 
-	managed := startUserService(t, binary, stateDir, serviceFile)
+	var managed managedService
+	switch startMode {
+	case runtimeUserService:
+		serviceFile := filepath.Join(scratch, serviceLabel+serviceSuffix())
+		run(
+			t,
+			binary,
+			"service",
+			"install",
+			"--platform",
+			runtime.GOOS,
+			"--binary",
+			binary,
+			"--state-dir",
+			stateDir,
+			"--output",
+			serviceFile,
+		)
+		managed = startUserService(t, binary, stateDir, serviceFile)
+	case runtimeForeground:
+		managed = startForegroundFallback(t, binary, stateDir)
+	default:
+		t.Fatalf("unsupported runtime start mode %q", startMode)
+	}
 	waitForHealth(t, binary, serverAddress, 15*time.Second)
 	if err := managed.assertRunning(); err != nil {
 		t.Fatal(err)
