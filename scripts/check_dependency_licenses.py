@@ -14,6 +14,14 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_NAME = "DEPENDENCIES.json"
+INVENTORY_SCHEMA_VERSION = 2
+INVENTORY_POLICY = "go-modules-ci-actions-and-test-tools"
+REQUIRED_TEST_TOOLS = {
+    "system:openssl@3": {
+        "command": "openssl",
+        "version_pattern": r"^OpenSSL 3\.[0-9]",
+    }
+}
 ALLOWED_LICENSES = frozenset(
     {"Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT"}
 )
@@ -117,12 +125,13 @@ def validate_repository(
             errors.append(f"{INVENTORY_NAME}: root value must be an object")
         return errors
 
-    if inventory.get("schema_version") != 1:
-        errors.append(f"{INVENTORY_NAME}: schema_version must be 1")
-    if inventory.get("policy") != "go-modules-and-ci-actions":
+    if inventory.get("schema_version") != INVENTORY_SCHEMA_VERSION:
         errors.append(
-            f"{INVENTORY_NAME}: policy must be go-modules-and-ci-actions"
+            f"{INVENTORY_NAME}: schema_version must be "
+            f"{INVENTORY_SCHEMA_VERSION}"
         )
+    if inventory.get("policy") != INVENTORY_POLICY:
+        errors.append(f"{INVENTORY_NAME}: policy must be {INVENTORY_POLICY}")
 
     configured_allowlist = inventory.get("allowed_licenses")
     if (
@@ -167,7 +176,7 @@ def validate_repository(
                 f"{label} uses non-allowlisted license "
                 f"{license_id if license_id else '<missing>'}"
             )
-        if usage not in {"ci-action", "go-module"}:
+        if usage not in {"ci-action", "go-module", "test-tool"}:
             errors.append(f"{label} has unsupported usage {usage!r}")
             continue
 
@@ -206,6 +215,35 @@ def validate_repository(
                             errors.append(
                                 f"{label} license_file is too short to be a full license"
                             )
+        elif usage == "test-tool":
+            command = dependency.get("command")
+            version_pattern = dependency.get("version_pattern")
+            if not isinstance(command, str) or not command.strip():
+                errors.append(f"{label} has no non-empty command")
+            if not isinstance(version_pattern, str) or not version_pattern.strip():
+                errors.append(f"{label} has no non-empty version_pattern")
+            else:
+                if not version_pattern.startswith("^"):
+                    errors.append(f"{label} version_pattern must be start-anchored")
+                try:
+                    re.compile(version_pattern)
+                except re.error as error:
+                    errors.append(f"{label} version_pattern is invalid: {error}")
+            if dependency.get("redistributed") is not False:
+                errors.append(f"{label} test tool must declare redistributed=false")
+            required_tool = REQUIRED_TEST_TOOLS.get(selector)
+            if required_tool is None:
+                errors.append(f"{label} is not a recognized test-tool selector")
+            else:
+                if command != required_tool["command"]:
+                    errors.append(
+                        f"{label} command must be {required_tool['command']!r}"
+                    )
+                if version_pattern != required_tool["version_pattern"]:
+                    errors.append(
+                        f"{label} version_pattern must be "
+                        f"{required_tool['version_pattern']!r}"
+                    )
 
     discovered_actions: set[str] = set()
     workflow_directory = root / ".github" / "workflows"
@@ -324,6 +362,14 @@ def validate_repository(
             module = dependencies[selector].get("module")
             if isinstance(module, str) and module not in notice_text:
                 errors.append(f"NOTICE does not list Go module {module}")
+        listed_test_tools = {
+            selector
+            for selector, dependency in dependencies.items()
+            if dependency.get("usage") == "test-tool"
+        }
+        for selector in sorted(listed_test_tools):
+            if selector not in notice_text:
+                errors.append(f"NOTICE does not list test tool {selector}")
 
     return errors
 
@@ -350,9 +396,12 @@ def main(argv: list[str] | None = None) -> int:
     dependencies = inventory["dependencies"]
     action_count = sum(item["usage"] == "ci-action" for item in dependencies)
     module_count = sum(item["usage"] == "go-module" for item in dependencies)
+    test_tool_count = sum(item["usage"] == "test-tool" for item in dependencies)
+    test_tool_label = "tool" if test_tool_count == 1 else "tools"
     print(
         "dependency license policy: valid "
-        f"({module_count} Go modules, {action_count} CI actions)"
+        f"({module_count} Go modules, {action_count} CI actions, "
+        f"{test_tool_count} external test {test_tool_label})"
     )
     return 0
 

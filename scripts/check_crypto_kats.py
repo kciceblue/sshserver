@@ -440,6 +440,10 @@ def verify_evidence() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         ["merge-base", "--is-ancestor", APPROVED_BASE_COMMIT, APPROVED_COMMIT],
         label="approved base ancestry",
     )
+    run_git(
+        ["merge-base", "--is-ancestor", APPROVED_COMMIT, "HEAD"],
+        label="approved commit ancestry",
+    )
 
     approved_file_hashes = require_exact_hash_map(
         profile.get("approved_file_sha256"),

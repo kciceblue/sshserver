@@ -14,6 +14,15 @@ CHECKOUT = {
     "selector": "actions/checkout@v4",
     "usage": "ci-action",
 }
+SYSTEM_OPENSSL = {
+    "command": "openssl",
+    "license": "Apache-2.0",
+    "name": "System OpenSSL 3 command-line tool",
+    "redistributed": False,
+    "selector": "system:openssl@3",
+    "usage": "test-tool",
+    "version_pattern": r"^OpenSSL 3\.[0-9]",
+}
 
 
 class DependencyLicensePolicyTests(unittest.TestCase):
@@ -41,8 +50,8 @@ class DependencyLicensePolicyTests(unittest.TestCase):
                 "MIT",
             ],
             "dependencies": dependencies,
-            "policy": "go-modules-and-ci-actions",
-            "schema_version": 1,
+            "policy": "go-modules-ci-actions-and-test-tools",
+            "schema_version": 2,
         }
         (self.root / "DEPENDENCIES.json").write_text(
             json.dumps(payload), encoding="utf-8"
@@ -128,6 +137,54 @@ class DependencyLicensePolicyTests(unittest.TestCase):
         self.assertEqual(
             checker.validate_repository(self.root, go_modules_json=module_graph), []
         )
+
+    def test_valid_nonredistributed_test_tool_passes(self) -> None:
+        self.write_inventory([CHECKOUT, SYSTEM_OPENSSL])
+        (self.root / "NOTICE").write_text(
+            "Example server\nTest tool: system:openssl@3\n", encoding="utf-8"
+        )
+
+        self.assertEqual(checker.validate_repository(self.root), [])
+
+    def test_test_tool_requires_command_version_pattern_and_nonredistribution(self) -> None:
+        invalid = dict(SYSTEM_OPENSSL)
+        invalid["command"] = ""
+        invalid["version_pattern"] = "OpenSSL 3["
+        invalid["redistributed"] = True
+        self.write_inventory([CHECKOUT, invalid])
+        (self.root / "NOTICE").write_text(
+            "Example server\nTest tool: system:openssl@3\n", encoding="utf-8"
+        )
+
+        errors = checker.validate_repository(self.root)
+
+        self.assertTrue(any("non-empty command" in item for item in errors), errors)
+        self.assertTrue(any("start-anchored" in item for item in errors), errors)
+        self.assertTrue(any("version_pattern is invalid" in item for item in errors), errors)
+        self.assertTrue(any("redistributed=false" in item for item in errors), errors)
+
+    def test_test_tool_rejects_semantic_command_and_pattern_drift(self) -> None:
+        drifted = dict(SYSTEM_OPENSSL)
+        drifted["command"] = "printf"
+        drifted["version_pattern"] = "^"
+        self.write_inventory([CHECKOUT, drifted])
+        (self.root / "NOTICE").write_text(
+            "Example server\nTest tool: system:openssl@3\n", encoding="utf-8"
+        )
+
+        errors = checker.validate_repository(self.root)
+
+        self.assertTrue(any("command must be 'openssl'" in item for item in errors), errors)
+        self.assertTrue(
+            any("version_pattern must be" in item for item in errors), errors
+        )
+
+    def test_test_tool_must_be_named_in_notice(self) -> None:
+        self.write_inventory([CHECKOUT, SYSTEM_OPENSSL])
+
+        errors = checker.validate_repository(self.root)
+
+        self.assertTrue(any("NOTICE does not list test tool" in item for item in errors), errors)
 
     def test_non_allowlisted_go_module_license_fails(self) -> None:
         module_graph = self.add_go_fixture(license_id="GPL-2.0-only")

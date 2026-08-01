@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import copy
+import functools
 import hashlib
 import hmac
 import json
@@ -19,6 +20,9 @@ PROTOCOL_ROOT = ROOT / "protocol" / "v1"
 SCHEMA_ROOT = PROTOCOL_ROOT / "schemas"
 FIXTURE_ROOT = PROTOCOL_ROOT / "fixtures"
 CONFORMANCE_ROOT = PROTOCOL_ROOT / "conformance"
+SYSTEM_OPENSSL_SELECTOR = "system:openssl@3"
+SYSTEM_OPENSSL_COMMAND = "openssl"
+SYSTEM_OPENSSL_VERSION_PATTERN = r"^OpenSSL 3\.[0-9]"
 
 EXPECTED_ROUTES = {
     "/v1/healthz",
@@ -83,6 +87,67 @@ def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
             raise ValueError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
+
+
+@functools.lru_cache(maxsize=1)
+def system_openssl_test_tool() -> dict:
+    """Load the one inventoried PATH OpenSSL provider used by key tests."""
+    inventory = read_json(ROOT / "DEPENDENCIES.json")
+    matches = [
+        item
+        for item in inventory.get("dependencies", [])
+        if isinstance(item, dict) and item.get("selector") == SYSTEM_OPENSSL_SELECTOR
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"DEPENDENCIES.json must contain exactly one {SYSTEM_OPENSSL_SELECTOR}"
+        )
+    tool = matches[0]
+    expected_fields = {
+        "command",
+        "license",
+        "name",
+        "redistributed",
+        "selector",
+        "usage",
+        "version_pattern",
+    }
+    if set(tool) != expected_fields:
+        raise RuntimeError("system OpenSSL inventory field set changed")
+    if tool.get("usage") != "test-tool" or tool.get("license") != "Apache-2.0":
+        raise RuntimeError("system OpenSSL must be an Apache-2.0 test tool")
+    if tool.get("redistributed") is not False:
+        raise RuntimeError("system OpenSSL must not be redistributed")
+    command = tool.get("command")
+    version_pattern = tool.get("version_pattern")
+    if command != SYSTEM_OPENSSL_COMMAND:
+        raise RuntimeError("system OpenSSL inventory command changed")
+    if version_pattern != SYSTEM_OPENSSL_VERSION_PATTERN:
+        raise RuntimeError("system OpenSSL inventory version pattern changed")
+    try:
+        re.compile(version_pattern)
+    except re.error as error:
+        raise RuntimeError("system OpenSSL version pattern is invalid") from error
+    try:
+        version_result = subprocess.run(
+            [command, "version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("inventoried system OpenSSL command is unavailable") from error
+    if version_result.returncode != 0:
+        detail = version_result.stderr.strip()
+        raise RuntimeError(
+            detail or f"system OpenSSL version exited with {version_result.returncode}"
+        )
+    if re.search(version_pattern, version_result.stdout.strip()) is None:
+        raise RuntimeError(
+            "system OpenSSL provider does not match its inventoried version pattern"
+        )
+    return tool
 
 
 def assert_uuid_v4(test: unittest.TestCase, value: str) -> None:
@@ -232,10 +297,11 @@ def collection_witness_ad_component(authenticator: str | None) -> bytes:
 
 
 def openssl_transform(arguments: list[str], input_bytes: bytes) -> bytes:
-    """Run the Apache-2.0 OpenSSL CLI as an executable conformance parser."""
+    """Run the inventoried system OpenSSL CLI as a conformance parser."""
+    tool = system_openssl_test_tool()
     try:
         result = subprocess.run(
-            ["openssl", *arguments],
+            [tool["command"], *arguments],
             check=False,
             input=input_bytes,
             stdout=subprocess.PIPE,
@@ -923,6 +989,12 @@ class SyncProtocolSpecTests(unittest.TestCase):
         }
         cls.approved_profile = read_json(CONFORMANCE_ROOT / "approved-profile.json")
         cls.kat_evidence = read_json(CONFORMANCE_ROOT / "kat-evidence.json")
+
+    def test_key_fixture_openssl_provider_is_inventoried(self) -> None:
+        tool = system_openssl_test_tool()
+        version = openssl_transform(["version"], b"").decode("ascii").strip()
+        self.assertRegex(version, tool["version_pattern"])
+        self.assertIn(SYSTEM_OPENSSL_SELECTOR, (ROOT / "NOTICE").read_text())
 
     def test_every_protocol_artifact_is_valid_duplicate_free_json(self) -> None:
         json_paths = sorted(PROTOCOL_ROOT.rglob("*.json"))
@@ -2953,10 +3025,6 @@ class SyncProtocolSpecTests(unittest.TestCase):
         self.assertEqual(
             fixture["status"],
             "owner-approved-executable-software-identity-key-fixture",
-        )
-        self.assertRegex(
-            openssl_transform(["version"], b"").decode("ascii"),
-            r"^OpenSSL 3\.",
         )
         external_roots = {"wire.schema.json": self.wire}
         for name, payload in fixture["canonical_identities"].items():

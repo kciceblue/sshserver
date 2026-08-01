@@ -20,6 +20,15 @@
       "usage": "ci-action"
     },
     {
+      "command": "openssl",
+      "license": "Apache-2.0",
+      "name": "System OpenSSL 3 command-line tool",
+      "redistributed": false,
+      "selector": "system:openssl@3",
+      "usage": "test-tool",
+      "version_pattern": "^OpenSSL 3\\.[0-9]"
+    },
+    {
       "license": "BSD-3-Clause",
       "license_file": "ThirdPartyLicenses/golang.org-x-crypto-LICENSE",
       "module": "golang.org/x/crypto",
@@ -65,6 +74,6 @@
       "version": "v0.40.0"
     }
   ],
-  "policy": "go-modules-and-ci-actions",
-  "schema_version": 1
+  "policy": "go-modules-ci-actions-and-test-tools",
+  "schema_version": 2
 }
