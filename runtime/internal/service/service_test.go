@@ -10,7 +10,7 @@ import (
 
 func TestRenderServiceDefinitionsAreUserScopedAndSecretFree(t *testing.T) {
 	binary := "/Users/example/$HOME/bin/sshserver%stable"
-	stateDir := "/Users/example/Library/Application Support/JAT & Sync"
+	stateDir := "/Users/example/$STATE/Library/Application Support/JAT & Sync%tenant"
 	for _, platform := range []string{"linux", "darwin"} {
 		t.Run(platform, func(t *testing.T) {
 			payload, err := Render(platform, binary, stateDir)
@@ -37,11 +37,34 @@ func TestRenderServiceDefinitionsAreUserScopedAndSecretFree(t *testing.T) {
 				if !strings.Contains(text, "JAT &amp; Sync") {
 					t.Fatal("plist path was not XML escaped")
 				}
-			} else if !strings.Contains(text, "$$HOME") || !strings.Contains(text, "sshserver%%stable") {
-				t.Fatal("systemd expansion characters were not escaped")
+			} else {
+				execStart := lineWithPrefix(t, text, "ExecStart=")
+				readWritePaths := lineWithPrefix(t, text, "ReadWritePaths=")
+				if !strings.Contains(execStart, "$$HOME") ||
+					!strings.Contains(execStart, "sshserver%%stable") ||
+					!strings.Contains(execStart, "$$STATE") ||
+					!strings.Contains(execStart, "Sync%%tenant") {
+					t.Fatalf("systemd ExecStart expansion characters were not escaped: %s", execStart)
+				}
+				if !strings.Contains(readWritePaths, "/$STATE/") ||
+					strings.Contains(readWritePaths, "$$STATE") ||
+					!strings.Contains(readWritePaths, "Sync%%tenant") {
+					t.Fatalf("systemd ReadWritePaths used command-line escaping: %s", readWritePaths)
+				}
 			}
 		})
 	}
+}
+
+func lineWithPrefix(t *testing.T, text, prefix string) string {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	t.Fatalf("service definition lacks %s", prefix)
+	return ""
 }
 
 type xmlElement struct {

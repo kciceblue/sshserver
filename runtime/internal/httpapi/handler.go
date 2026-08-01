@@ -76,7 +76,7 @@ func New(settings config.Settings, readiness Readiness) (*Handler, error) {
 }
 
 func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
-	requestID := requestIDOrFallback(request.Header.Values("JAT-Request-ID"))
+	requestID := RequestIDOrFallback(request.Header.Values("JAT-Request-ID"))
 	if err := validateTransport(request); err != nil {
 		handler.writeError(response, http.StatusBadRequest, "invalid_request", false, requestID)
 		return
@@ -209,7 +209,10 @@ func requireEmptyBody(response http.ResponseWriter, request *http.Request) error
 	return nil
 }
 
-func requestIDOrFallback(values []string) string {
+// RequestIDOrFallback returns the sole canonical V4 request ID, or a fresh
+// identifier when the request cannot safely supply one. The server's bounded
+// request-head reader also uses this helper before net/http parses the request.
+func RequestIDOrFallback(values []string) string {
 	if len(values) == 1 {
 		if _, err := uuidv4.Parse(values[0]); err == nil {
 			return values[0]
@@ -223,9 +226,14 @@ func requestIDOrFallback(values []string) string {
 }
 
 func (handler *Handler) writeError(response http.ResponseWriter, status int, code string, retryable bool, requestID string) {
+	writeProtocolError(response, status, code, retryable, requestID)
+}
+
+func writeProtocolError(response http.ResponseWriter, status int, code string, retryable bool, requestID string) {
 	messages := map[string]string{
 		"invalid_request":      "The request did not match protocol version 1.",
 		"unsupported_protocol": "The requested protocol version is not supported.",
+		"limit_exceeded":       "The request exceeded a protocol limit.",
 		"internal_error":       "The service could not complete the request.",
 	}
 	writeJSON(response, status, errorEnvelope{Error: protocolError{
@@ -234,6 +242,12 @@ func (handler *Handler) writeError(response http.ResponseWriter, status int, cod
 		Retryable: retryable,
 		RequestID: requestID,
 	}})
+}
+
+// WriteLimitExceeded emits the V1 error contract for a request rejected by a
+// transport limit before the regular HTTP handler can validate it.
+func WriteLimitExceeded(response http.ResponseWriter, requestID string) {
+	writeProtocolError(response, http.StatusRequestEntityTooLarge, "limit_exceeded", false, requestID)
 }
 
 func writeJSON(response http.ResponseWriter, status int, value any) {

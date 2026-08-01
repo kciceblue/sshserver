@@ -38,11 +38,15 @@ func Render(platform, binary, stateDir string) ([]byte, error) {
 		return nil, errors.New("state directory must not be the filesystem root")
 	}
 	if platform == "linux" {
-		binaryArgument, err := quoteSystemd(binary)
+		binaryArgument, err := quoteSystemdExecArgument(binary)
 		if err != nil {
 			return nil, err
 		}
-		stateArgument, err := quoteSystemd(stateDir)
+		stateArgument, err := quoteSystemdExecArgument(stateDir)
+		if err != nil {
+			return nil, err
+		}
+		statePath, err := quoteSystemdPath(stateDir)
 		if err != nil {
 			return nil, err
 		}
@@ -53,7 +57,7 @@ func Render(platform, binary, stateDir string) ([]byte, error) {
 			stateArgument,
 		}, " ")
 		result := strings.ReplaceAll(systemdTemplate, "{{EXEC_START}}", execStart)
-		result = strings.ReplaceAll(result, "{{STATE_DIR}}", stateArgument)
+		result = strings.ReplaceAll(result, "{{STATE_DIR}}", statePath)
 		return []byte(result), nil
 	}
 	escape := func(value string) string {
@@ -80,7 +84,15 @@ func validPathText(value string) bool {
 	return true
 }
 
-func quoteSystemd(value string) (string, error) {
+func quoteSystemdExecArgument(value string) (string, error) {
+	return quoteSystemd(value, true)
+}
+
+func quoteSystemdPath(value string) (string, error) {
+	return quoteSystemd(value, false)
+}
+
+func quoteSystemd(value string, escapeDollar bool) (string, error) {
 	if !validPathText(value) {
 		return "", errors.New("systemd argument contains invalid text")
 	}
@@ -95,7 +107,11 @@ func quoteSystemd(value string) (string, error) {
 		case '%':
 			result.WriteString("%%")
 		case '$':
-			result.WriteString("$$")
+			if escapeDollar {
+				result.WriteString("$$")
+			} else {
+				result.WriteRune(character)
+			}
 		default:
 			result.WriteRune(character)
 		}

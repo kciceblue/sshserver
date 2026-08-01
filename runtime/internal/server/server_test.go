@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -63,15 +64,47 @@ func TestRequestHeadLimitAcceptsExactBoundaryAndRejectsOneByteMore(t *testing.T)
 		}
 	}()
 
-	if status := rawHeaderRequest(t, address, httpapi.MaxHeaderBytes); status != http.StatusOK {
-		t.Fatalf("exact-limit request status = %d", status)
+	response, body := rawHeaderRequest(t, address, httpapi.MaxHeaderBytes)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("exact-limit request status = %d", response.StatusCode)
 	}
-	if status := rawHeaderRequest(t, address, httpapi.MaxHeaderBytes+1); status < 400 {
-		t.Fatalf("over-limit request status = %d", status)
+	if len(body) == 0 {
+		t.Fatal("exact-limit response body is empty")
+	}
+
+	response, body = rawHeaderRequest(t, address, httpapi.MaxHeaderBytes+1)
+	if response.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("over-limit request status = %d, body = %s", response.StatusCode, body)
+	}
+	for name, want := range map[string]string{
+		"Content-Type":           "application/json; charset=utf-8",
+		"Cache-Control":          "no-store",
+		"X-Content-Type-Options": "nosniff",
+	} {
+		if got := response.Header.Get(name); got != want {
+			t.Fatalf("over-limit %s = %q, want %q", name, got, want)
+		}
+	}
+	var envelope struct {
+		Error struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Retryable bool   `json:"retryable"`
+			RequestID string `json:"request_id"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("decode over-limit body: %v", err)
+	}
+	if envelope.Error.Code != "limit_exceeded" ||
+		envelope.Error.Message != "The request exceeded a protocol limit." ||
+		envelope.Error.Retryable ||
+		envelope.Error.RequestID != "00000000-0000-4000-8000-000000000003" {
+		t.Fatalf("unexpected over-limit envelope: %+v", envelope.Error)
 	}
 }
 
-func rawHeaderRequest(t *testing.T, address string, size int) int {
+func rawHeaderRequest(t *testing.T, address string, size int) (*http.Response, []byte) {
 	t.Helper()
 	prefix := "GET /v1/healthz HTTP/1.1\r\n" +
 		"Host: " + address + "\r\n" +
@@ -98,15 +131,16 @@ func rawHeaderRequest(t *testing.T, address string, size int) int {
 	if _, err := io.WriteString(connection, request); err != nil {
 		t.Fatal(err)
 	}
-	statusLine, err := bufio.NewReader(connection).ReadString('\n')
+	response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: http.MethodGet})
 	if err != nil {
-		t.Fatalf("read response status: %v", err)
+		t.Fatalf("read response: %v", err)
 	}
-	var status int
-	if _, err := fmt.Sscanf(statusLine, "HTTP/1.1 %d", &status); err != nil {
-		t.Fatalf("parse response status %q: %v", statusLine, err)
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
 	}
-	return status
+	return response, body
 }
 
 func TestPartialListenerFailureRollsBackEarlierListener(t *testing.T) {
