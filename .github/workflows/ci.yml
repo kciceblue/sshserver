@@ -131,6 +131,10 @@ jobs:
             --version "$RUNTIME_VERSION" \
             --target ${{ matrix.goos }}/${{ matrix.goarch }} \
             --execute-native
+      - name: Verify foreground fallback through an SSH tunnel
+        env:
+          JAT_RUNTIME_SERVICE_BINARY: ${{ github.workspace }}/dist/sshserver-${{ matrix.goos }}-${{ matrix.goarch }}
+        run: go test -mod=readonly -run '^TestRuntimeForegroundSSHTunnel$' -v ./integration
       - name: Verify the macOS user service through an SSH tunnel
         if: runner.os == 'macOS'
         env:
