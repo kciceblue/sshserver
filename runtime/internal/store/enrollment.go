@@ -40,9 +40,6 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
-	if protocolErr := store.admitEnrollmentAttempt(call.Now); protocolErr != nil {
-		return api.Response{}, protocolErr
-	}
 
 	transaction, protocolErr := beginTransaction(ctx, store.db)
 	if protocolErr != nil {
@@ -77,6 +74,10 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 			return api.Response{}, protocolErr
 		}
 		return api.Response{Status: http.StatusOK, Body: response}, nil
+	}
+
+	if protocolErr := store.admitEnrollmentAttempt(call.Now); protocolErr != nil {
+		return api.Response{}, protocolErr
 	}
 
 	var enrollmentForDevice string

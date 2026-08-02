@@ -548,6 +548,60 @@ func TestReadinessUsesOneSnapshotAcrossConcurrentEnvelopeCommit(t *testing.T) {
 	}
 }
 
+func TestExactEnrollmentReplayBypassesNewAttemptRateLimit(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	for retry := 0; retry < 5; retry++ {
+		response, protocolErr := seed.opened.HandleAPI(context.Background(), seed.enrollment)
+		if protocolErr != nil || response.Status != http.StatusOK {
+			t.Fatalf("exact enrollment retry %d: response=%+v error=%v", retry+1, response, protocolErr)
+		}
+	}
+}
+
+func TestStartupRejectsRetainedChangeGap(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	two := EncodeUint64(2)
+	if _, err := seed.opened.db.Exec("DELETE FROM changes WHERE cursor = ?", two[:]); err != nil {
+		seed.opened.Close()
+		t.Fatal(err)
+	}
+	if err := seed.opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), seed.path, testIdentity)
+	if reopened != nil {
+		reopened.Close()
+	}
+	if !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "retained change cursor gap") {
+		t.Fatalf("retained change gap startup error=%v", err)
+	}
+}
+
+func TestSnapshotReferenceAcceptedAfterCutFailsClosed(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	four := EncodeUint64(4)
+	if _, err := seed.opened.db.Exec("UPDATE record_revisions SET change_cursor = ? WHERE revision_id = ?", four[:], seed.revisionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.opened.db.Exec("UPDATE runtime_state SET server_cursor = ? WHERE singleton = 1", four[:]); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	serverCursor, _, _, err := validatePersistentRuntime(ctx, seed.opened.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devices, err := validatePersistentDevices(ctx, seed.opened.db, serverCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, serverCursor); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot reference accepted after cut") {
+		t.Fatalf("post-cut snapshot reference error=%v", err)
+	}
+}
+
 func boundedSyncCall(seed boundedPersistenceSeed, requestID, afterCursor string, mutations []recordRevision) api.Request {
 	if mutations == nil {
 		mutations = []recordRevision{}

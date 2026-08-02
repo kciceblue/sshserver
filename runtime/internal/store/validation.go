@@ -849,6 +849,14 @@ func validatePersistentEnrollmentGrants(ctx context.Context, query schemaQueryer
 }
 
 func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverCursor uint64) (map[string]validatedMarkerChange, error) {
+	var floorBytes []byte
+	if query.QueryRowContext(ctx, "SELECT cursor_floor FROM runtime_state WHERE singleton = 1").Scan(&floorBytes) != nil {
+		return nil, invalidPersistentState("read cursor floor")
+	}
+	floor, err := DecodeUint64(floorBytes)
+	if err != nil || floor > serverCursor {
+		return nil, invalidPersistentState("invalid cursor floor")
+	}
 	rows, err := query.QueryContext(ctx, `
 		SELECT c.cursor, c.kind, c.received_at_ms,
 		       length(c.record_revision_id),
@@ -866,6 +874,7 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 	}
 	defer rows.Close()
 	previous := uint64(0)
+	retainedCursor := floor
 	latestMarkerChanges := make(map[string]validatedMarkerChange)
 	for rows.Next() {
 		var cursorBytes, markerBody []byte
@@ -883,6 +892,12 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 		cursor, err := DecodeUint64(cursorBytes)
 		if err != nil || cursor == 0 || cursor <= previous || cursor > serverCursor || validateTimestamp(formatTimestamp(receivedAt)) != nil {
 			return nil, invalidPersistentState("invalid change cursor")
+		}
+		if cursor > floor {
+			if retainedCursor == math.MaxUint64 || cursor != retainedCursor+1 {
+				return nil, invalidPersistentState("retained change cursor gap")
+			}
+			retainedCursor = cursor
 		}
 		switch kind {
 		case "record_revision":
@@ -910,8 +925,8 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 	if rows.Err() != nil {
 		return nil, invalidPersistentState("read change rows")
 	}
-	if previous != serverCursor {
-		return nil, invalidPersistentState("server cursor has no retained terminal change")
+	if retainedCursor != serverCursor {
+		return nil, invalidPersistentState("retained change cursor gap")
 	}
 	return latestMarkerChanges, nil
 }
@@ -1352,6 +1367,7 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		       r.revision_id, r.record_id, r.author_device_id,
 		       r.author_counter, length(r.vector_json),
 		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
+		       r.change_cursor,
 		       o.content_hash
 		FROM snapshot_revision_refs s
 		LEFT JOIN record_revisions r
@@ -1363,10 +1379,10 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 	}
 	for refRows.Next() {
 		var snapshotID, revisionID string
-		var hashBytes, counterBytes, vectorBody, objectHash []byte
+		var hashBytes, counterBytes, vectorBody, changeCursorBytes, objectHash []byte
 		var matchingRevision, recordID, authorID sql.NullString
 		var vectorLength sql.NullInt64
-		if refRows.Scan(&snapshotID, &revisionID, &hashBytes, &matchingRevision, &recordID, &authorID, &counterBytes, &vectorLength, &vectorBody, &objectHash) != nil {
+		if refRows.Scan(&snapshotID, &revisionID, &hashBytes, &matchingRevision, &recordID, &authorID, &counterBytes, &vectorLength, &vectorBody, &changeCursorBytes, &objectHash) != nil {
 			refRows.Close()
 			return invalidPersistentState("invalid snapshot reference")
 		}
@@ -1378,6 +1394,11 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			!boundedOptionalBytes(vectorLength, vectorBody, maxVectorBytes) || !vectorLength.Valid || json.Unmarshal(vectorBody, &entries) != nil || !bytes.Equal(objectHash, hashBytes) {
 			refRows.Close()
 			return invalidPersistentState("invalid snapshot reference")
+		}
+		changeCursor, changeCursorErr := DecodeUint64(changeCursorBytes)
+		if changeCursorErr != nil || changeCursor > snapshot.cutCursor {
+			refRows.Close()
+			return invalidPersistentState("snapshot reference accepted after cut")
 		}
 		vector, vectorErr := validateVector(entries)
 		if vectorErr != nil || vector[authorID.String] != counter {
