@@ -451,6 +451,9 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 			frontier = retainedFrontier
 			if !dominated {
 				frontier = append(frontier, frontierItem{id: revisionID, vector: vector})
+				if len(frontier) > 32 {
+					return nil, invalidPersistentState("too many reconstructed undominated revisions")
+				}
 			}
 			if undominated == 1 {
 				storedHeads[revisionID] = struct{}{}
@@ -980,10 +983,15 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 	type validatedSnapshot struct {
 		ownerID            string
 		requestID          string
+		cutCursor          uint64
+		envelopeGeneration uint64
+		expiresAt          int64
 		metadataBytes      int64
+		createBodyLength   int64
 		createBody         []byte
 		create             snapshotCreateResponse
 		pages              []storedSnapshotPage
+		pageBodyLengths    []int64
 		references         []snapshotRevisionReference
 		referenceRecordIDs map[string]string
 		sourceCounters     map[string]uint64
@@ -996,16 +1004,16 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 	rows, err := query.QueryContext(ctx, `
 		SELECT snapshot_id, owner_device_id, request_id, request_fingerprint,
 		       cut_cursor, envelope_generation, expires_at_ms, metadata_bytes,
-		       create_response_json
+		       length(create_response_json)
 		FROM snapshots ORDER BY snapshot_id`)
 	if err != nil {
 		return invalidPersistentState("read snapshots")
 	}
 	for rows.Next() {
 		var snapshotID, ownerID, requestID string
-		var fingerprint, cutBytes, generationBytes, body []byte
-		var expiresAt, metadataBytes int64
-		if rows.Scan(&snapshotID, &ownerID, &requestID, &fingerprint, &cutBytes, &generationBytes, &expiresAt, &metadataBytes, &body) != nil ||
+		var fingerprint, cutBytes, generationBytes []byte
+		var expiresAt, metadataBytes, createBodyLength int64
+		if rows.Scan(&snapshotID, &ownerID, &requestID, &fingerprint, &cutBytes, &generationBytes, &expiresAt, &metadataBytes, &createBodyLength) != nil ||
 			validateUUID(snapshotID) != nil || validateUUID(requestID) != nil || !deviceExists(devices, ownerID) || len(fingerprint) != 32 ||
 			metadataBytes < 0 || metadataBytes > snapshotMetadataLimit || len(snapshots) >= 8 {
 			rows.Close()
@@ -1013,18 +1021,21 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		}
 		cut, cutErr := DecodeUint64(cutBytes)
 		generation, generationErr := DecodeUint64(generationBytes)
-		var create snapshotCreateResponse
-		if cutErr != nil || generationErr != nil || cut > serverCursor || validateStoredSnapshotCreateResponse(body, identity, snapshotID, ownerID, cut, generation, expiresAt) != nil ||
-			decodeStoredCanonical(body, &create) != nil {
+		if cutErr != nil || generationErr != nil || cut > serverCursor {
 			rows.Close()
 			return invalidPersistentState("inconsistent snapshot row")
+		}
+		if createBodyLength < 0 || createBodyLength > metadataBytes || createBodyLength > snapshotMetadataLimit {
+			rows.Close()
+			return invalidPersistentState("snapshot create response exceeds declared metadata")
 		}
 		if metadataBytes > snapshotMetadataLimit-declaredMetadata {
 			rows.Close()
 			return invalidPersistentState("active snapshot metadata exceeds limit")
 		}
 		validationAccount := snapshotMetadataAccounting{}
-		accountSnapshotBase(&validationAccount, snapshotID, ownerID, requestID, body)
+		accountSnapshotBase(&validationAccount, snapshotID, ownerID, requestID, nil)
+		validationAccount.addLength64(createBodyLength)
 		if !validationAccount.ok() || validationAccount.total > metadataBytes {
 			rows.Close()
 			return invalidPersistentState("snapshot metadata undercounts base row")
@@ -1036,43 +1047,126 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			return invalidPersistentState("multiple active snapshots for one owner")
 		}
 		snapshots[snapshotID] = &validatedSnapshot{
-			ownerID: ownerID, requestID: requestID, metadataBytes: metadataBytes,
-			createBody: body, create: create, referenceRecordIDs: make(map[string]string),
-			sourceCounters: make(map[string]uint64), validationAccount: validationAccount,
+			ownerID: ownerID, requestID: requestID, cutCursor: cut, envelopeGeneration: generation,
+			expiresAt: expiresAt, metadataBytes: metadataBytes, createBodyLength: createBodyLength,
+			referenceRecordIDs: make(map[string]string),
+			sourceCounters:     make(map[string]uint64), validationAccount: validationAccount,
 		}
 	}
 	if rows.Err() != nil || rows.Close() != nil {
 		return invalidPersistentState("read snapshots")
 	}
 
-	pageRows, err := query.QueryContext(ctx, "SELECT snapshot_id, page_index, page_token, response_json FROM snapshot_pages ORDER BY snapshot_id, page_index")
+	createRows, err := query.QueryContext(ctx, `
+		SELECT snapshot_id, length(create_response_json),
+		       CASE WHEN length(create_response_json) <= ? THEN create_response_json END
+		FROM snapshots ORDER BY snapshot_id`, snapshotMetadataLimit)
+	if err != nil {
+		return invalidPersistentState("read snapshot create responses")
+	}
+	createCount := 0
+	for createRows.Next() {
+		var snapshotID string
+		var bodyLength int64
+		var body []byte
+		if createRows.Scan(&snapshotID, &bodyLength, &body) != nil {
+			createRows.Close()
+			return invalidPersistentState("invalid snapshot create response")
+		}
+		snapshot := snapshots[snapshotID]
+		if snapshot == nil || bodyLength != snapshot.createBodyLength || int64(len(body)) != bodyLength {
+			createRows.Close()
+			return invalidPersistentState("snapshot create response exceeds declared metadata")
+		}
+		var create snapshotCreateResponse
+		if validateStoredSnapshotCreateResponse(body, identity, snapshotID, snapshot.ownerID, snapshot.cutCursor, snapshot.envelopeGeneration, snapshot.expiresAt) != nil ||
+			decodeStoredCanonical(body, &create) != nil {
+			createRows.Close()
+			return invalidPersistentState("inconsistent snapshot row")
+		}
+		snapshot.createBody = body
+		snapshot.create = create
+		createCount++
+	}
+	if createRows.Err() != nil || createRows.Close() != nil || createCount != len(snapshots) {
+		return invalidPersistentState("read snapshot create responses")
+	}
+
+	pageRows, err := query.QueryContext(ctx, `
+		SELECT snapshot_id, page_index, page_token, length(response_json)
+		FROM snapshot_pages ORDER BY snapshot_id, page_index`)
 	if err != nil {
 		return invalidPersistentState("read snapshot pages")
 	}
 	for pageRows.Next() {
 		var snapshotID, token string
 		var index int64
-		var body []byte
-		var descriptor snapshotPageDescriptor
+		var bodyLength int64
+		if pageRows.Scan(&snapshotID, &index, &token, &bodyLength) != nil {
+			pageRows.Close()
+			return invalidPersistentState("invalid snapshot page")
+		}
 		snapshot := snapshots[snapshotID]
-		if pageRows.Scan(&snapshotID, &index, &token, &body) != nil {
+		if snapshot == nil || index < 0 || index != int64(len(snapshot.pages)) || decodeBase64Token(token) != nil {
 			pageRows.Close()
 			return invalidPersistentState("invalid snapshot page")
 		}
-		snapshot = snapshots[snapshotID]
-		if snapshot == nil || index < 0 || index != int64(len(snapshot.pages)) || decodeBase64Token(token) != nil || decodeStoredSnapshotPageDescriptor(body, &descriptor) != nil {
+		if bodyLength < 0 || bodyLength > snapshot.metadataBytes || bodyLength > snapshotMetadataLimit {
 			pageRows.Close()
-			return invalidPersistentState("invalid snapshot page")
+			return invalidPersistentState("snapshot page response exceeds declared metadata")
 		}
-		accountSnapshotPage(&snapshot.validationAccount, snapshotID, len(snapshot.pages), token, body)
+		accountSnapshotPage(&snapshot.validationAccount, snapshotID, len(snapshot.pages), token, nil)
+		snapshot.validationAccount.addLength64(bodyLength)
 		if !snapshot.validationAccount.ok() || snapshot.validationAccount.total > snapshot.metadataBytes {
 			pageRows.Close()
 			return invalidPersistentState("snapshot pages exceed declared metadata")
 		}
-		snapshot.pages = append(snapshot.pages, storedSnapshotPage{token: token, descriptor: descriptor, body: body})
+		snapshot.pages = append(snapshot.pages, storedSnapshotPage{token: token})
+		snapshot.pageBodyLengths = append(snapshot.pageBodyLengths, bodyLength)
 	}
 	if pageRows.Err() != nil || pageRows.Close() != nil {
 		return invalidPersistentState("read snapshot pages")
+	}
+
+	pageBodyRows, err := query.QueryContext(ctx, `
+		SELECT snapshot_id, page_index, length(response_json),
+		       CASE WHEN length(response_json) <= ? THEN response_json END
+		FROM snapshot_pages ORDER BY snapshot_id, page_index`, snapshotMetadataLimit)
+	if err != nil {
+		return invalidPersistentState("read snapshot page responses")
+	}
+	pageBodyCount := 0
+	for pageBodyRows.Next() {
+		var snapshotID string
+		var index, bodyLength int64
+		var body []byte
+		if pageBodyRows.Scan(&snapshotID, &index, &bodyLength, &body) != nil {
+			pageBodyRows.Close()
+			return invalidPersistentState("invalid snapshot page response")
+		}
+		snapshot := snapshots[snapshotID]
+		if snapshot == nil || index < 0 || index >= int64(len(snapshot.pages)) || snapshot.pageBodyLengths[index] != bodyLength || int64(len(body)) != bodyLength {
+			pageBodyRows.Close()
+			return invalidPersistentState("snapshot page response exceeds declared metadata")
+		}
+		var descriptor snapshotPageDescriptor
+		if decodeStoredSnapshotPageDescriptor(body, &descriptor) != nil {
+			pageBodyRows.Close()
+			return invalidPersistentState("invalid snapshot page")
+		}
+		snapshot.pages[index].body = body
+		snapshot.pages[index].descriptor = descriptor
+		pageBodyCount++
+	}
+	if pageBodyRows.Err() != nil || pageBodyRows.Close() != nil {
+		return invalidPersistentState("read snapshot page responses")
+	}
+	pageCount := 0
+	for _, snapshot := range snapshots {
+		pageCount += len(snapshot.pages)
+	}
+	if pageBodyCount != pageCount {
+		return invalidPersistentState("snapshot page response count mismatch")
 	}
 	for _, snapshot := range snapshots {
 		if len(snapshot.pages) == 0 || snapshot.create.FirstPageToken != snapshot.pages[0].token {

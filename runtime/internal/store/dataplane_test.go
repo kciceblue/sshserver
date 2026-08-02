@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1308,14 +1309,18 @@ func TestSnapshotGraphCorruptionFailsClosedAtStartup(t *testing.T) {
 		}
 		return opened, path, created
 	}
-	assertRejected := func(t *testing.T, opened *Store, path string) {
+	assertRejectedWithDetail := func(t *testing.T, opened *Store, path, detail string) {
 		t.Helper()
 		if err := opened.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Open(context.Background(), path, testIdentity); !errors.Is(err, ErrUnexpectedSchema) {
+		if _, err := Open(context.Background(), path, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || detail != "" && !strings.Contains(err.Error(), detail) {
 			t.Fatalf("corrupt snapshot startup error = %v", err)
 		}
+	}
+	assertRejected := func(t *testing.T, opened *Store, path string) {
+		t.Helper()
+		assertRejectedWithDetail(t, opened, path, "")
 	}
 	t.Run("metadata accounting", func(t *testing.T) {
 		opened, path, created := seed(t)
@@ -1348,6 +1353,28 @@ func TestSnapshotGraphCorruptionFailsClosedAtStartup(t *testing.T) {
 		}
 		assertRejected(t, opened, path)
 	})
+	t.Run("oversized create response", func(t *testing.T) {
+		opened, path, created := seed(t)
+		if _, err := opened.db.Exec(
+			"UPDATE snapshots SET create_response_json = zeroblob(?) WHERE snapshot_id = ?",
+			snapshotMetadataLimit+1, created.SnapshotID,
+		); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		assertRejectedWithDetail(t, opened, path, "snapshot create response exceeds declared metadata")
+	})
+	t.Run("oversized page response", func(t *testing.T) {
+		opened, path, created := seed(t)
+		if _, err := opened.db.Exec(
+			"UPDATE snapshot_pages SET response_json = zeroblob(?) WHERE snapshot_id = ? AND page_index = 0",
+			snapshotMetadataLimit+1, created.SnapshotID,
+		); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		assertRejectedWithDetail(t, opened, path, "snapshot page response exceeds declared metadata")
+	})
 	t.Run("page token chain", func(t *testing.T) {
 		opened, path, created := seed(t)
 		var body []byte
@@ -1377,6 +1404,106 @@ func TestSnapshotGraphCorruptionFailsClosedAtStartup(t *testing.T) {
 		}
 		assertRejected(t, opened, path)
 	})
+}
+
+func TestReconstructedFrontierRejectsTheThirtyThirdMemberImmediately(t *testing.T) {
+	opened, path := openDataPlane(t)
+	transaction, err := opened.db.Begin()
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+
+	scopesJSON, err := json.Marshal(auth.FixedScopes())
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	zero := EncodeUint64(0)
+	one := EncodeUint64(1)
+	recordID := "c3000000-0000-4000-8000-000000000001"
+	for index := 0; index < 33; index++ {
+		deviceID := fmt.Sprintf("c1000000-0000-4000-8000-%012x", index+1)
+		revisionID := fmt.Sprintf("c2000000-0000-4000-8000-%012x", index+1)
+		tokenHash := tokenWithByte(byte(index + 1))
+		if _, err := transaction.Exec(`
+			INSERT INTO devices (
+				device_id, token_hash, scopes_json, created_at_ms,
+				last_ack_cursor, max_author_counter
+			) VALUES (?, ?, ?, ?, ?, ?)`,
+			deviceID, tokenHash, string(scopesJSON), protocolFixtureTime.UnixMilli(), zero[:], one[:],
+		); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec(
+			"INSERT INTO device_sync_state (device_id, max_returned_cursor) VALUES (?, ?)", deviceID, zero[:],
+		); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		revision := recordRevision{
+			RecordID: recordID, RevisionID: revisionID, AuthorDeviceID: deviceID,
+			AuthorCounter: "1", VersionVector: []vectorEntry{{DeviceID: deviceID, Counter: "1"}},
+			PayloadSchema: "1", CryptoSuite: cryptoSuite,
+			Nonce:      base64.RawURLEncoding.EncodeToString(make([]byte, 24)),
+			Ciphertext: base64.RawURLEncoding.EncodeToString(make([]byte, 16)),
+		}
+		body, err := marshalJSON(revision)
+		if err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		vectorBody, err := json.Marshal(revision.VersionVector)
+		if err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		contentHash := sha256.Sum256(body)
+		cursor := EncodeUint64(uint64(index + 1))
+		if _, err := transaction.Exec(
+			"INSERT INTO revision_objects (content_hash, revision_json) VALUES (?, ?)", contentHash[:], body,
+		); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec(`
+			INSERT INTO record_revisions (
+				revision_id, record_id, author_device_id, author_counter,
+				vector_json, collection_witness_authenticator, tombstone,
+				content_hash, received_at_ms, accepted_uptime_ms,
+				change_cursor, retained, undominated
+			) VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, 1, 0)`,
+			revisionID, recordID, deviceID, one[:], vectorBody, contentHash[:],
+			protocolFixtureTime.UnixMilli(), zero[:], cursor[:],
+		); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec(`
+			INSERT INTO changes (cursor, kind, received_at_ms, record_revision_id)
+			VALUES (?, 'record_revision', ?, ?)`, cursor[:], protocolFixtureTime.UnixMilli(), revisionID,
+		); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+	}
+	serverCursor := EncodeUint64(33)
+	if _, err := transaction.Exec("UPDATE runtime_state SET server_cursor = ? WHERE singleton = 1", serverCursor[:]); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := transaction.Commit(); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(context.Background(), path, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "too many reconstructed undominated revisions") {
+		t.Fatalf("33-member frontier startup error = %v", err)
+	}
 }
 
 func TestOperationReceiptRetentionClassesAreIndependent(t *testing.T) {

@@ -719,11 +719,15 @@ type snapshotMetadataAccounting struct {
 }
 
 func (account *snapshotMetadataAccounting) addLength(length int) {
-	if account.overflow || length < 0 || int64(length) > math.MaxInt64-account.total {
+	account.addLength64(int64(length))
+}
+
+func (account *snapshotMetadataAccounting) addLength64(length int64) {
+	if account.overflow || length < 0 || length > math.MaxInt64-account.total {
 		account.overflow = true
 		return
 	}
-	account.total += int64(length)
+	account.total += length
 }
 
 func (account *snapshotMetadataAccounting) addLP(value []byte) {
