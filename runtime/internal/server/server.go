@@ -4,15 +4,21 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/httpapi"
+	"github.com/kciceblue/sshserver/runtime/internal/store"
 )
 
 func Run(ctx context.Context, settings config.Settings, readiness httpapi.Readiness) error {
@@ -24,6 +30,153 @@ func Run(ctx context.Context, settings config.Settings, readiness httpapi.Readin
 		return err
 	}
 	return runHTTP(ctx, settings.Listeners, handler)
+}
+
+// RunWithAdmin serves the public loopback V1 API and an owner-only Unix socket
+// used exclusively by `sshserver enrollment create` over the already verified
+// SSH channel. The Unix socket keeps the instance secret and plaintext grant
+// out of the normal HTTP surface.
+func RunWithAdmin(ctx context.Context, settings config.Settings, database *store.Store, paths config.Paths) error {
+	if err := settings.Validate(); err != nil {
+		return err
+	}
+	if database == nil {
+		return errors.New("data plane store is required")
+	}
+	if err := database.StartBoot(ctx); err != nil {
+		return err
+	}
+	handler, err := httpapi.New(settings, database)
+	if err != nil {
+		return err
+	}
+	adminListener, err := listenAdminSocket(paths.AdminSocket)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = adminListener.Close()
+		removeAdminSocket(paths.AdminSocket)
+	}()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errCh := make(chan error, 2)
+	go func() { errCh <- runHTTP(runCtx, settings.Listeners, handler) }()
+	go func() { errCh <- runAdmin(runCtx, adminListener, settings, database, paths) }()
+	firstErr := <-errCh
+	cancel()
+	_ = adminListener.Close()
+	secondErr := <-errCh
+	checkpointCtx, checkpointCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	checkpointErr := database.CheckpointUptime(checkpointCtx, time.Now())
+	checkpointCancel()
+	if firstErr != nil {
+		return errors.Join(firstErr, checkpointErr)
+	}
+	return errors.Join(secondErr, checkpointErr)
+}
+
+func listenAdminSocket(path string) (net.Listener, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+			return nil, errors.New("enrollment socket path is occupied by a non-socket")
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("remove stale enrollment socket: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect enrollment socket: %w", err)
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("listen on enrollment socket: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		listener.Close()
+		removeAdminSocket(path)
+		return nil, fmt.Errorf("protect enrollment socket: %w", err)
+	}
+	return listener, nil
+}
+
+func removeAdminSocket(path string) {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSocket != 0 && info.Mode()&os.ModeSymlink == 0 {
+		_ = os.Remove(path)
+	}
+}
+
+func runAdmin(ctx context.Context, listener net.Listener, settings config.Settings, database *store.Store, paths config.Paths) error {
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("accept enrollment command: %w", err)
+		}
+		if err := handleAdminConnection(ctx, connection, settings, database, paths); err != nil {
+			_, _ = io.WriteString(connection, `{"error":"bootstrap_failed"}`)
+		}
+		_ = connection.Close()
+	}
+}
+
+func handleAdminConnection(ctx context.Context, connection net.Conn, settings config.Settings, database *store.Store, paths config.Paths) error {
+	if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	request, err := io.ReadAll(io.LimitReader(connection, 257))
+	if err != nil {
+		return err
+	}
+	if string(request) != `{"operation":"enrollment_create"}` {
+		return errors.New("invalid enrollment command")
+	}
+	grant, err := database.CreateEnrollmentGrant(ctx, time.Now())
+	if err != nil {
+		return err
+	}
+	defer clear(grant.Grant)
+	secret, err := config.ReadSecret(paths.InstanceSecret)
+	if err != nil {
+		return err
+	}
+	defer clear(secret)
+	_, portText, err := net.SplitHostPort(settings.Listeners[0])
+	if err != nil {
+		return err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(struct {
+		ProtocolVersion string `json:"protocol_version"`
+		InstanceID      string `json:"instance_id"`
+		VaultID         string `json:"vault_id"`
+		InstanceSecret  string `json:"instance_secret"`
+		EnrollmentGrant string `json:"enrollment_grant"`
+		ExpiresAt       string `json:"expires_at"`
+		LoopbackPort    int    `json:"loopback_port"`
+	}{
+		ProtocolVersion: "1",
+		InstanceID:      settings.InstanceID,
+		VaultID:         settings.VaultID,
+		InstanceSecret:  base64.RawURLEncoding.EncodeToString(secret),
+		EnrollmentGrant: base64.RawURLEncoding.EncodeToString(grant.Grant),
+		ExpiresAt:       grant.ExpiresAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+		LoopbackPort:    port,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = connection.Write(body)
+	return err
 }
 
 func runHTTP(ctx context.Context, addresses []string, handler http.Handler) error {

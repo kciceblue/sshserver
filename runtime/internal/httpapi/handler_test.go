@@ -9,12 +9,28 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kciceblue/sshserver/runtime/internal/api"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 )
 
 type readyStub struct{ err error }
 
 func (stub readyStub) Ready(context.Context) error { return stub.err }
+
+type dataPlaneStub struct {
+	request  api.Request
+	response api.Response
+	err      *api.Error
+	calls    int
+}
+
+func (*dataPlaneStub) Ready(context.Context) error { return nil }
+
+func (stub *dataPlaneStub) HandleAPI(_ context.Context, request api.Request) (api.Response, *api.Error) {
+	stub.calls++
+	stub.request = request
+	return stub.response, stub.err
+}
 
 func testHandler(t *testing.T, readiness Readiness) *Handler {
 	t.Helper()
@@ -70,6 +86,104 @@ func TestCapabilitiesAdvertiseNoUnimplementedFeature(t *testing.T) {
 	}
 	if body.Capabilities == nil || len(body.Capabilities) != 0 {
 		t.Fatalf("unexpected capabilities: %#v", body.Capabilities)
+	}
+}
+
+func TestDataPlaneCapabilitiesAndRawRequestTransport(t *testing.T) {
+	dataPlane := &dataPlaneStub{response: api.Response{Status: http.StatusOK, Body: []byte(`{"devices":[]}`)}}
+	recorder := httptest.NewRecorder()
+	testHandler(t, dataPlane).ServeHTTP(recorder, validRequest("/v1/capabilities"))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("capabilities status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var capabilities capabilitiesResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &capabilities); err != nil {
+		t.Fatal(err)
+	}
+	wantCapabilities := []string{
+		"authenticated-collection-frontiers-v2",
+		"conflict-siblings-v1",
+		"device-token-rotation-v1",
+		"envelope-cas-v1",
+		"snapshot-collection-markers-v1",
+		"snapshot-device-registry-v1",
+		"snapshot-read-v1",
+		"tombstone-ack-v1",
+	}
+	if strings.Join(capabilities.Capabilities, "\n") != strings.Join(wantCapabilities, "\n") || capabilities.Limits.MaxBodyBytes != MaxBodyBytes {
+		t.Fatalf("unexpected data-plane capabilities: %+v", capabilities)
+	}
+
+	rawBody := ` {"request_id":"00000000-0000-4000-8000-000000000003"} `
+	request := httptest.NewRequest(http.MethodPost, "/v1/sync", strings.NewReader(rawBody))
+	request.Header.Set("JAT-Protocol-Version", "1")
+	request.Header.Set("JAT-Request-ID", "00000000-0000-4000-8000-000000000003")
+	request.Header.Set("Authorization", "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	request.Header.Set("Content-Type", "application/json; charset=utf-8")
+	recorder = httptest.NewRecorder()
+	testHandler(t, dataPlane).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"devices":[]}` {
+		t.Fatalf("data-plane response=%d %s", recorder.Code, recorder.Body.String())
+	}
+	if dataPlane.calls != 1 || dataPlane.request.Path != "/v1/sync" || dataPlane.request.Method != http.MethodPost ||
+		dataPlane.request.RequestID != "00000000-0000-4000-8000-000000000003" ||
+		dataPlane.request.Authorization != "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ||
+		string(dataPlane.request.Body) != rawBody || dataPlane.request.Now.IsZero() {
+		t.Fatalf("transport request = %+v calls=%d", dataPlane.request, dataPlane.calls)
+	}
+	for name, want := range map[string]string{
+		"Content-Type":         "application/json; charset=utf-8",
+		"Content-Length":       "14",
+		"JAT-Protocol-Version": "1",
+		"JAT-Request-ID":       "00000000-0000-4000-8000-000000000003",
+	} {
+		if got := recorder.Header().Get(name); got != want {
+			t.Fatalf("%s=%q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestDataPlaneBodyAuthorizationAndErrorsFailClosed(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		contentType string
+		authorize   bool
+		wantStatus  int
+		wantCode    string
+	}{
+		{name: "missing authorization", body: `{}`, contentType: "application/json; charset=utf-8", wantStatus: http.StatusUnauthorized, wantCode: "unauthorized"},
+		{name: "wrong content type", body: `{}`, contentType: "application/json", authorize: true, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
+		{name: "oversize body", body: strings.Repeat("x", MaxBodyBytes+1), contentType: "application/json; charset=utf-8", authorize: true, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "limit_exceeded"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dataPlane := &dataPlaneStub{response: api.Response{Status: http.StatusOK, Body: []byte(`{}`)}}
+			request := httptest.NewRequest(http.MethodPost, "/v1/sync", strings.NewReader(test.body))
+			request.Header.Set("JAT-Protocol-Version", "1")
+			request.Header.Set("JAT-Request-ID", "00000000-0000-4000-8000-000000000003")
+			request.Header.Set("Content-Type", test.contentType)
+			if test.authorize {
+				request.Header.Set("Authorization", "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+			}
+			recorder := httptest.NewRecorder()
+			testHandler(t, dataPlane).ServeHTTP(recorder, request)
+			if recorder.Code != test.wantStatus || !strings.Contains(recorder.Body.String(), `"code":"`+test.wantCode+`"`) || dataPlane.calls != 0 {
+				t.Fatalf("response=%d %s calls=%d", recorder.Code, recorder.Body.String(), dataPlane.calls)
+			}
+		})
+	}
+
+	dataPlane := &dataPlaneStub{err: api.NewError("generation_conflict", true)}
+	request := httptest.NewRequest(http.MethodPut, "/v1/vault-envelope", strings.NewReader(`{}`))
+	request.Header.Set("JAT-Protocol-Version", "1")
+	request.Header.Set("JAT-Request-ID", "00000000-0000-4000-8000-000000000003")
+	request.Header.Set("Content-Type", "application/json; charset=utf-8")
+	request.Header.Set("Authorization", "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	recorder := httptest.NewRecorder()
+	testHandler(t, dataPlane).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), `"code":"generation_conflict"`) || !strings.Contains(recorder.Body.String(), `"retryable":true`) {
+		t.Fatalf("protocol error response=%d %s", recorder.Code, recorder.Body.String())
 	}
 }
 

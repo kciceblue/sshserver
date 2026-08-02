@@ -1,16 +1,19 @@
-// Package httpapi implements the bounded, loopback-only Task 2.1 HTTP
-// surface. It intentionally exposes only health and honest capability data.
+// Package httpapi implements the bounded, loopback-only frozen V1 HTTP
+// transport. Opaque persistence and authorization remain behind DataPlane.
 package httpapi
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/kciceblue/sshserver/runtime/internal/api"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/uuidv4"
 )
@@ -27,6 +30,7 @@ type Readiness interface {
 type Handler struct {
 	settings  config.Settings
 	readiness Readiness
+	dataPlane api.DataPlane
 }
 
 type errorEnvelope struct {
@@ -72,7 +76,11 @@ func New(settings config.Settings, readiness Readiness) (*Handler, error) {
 	if readiness == nil {
 		return nil, errors.New("readiness provider is required")
 	}
-	return &Handler{settings: settings, readiness: readiness}, nil
+	handler := &Handler{settings: settings, readiness: readiness}
+	if dataPlane, ok := readiness.(api.DataPlane); ok {
+		handler.dataPlane = dataPlane
+	}
+	return handler, nil
 }
 
 func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -100,36 +108,48 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		return
 	}
 	requestID = requestIDValues[0]
-	if request.Method != http.MethodGet {
-		handler.writeError(response, http.StatusBadRequest, "invalid_request", false, requestID)
-		return
-	}
-	if err := requireEmptyBody(response, request); err != nil {
-		handler.writeError(response, http.StatusBadRequest, "invalid_request", false, requestID)
-		return
-	}
-
 	switch request.URL.Path {
 	case "/v1/healthz":
+		if request.Method != http.MethodGet || requireEmptyBody(response, request) != nil {
+			handler.writeError(response, http.StatusBadRequest, "invalid_request", false, requestID)
+			return
+		}
 		ctx, cancel := context.WithTimeout(request.Context(), 500*time.Millisecond)
 		defer cancel()
 		if err := handler.readiness.Ready(ctx); err != nil {
 			handler.writeError(response, http.StatusInternalServerError, "internal_error", true, requestID)
 			return
 		}
-		writeJSON(response, http.StatusOK, struct {
+		writeJSON(response, http.StatusOK, requestID, struct {
 			Status          string `json:"status"`
 			ProtocolVersion string `json:"protocol_version"`
 		}{Status: "ok", ProtocolVersion: config.ProtocolMajor})
 	case "/v1/capabilities":
-		writeJSON(response, http.StatusOK, capabilitiesResponse{
+		if request.Method != http.MethodGet || requireEmptyBody(response, request) != nil {
+			handler.writeError(response, http.StatusBadRequest, "invalid_request", false, requestID)
+			return
+		}
+		capabilities := []string{}
+		if handler.dataPlane != nil {
+			capabilities = []string{
+				"authenticated-collection-frontiers-v2",
+				"conflict-siblings-v1",
+				"device-token-rotation-v1",
+				"envelope-cas-v1",
+				"snapshot-collection-markers-v1",
+				"snapshot-device-registry-v1",
+				"snapshot-read-v1",
+				"tombstone-ack-v1",
+			}
+		}
+		writeJSON(response, http.StatusOK, requestID, capabilitiesResponse{
 			InstanceID:    handler.settings.InstanceID,
 			VaultID:       handler.settings.VaultID,
 			ProtocolMin:   config.ProtocolMajor,
 			ProtocolMax:   config.ProtocolMajor,
 			StorageSchema: config.StorageSchema,
 			CryptoSuites:  []string{"jat-xchacha-hkdf-argon2id-draft2"},
-			Capabilities:  []string{},
+			Capabilities:  capabilities,
 			Limits: limits{
 				MaxBodyBytes:                              MaxBodyBytes,
 				MaxMutations:                              256,
@@ -145,7 +165,42 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 			},
 		})
 	default:
-		handler.writeError(response, http.StatusBadRequest, "invalid_request", false, requestID)
+		if handler.dataPlane == nil {
+			handler.writeError(response, http.StatusBadRequest, "invalid_request", false, requestID)
+			return
+		}
+		var body []byte
+		if request.Method == http.MethodGet {
+			if requireEmptyBody(response, request) != nil {
+				handler.writeError(response, http.StatusBadRequest, "invalid_request", false, requestID)
+				return
+			}
+		} else {
+			var protocolErr *api.Error
+			body, protocolErr = readJSONBody(response, request)
+			if protocolErr != nil {
+				handler.writeError(response, protocolErr.Status(), protocolErr.Code, protocolErr.Retryable, requestID)
+				return
+			}
+		}
+		authorizationValues := request.Header.Values("Authorization")
+		if len(authorizationValues) != 1 {
+			handler.writeError(response, http.StatusUnauthorized, "unauthorized", false, requestID)
+			return
+		}
+		result, protocolErr := handler.dataPlane.HandleAPI(request.Context(), api.Request{
+			Method:        request.Method,
+			Path:          request.URL.Path,
+			RequestID:     requestID,
+			Authorization: authorizationValues[0],
+			Body:          body,
+			Now:           time.Now(),
+		})
+		if protocolErr != nil {
+			handler.writeError(response, protocolErr.Status(), protocolErr.Code, protocolErr.Retryable, requestID)
+			return
+		}
+		writeJSONBytes(response, result.Status, requestID, result.Body, result.Headers)
 	}
 }
 
@@ -174,9 +229,8 @@ func validateTransport(request *http.Request) error {
 	if len(request.TransferEncoding) != 0 || len(request.Trailer) != 0 || request.Header.Get("Expect") != "" || request.Header.Get("TE") != "" {
 		return errors.New("streamed request framing is forbidden")
 	}
-	contentLengthValues := request.Header.Values("Content-Length")
-	if len(contentLengthValues) > 1 || (len(contentLengthValues) == 1 && strings.TrimSpace(contentLengthValues[0]) != "0") || request.ContentLength != 0 {
-		return errors.New("request body framing is forbidden")
+	if request.ContentLength < 0 {
+		return errors.New("request body length is invalid")
 	}
 	return nil
 }
@@ -193,6 +247,9 @@ func headerContainsToken(values []string, token string) bool {
 }
 
 func requireEmptyBody(response http.ResponseWriter, request *http.Request) error {
+	if request.ContentLength != 0 {
+		return errors.New("request body is forbidden")
+	}
 	if request.Body == nil {
 		return nil
 	}
@@ -207,6 +264,33 @@ func requireEmptyBody(response http.ResponseWriter, request *http.Request) error
 		return err
 	}
 	return nil
+}
+
+func readJSONBody(response http.ResponseWriter, request *http.Request) ([]byte, *api.Error) {
+	if request.Method != http.MethodPost && request.Method != http.MethodPut {
+		return nil, api.NewError("invalid_request", false)
+	}
+	contentTypes := request.Header.Values("Content-Type")
+	if len(contentTypes) != 1 || contentTypes[0] != "application/json; charset=utf-8" {
+		return nil, api.NewError("invalid_request", false)
+	}
+	if request.ContentLength <= 0 {
+		return nil, api.NewError("invalid_request", false)
+	}
+	request.Body = http.MaxBytesReader(response, request.Body, MaxBodyBytes)
+	defer request.Body.Close()
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		var maximum *http.MaxBytesError
+		if errors.As(err, &maximum) {
+			return nil, api.NewError("limit_exceeded", false)
+		}
+		return nil, api.NewError("invalid_request", false)
+	}
+	if len(body) == 0 {
+		return nil, api.NewError("invalid_request", false)
+	}
+	return body, nil
 }
 
 // RequestIDOrFallback returns the sole canonical V4 request ID, or a fresh
@@ -230,15 +314,10 @@ func (handler *Handler) writeError(response http.ResponseWriter, status int, cod
 }
 
 func writeProtocolError(response http.ResponseWriter, status int, code string, retryable bool, requestID string) {
-	messages := map[string]string{
-		"invalid_request":      "The request did not match protocol version 1.",
-		"unsupported_protocol": "The requested protocol version is not supported.",
-		"limit_exceeded":       "The request exceeded a protocol limit.",
-		"internal_error":       "The service could not complete the request.",
-	}
-	writeJSON(response, status, errorEnvelope{Error: protocolError{
+	protocolErr := api.NewError(code, retryable)
+	writeJSON(response, status, requestID, errorEnvelope{Error: protocolError{
 		Code:      code,
-		Message:   messages[code],
+		Message:   protocolErr.Message(),
 		Retryable: retryable,
 		RequestID: requestID,
 	}})
@@ -250,10 +329,58 @@ func WriteLimitExceeded(response http.ResponseWriter, requestID string) {
 	writeProtocolError(response, http.StatusRequestEntityTooLarge, "limit_exceeded", false, requestID)
 }
 
-func writeJSON(response http.ResponseWriter, status int, value any) {
-	response.Header().Set("Content-Type", "application/json; charset=utf-8")
+func writeJSON(response http.ResponseWriter, status int, requestID string, value any) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		writeJSONBytes(response, http.StatusInternalServerError, requestID, []byte(`{"error":{"code":"internal_error","message":"The service could not complete the request.","retryable":true,"request_id":"`+requestID+`"}}`))
+		return
+	}
+	writeJSONBytes(response, status, requestID, body)
+}
+
+func writeJSONBytes(response http.ResponseWriter, status int, requestID string, body []byte, retainedHeaders ...[]api.Header) {
+	if len(retainedHeaders) == 1 && slices.Equal(retainedHeaders[0], api.V1ResponseHeaders(requestID, len(body))) &&
+		writeRetainedHTTPResponse(response, status, body, retainedHeaders[0]) {
+		return
+	}
+	// V1 self-revocation receipts require a byte-equivalent HTTP replay. Keep
+	// every response header deterministic and suppress net/http's wall-clock
+	// Date injection; the body already carries any informational timestamps.
+	response.Header()["Date"] = nil
 	response.Header().Set("Cache-Control", "no-store")
 	response.Header().Set("X-Content-Type-Options", "nosniff")
+	headers := api.V1ResponseHeaders(requestID, len(body))
+	for _, header := range headers {
+		response.Header().Set(header.Name, header.Value)
+	}
 	response.WriteHeader(status)
-	_ = json.NewEncoder(response).Encode(value)
+	_, _ = response.Write(body)
+}
+
+func writeRetainedHTTPResponse(response http.ResponseWriter, status int, body []byte, headers []api.Header) bool {
+	hijacker, ok := response.(http.Hijacker)
+	if !ok {
+		return false
+	}
+	connection, buffered, err := hijacker.Hijack()
+	if err != nil {
+		return false
+	}
+	defer connection.Close()
+	if _, err := fmt.Fprintf(buffered, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status)); err != nil {
+		return true
+	}
+	for _, header := range headers {
+		if _, err := fmt.Fprintf(buffered, "%s: %s\r\n", header.Name, header.Value); err != nil {
+			return true
+		}
+	}
+	if _, err := buffered.WriteString("\r\n"); err != nil {
+		return true
+	}
+	if _, err := buffered.Write(body); err != nil {
+		return true
+	}
+	_ = buffered.Flush()
+	return true
 }

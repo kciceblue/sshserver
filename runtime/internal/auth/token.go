@@ -80,6 +80,58 @@ func DeviceTokenHash(instanceID, vaultID, deviceID string, token []byte) ([32]by
 	return result, nil
 }
 
+// EnrollmentGrantHash implements SYNC-PROTOCOL.md section 6 exactly. Only the
+// returned digest is persisted; the plaintext grant exists only in the
+// daemon's bounded bootstrap response and the protected SSH channel.
+func EnrollmentGrantHash(instanceID, vaultID string, grant []byte) ([32]byte, error) {
+	if len(grant) != credentialSize {
+		return [32]byte{}, ErrCredentialSize
+	}
+	instanceBytes, err := uuidv4.Parse(instanceID)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("instance ID: %w", err)
+	}
+	vaultBytes, err := uuidv4.Parse(vaultID)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("vault ID: %w", err)
+	}
+	hash := sha256.New()
+	writeLengthPrefixed(hash, []byte("JAT enrollment grant hash v1"))
+	hash.Write(instanceBytes[:])
+	hash.Write(vaultBytes[:])
+	hash.Write(grant)
+	var result [32]byte
+	copy(result[:], hash.Sum(nil))
+	return result, nil
+}
+
+// RequestBodyFingerprint binds exact raw authenticated request bytes to the
+// instance, vault, device, and operation-specific domain. Callers choose only
+// fixed source-code labels; no untrusted text is used as a domain.
+func RequestBodyFingerprint(label, instanceID, vaultID, deviceID string, body []byte) ([32]byte, error) {
+	instanceBytes, err := uuidv4.Parse(instanceID)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("instance ID: %w", err)
+	}
+	vaultBytes, err := uuidv4.Parse(vaultID)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("vault ID: %w", err)
+	}
+	deviceBytes, err := uuidv4.Parse(deviceID)
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("device ID: %w", err)
+	}
+	hash := sha256.New()
+	writeLengthPrefixed(hash, []byte(label))
+	hash.Write(instanceBytes[:])
+	hash.Write(vaultBytes[:])
+	hash.Write(deviceBytes[:])
+	writeLengthPrefixed(hash, body)
+	var result [32]byte
+	copy(result[:], hash.Sum(nil))
+	return result, nil
+}
+
 type writer interface {
 	Write([]byte) (int, error)
 }

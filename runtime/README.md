@@ -1,15 +1,16 @@
-# Task 2.1 server runtime
+# V1 server runtime
 
-This module is the first executable sync-server substrate. It implements
-protected on-host initialization, SQLite metadata and hash-only device
-credential storage, exact health and capability responses, foreground service
-lifecycle, and user-scoped service-definition rendering.
+This module implements the frozen V1 loopback data plane: protected on-host
+initialization, an SSH-only enrollment bootstrap, hash-only grant and device
+authorization, opaque envelope and record persistence, retry-safe sync and
+snapshot reads, and device listing, revocation, and token rotation. It also
+provides foreground lifecycle and user-scoped service-definition rendering.
 
-Enrollment, encrypted-record synchronization, recovery, and deployment-time
-service activation remain unavailable until their roadmap tasks land. The
-runtime is loopback-only, stores only opaque client-encrypted records, performs
-no vault cryptography, parses no private keys, and is never installed on
-ordinary SSH targets.
+The runtime is loopback-only, stores only opaque client-encrypted records and
+minimal protocol metadata, performs no vault cryptography, parses no private
+keys, and is never installed on ordinary SSH targets. Host-loss import,
+instance-secret rotation, backup/restore commands, and transactional deployment
+activation remain separate roadmap work; no unsupported route is advertised.
 
 From the repository root, build and verify cgo-free Linux and macOS binaries
 for amd64 and arm64:
@@ -26,6 +27,20 @@ Initialize and run a foreground instance using the binary matching the host:
 ./dist/sshserver-darwin-arm64 health --address 127.0.0.1:37421
 ```
 
+While `serve` is running, a verified SSH session can obtain one bounded
+bootstrap object with:
+
+```sh
+./dist/sshserver-darwin-arm64 enrollment create \
+  --format=json \
+  --state-dir /absolute/private/state
+```
+
+The command talks to an owner-only Unix socket in the protected state
+directory. It writes exactly one JSON object to standard output; the instance
+secret and five-minute, single-use enrollment grant are never accepted in
+arguments, environment variables, the HTTP API, or service-manager files.
+
 `init` is idempotent and refuses unsafe ownership, permissions, symlinks, hard
 links, mixed partial installations, and listener changes. Only literal IPv4 or
 IPv6 loopback listeners are accepted. The 32-byte instance secret lives in a
@@ -35,8 +50,10 @@ device credentials are hashed before persistence.
 The `service render` and `service install` commands generate a systemd user
 unit or per-user LaunchAgent that executes the same foreground path without a
 credential in arguments, environment, or service files. They do not enable or
-start the service manager. See [`../packaging/README.md`](../packaging/README.md)
-for the packaging boundary.
+start the service manager. Transactional activation and the pinned one-line
+installer are the next Task 2.5 server step. See
+[`../packaging/README.md`](../packaging/README.md) for the current packaging
+boundary.
 
 The SQLite driver is an exact, mechanically trimmed source fork of the
 MIT-licensed `github.com/ncruces/go-sqlite3` v0.32.0 package closure. Its
