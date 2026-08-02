@@ -56,6 +56,7 @@ const createEnrollmentGrantsV1 = `CREATE TABLE enrollment_grants (
 const createEnrollmentsV1 = `CREATE TABLE enrollments (
 			enrollment_id TEXT PRIMARY KEY CHECK (length(enrollment_id) = 36),
 			device_id TEXT NOT NULL UNIQUE REFERENCES devices(device_id),
+			created_cursor BLOB NOT NULL UNIQUE CHECK (length(created_cursor) = 8),
 			token_hash BLOB NOT NULL CHECK (length(token_hash) = 32),
 			scopes_json TEXT NOT NULL,
 			request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
@@ -135,9 +136,14 @@ const createChangesV1 = `CREATE TABLE changes (
 			record_revision_id TEXT,
 			collection_marker_record_id TEXT,
 			collection_marker_json BLOB,
+			device_changed_id TEXT,
+			device_change_kind TEXT CHECK (device_change_kind IN ('enrolled', 'revoked')),
 			CHECK ((kind = 'record_revision') = (record_revision_id IS NOT NULL)),
 			CHECK ((kind = 'collection_marker') = (collection_marker_record_id IS NOT NULL)),
-			CHECK ((kind = 'collection_marker') = (collection_marker_json IS NOT NULL))
+			CHECK ((kind = 'collection_marker') = (collection_marker_json IS NOT NULL)),
+			CHECK ((kind = 'device_changed') = (device_changed_id IS NOT NULL)),
+			CHECK ((kind = 'device_changed') = (device_change_kind IS NOT NULL)),
+			CHECK (device_changed_id IS NULL OR length(device_changed_id) = 36)
 		) STRICT`
 
 const createOperationReceiptsV1 = `CREATE TABLE operation_receipts (

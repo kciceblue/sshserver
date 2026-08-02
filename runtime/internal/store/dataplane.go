@@ -500,19 +500,26 @@ func setServerCursor(ctx context.Context, transaction *sql.Tx, value uint64) *ap
 	return nil
 }
 
-func insertChange(ctx context.Context, transaction *sql.Tx, cursor uint64, kind, revisionID, markerRecordID string, now time.Time) *api.Error {
+func insertChange(ctx context.Context, transaction *sql.Tx, cursor uint64, kind, revisionID, markerRecordID, deviceID, deviceChangeKind string, now time.Time) *api.Error {
 	encoded := EncodeUint64(cursor)
-	var revision, marker any
+	var revision, marker, changedDevice, deviceEvent any
 	if revisionID != "" {
 		revision = revisionID
 	}
 	if markerRecordID != "" {
 		marker = markerRecordID
 	}
+	if deviceID != "" {
+		changedDevice = deviceID
+	}
+	if deviceChangeKind != "" {
+		deviceEvent = deviceChangeKind
+	}
 	if _, err := transaction.ExecContext(ctx, `
 		INSERT INTO changes (
-			cursor, kind, received_at_ms, record_revision_id, collection_marker_record_id
-		) VALUES (?, ?, ?, ?, ?)`, encoded[:], kind, now.UTC().UnixMilli(), revision, marker); err != nil {
+			cursor, kind, received_at_ms, record_revision_id,
+			collection_marker_record_id, device_changed_id, device_change_kind
+		) VALUES (?, ?, ?, ?, ?, ?, ?)`, encoded[:], kind, now.UTC().UnixMilli(), revision, marker, changedDevice, deviceEvent); err != nil {
 		return api.NewError("internal_error", true)
 	}
 	return nil

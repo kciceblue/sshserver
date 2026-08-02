@@ -89,6 +89,24 @@ func TestStorePersistsOnlyCredentialHash(t *testing.T) {
 	}
 }
 
+func TestCreateDeviceIsLimitedToThePreActivationBaseline(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(ctx, filepath.Join(t.TempDir(), "server.db"), testIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if err := opened.CreateDevice(ctx, "00000000-0000-4000-8000-000000000003", tokenWithByte(0x31), auth.FixedScopes(), protocolFixtureTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.StartBoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.CreateDevice(ctx, "00000000-0000-4000-8000-000000000004", tokenWithByte(0x32), auth.FixedScopes(), protocolFixtureTime); err == nil {
+		t.Fatal("post-activation baseline device creation succeeded")
+	}
+}
+
 func TestStoreIdentityAndFutureSchemaFailClosed(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "server.db")
@@ -272,12 +290,25 @@ func TestOpenMigratesReviewedTask21SchemaWithoutChangingIdentityOrCredentials(t 
 	if err != nil || !verified {
 		t.Fatalf("migrated credential verified=%v error=%v", verified, err)
 	}
-	var runtimeRows, syncRows int
+	var runtimeRows, syncRows, enrollmentRows, changeRows int
 	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM runtime_state").Scan(&runtimeRows); err != nil || runtimeRows != 1 {
 		t.Fatalf("runtime rows=%d error=%v", runtimeRows, err)
 	}
 	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM device_sync_state WHERE device_id = ?", deviceID).Scan(&syncRows); err != nil || syncRows != 1 {
 		t.Fatalf("sync rows=%d error=%v", syncRows, err)
+	}
+	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM enrollments").Scan(&enrollmentRows); err != nil || enrollmentRows != 0 {
+		t.Fatalf("migrated baseline enrollment rows=%d error=%v", enrollmentRows, err)
+	}
+	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM changes").Scan(&changeRows); err != nil || changeRows != 0 {
+		t.Fatalf("migrated baseline change rows=%d error=%v", changeRows, err)
+	}
+	var cursorBytes []byte
+	if err := opened.db.QueryRowContext(ctx, "SELECT server_cursor FROM runtime_state WHERE singleton = 1").Scan(&cursorBytes); err != nil {
+		t.Fatal(err)
+	}
+	if cursor, err := DecodeUint64(cursorBytes); err != nil || cursor != 0 {
+		t.Fatalf("migrated baseline cursor=%d error=%v", cursor, err)
 	}
 }
 

@@ -115,6 +115,7 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 	}
 	createdAt := call.Now.UTC().Truncate(time.Millisecond)
 	zero := EncodeUint64(0)
+	createdCursor := EncodeUint64(newCursor)
 	scopesJSON, _ := json.Marshal(auth.FixedScopes())
 	if _, err := transaction.ExecContext(ctx, `
 		INSERT INTO devices (
@@ -142,17 +143,17 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 	}
 	if _, err := transaction.ExecContext(ctx, `
 		INSERT INTO enrollments (
-			enrollment_id, device_id, token_hash, scopes_json,
+			enrollment_id, device_id, created_cursor, token_hash, scopes_json,
 			request_fingerprint, response_json, created_status
-		) VALUES (?, ?, ?, ?, ?, ?, 201)`,
-		request.EnrollmentID, request.DeviceID, tokenHash[:], string(scopesJSON), fingerprint[:], responseBody,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 201)`,
+		request.EnrollmentID, request.DeviceID, createdCursor[:], tokenHash[:], string(scopesJSON), fingerprint[:], responseBody,
 	); err != nil {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	if _, err := transaction.ExecContext(ctx, "UPDATE enrollment_grants SET consumed_enrollment_id = ? WHERE grant_hash = ?", request.EnrollmentID, grantHash[:]); err != nil {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
-	if protocolErr := insertChange(ctx, transaction, newCursor, "device_changed", "", "", call.Now); protocolErr != nil {
+	if protocolErr := insertChange(ctx, transaction, newCursor, "device_changed", "", "", request.DeviceID, "enrolled", call.Now); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	if protocolErr := setServerCursor(ctx, transaction, newCursor); protocolErr != nil {

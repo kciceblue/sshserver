@@ -140,8 +140,9 @@ func validateReadinessSnapshot(ctx context.Context, query schemaQueryer, identit
 	return nil
 }
 
-// CreateDevice persists only the domain-separated token hash and the exact
-// fixed scope set. The caller's plaintext token is never written to SQLite.
+// CreateDevice adds a pre-activation baseline device and persists only the
+// domain-separated token hash and exact fixed scope set. The caller's plaintext
+// token is never written to SQLite.
 func (store *Store) CreateDevice(ctx context.Context, deviceID string, token []byte, scopes []string, createdAt time.Time) error {
 	if _, err := uuidv4.Parse(deviceID); err != nil {
 		return fmt.Errorf("device ID: %w", err)
@@ -164,6 +165,18 @@ func (store *Store) CreateDevice(ctx context.Context, deviceID string, token []b
 		return fmt.Errorf("begin create device: %w", err)
 	}
 	defer transaction.Rollback()
+	var cursorBytes, activeBootID []byte
+	var snapshotCount int
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT server_cursor, active_boot_id,
+		       (SELECT count(*) FROM (SELECT 1 FROM snapshots LIMIT 1))
+		FROM runtime_state WHERE singleton = 1`).Scan(&cursorBytes, &activeBootID, &snapshotCount); err != nil {
+		return fmt.Errorf("read baseline activation state: %w", err)
+	}
+	cursor, err := DecodeUint64(cursorBytes)
+	if err != nil || cursor != 0 || activeBootID != nil || snapshotCount != 0 {
+		return errors.New("create device: baseline device creation is closed after activation")
+	}
 	_, err = transaction.ExecContext(
 		ctx,
 		`INSERT INTO devices (

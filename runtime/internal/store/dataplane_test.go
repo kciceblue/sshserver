@@ -630,20 +630,31 @@ func TestMarkerFallbackPreservesLiveWitnessAndPrunesTombstoneWitness(t *testing.
 			"e2000000-0000-4000-8000-000000000002", deviceID,
 			"e2000000-0000-4000-8000-000000000003", token,
 		)
+		var envelopeFixture struct {
+			BaseMode putEnvelopeRequest `json:"base_mode"`
+		}
+		loadFixture(t, "vault-envelope.json", &envelopeFixture)
+		envelopeBody, _ := marshalJSON(envelopeFixture.BaseMode)
+		if response, protocolErr := opened.HandleAPI(context.Background(), api.Request{
+			Method: "PUT", Path: "/v1/vault-envelope", RequestID: "e2000000-0000-4000-8000-00000000000e",
+			Authorization: authorization(token), Body: envelopeBody, Now: protocolFixtureTime,
+		}); protocolErr != nil || response.Status != http.StatusOK {
+			t.Fatalf("put envelope: response=%+v error=%v", response, protocolErr)
+		}
 		recordID := "e2000000-0000-4000-8000-000000000004"
 		first := makeRevision(deviceID, recordID, "e2000000-0000-4000-8000-000000000005", 1, false, false)
 		seed := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-000000000006", "0", "0", []recordRevision{first})
-		if seed.ServerCursor != "2" || seed.NextCursor != "2" {
+		if seed.ServerCursor != "3" || seed.NextCursor != "3" {
 			t.Fatalf("seed cursors = %+v", seed)
 		}
 		setUptime(t, opened, minimumRetentionUptime)
 		tombstone := makeRevision(deviceID, recordID, "e2000000-0000-4000-8000-000000000007", 2, true, true)
-		withTombstone := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-000000000008", "2", "2", []recordRevision{tombstone})
-		if withTombstone.ServerCursor != "3" || withTombstone.NextCursor != "3" {
+		withTombstone := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-000000000008", "3", "3", []recordRevision{tombstone})
+		if withTombstone.ServerCursor != "4" || withTombstone.NextCursor != "4" {
 			t.Fatalf("tombstone cursors = %+v", withTombstone)
 		}
-		firstPass := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-000000000009", "3", "3", []recordRevision{})
-		if firstPass.ServerCursor != "4" || len(firstPass.Changes) != 1 || firstPass.Changes[0].CollectionMarker == nil {
+		firstPass := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-000000000009", "4", "4", []recordRevision{})
+		if firstPass.ServerCursor != "5" || len(firstPass.Changes) != 1 || firstPass.Changes[0].CollectionMarker == nil {
 			t.Fatalf("first collection pass = %+v", firstPass)
 		}
 		var firstRetained, tombstoneRetained int
@@ -656,30 +667,71 @@ func TestMarkerFallbackPreservesLiveWitnessAndPrunesTombstoneWitness(t *testing.
 		if firstRetained != 0 || tombstoneRetained != 1 {
 			t.Fatalf("first-pass retention: first=%d tombstone=%d", firstRetained, tombstoneRetained)
 		}
+		liveRevision := makeRevision(deviceID,
+			"e2000000-0000-4000-8000-00000000000f",
+			"e2000000-0000-4000-8000-000000000010", 3, false, false)
+		withLiveRevision := syncCall(t, opened, deviceID, token,
+			"e2000000-0000-4000-8000-000000000011", "5", "5", []recordRevision{liveRevision})
+		if withLiveRevision.ServerCursor != "6" || withLiveRevision.NextCursor != "6" {
+			t.Fatalf("live-revision cursors = %+v", withLiveRevision)
+		}
+		retainedSnapshot := createBoundedSnapshot(t, opened, deviceID, token,
+			"e2000000-0000-4000-8000-00000000000d", protocolFixtureTime)
+		rewriteSnapshotPageDescriptor(t, opened, retainedSnapshot.SnapshotID,
+			func(descriptor snapshotPageDescriptor) bool {
+				return slices.Contains(descriptor.RevisionIDs, tombstone.RevisionID)
+			},
+			func(descriptor *snapshotPageDescriptor) {
+				retained := descriptor.RevisionIDs[:0]
+				for _, revisionID := range descriptor.RevisionIDs {
+					if revisionID != tombstone.RevisionID {
+						retained = append(retained, revisionID)
+					}
+				}
+				descriptor.RevisionIDs = retained
+			})
+		deleteSnapshotRevisionReference(t, opened, retainedSnapshot.SnapshotID, tombstone.RevisionID)
+		if err := validateSnapshotsAtCurrentState(t, opened); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot frontier head is missing at cut") {
+			t.Fatalf("retained tombstone snapshot omission error=%v", err)
+		}
+		transaction, err := opened.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if protocolErr := deleteSnapshotAndReleaseObjects(context.Background(), transaction, retainedSnapshot.SnapshotID); protocolErr != nil {
+			transaction.Rollback()
+			t.Fatalf("delete corrupted retained snapshot: %v", protocolErr)
+		}
+		if err := transaction.Commit(); err != nil {
+			t.Fatal(err)
+		}
 		setUptime(t, opened, 2*minimumRetentionUptime)
-		secondPass := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-00000000000a", "4", "4", []recordRevision{})
-		if secondPass.ServerCursor != "4" || len(secondPass.Changes) != 0 {
+		secondPass := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-00000000000a", "6", "6", []recordRevision{})
+		if secondPass.ServerCursor != "6" || len(secondPass.Changes) != 0 {
 			t.Fatalf("second collection pass = %+v", secondPass)
 		}
-		var objectCount, markerCount int
+		var tombstoneObjectCount, markerCount int
 		if err := opened.db.QueryRow("SELECT retained FROM record_revisions WHERE revision_id = ?", tombstone.RevisionID).Scan(&tombstoneRetained); err != nil {
 			t.Fatal(err)
 		}
-		if err := opened.db.QueryRow("SELECT count(*) FROM revision_objects").Scan(&objectCount); err != nil {
+		if err := opened.db.QueryRow(`
+			SELECT count(*) FROM revision_objects o
+			JOIN record_revisions r USING (content_hash)
+			WHERE r.revision_id = ?`, tombstone.RevisionID).Scan(&tombstoneObjectCount); err != nil {
 			t.Fatal(err)
 		}
 		if err := opened.db.QueryRow("SELECT count(*) FROM collection_markers WHERE record_id = ?", recordID).Scan(&markerCount); err != nil {
 			t.Fatal(err)
 		}
-		if tombstoneRetained != 0 || objectCount != 0 || markerCount != 1 {
-			t.Fatalf("tombstone fallback: retained=%d objects=%d markers=%d", tombstoneRetained, objectCount, markerCount)
+		if tombstoneRetained != 0 || tombstoneObjectCount != 0 || markerCount != 1 {
+			t.Fatalf("tombstone fallback: retained=%d objects=%d markers=%d", tombstoneRetained, tombstoneObjectCount, markerCount)
 		}
 		equivocation := tombstone
 		equivocation.RevisionID = "e2000000-0000-4000-8000-00000000000b"
 		equivocationID := "e2000000-0000-4000-8000-00000000000c"
 		equivocationBody, _ := marshalJSON(syncRequest{
 			ProtocolVersion: "1", DeviceID: deviceID, RequestID: equivocationID,
-			AfterCursor: "4", AckCursor: "4", Mutations: []recordRevision{equivocation},
+			AfterCursor: "6", AckCursor: "6", Mutations: []recordRevision{equivocation},
 		})
 		if _, protocolErr := opened.HandleAPI(context.Background(), api.Request{
 			Method: "POST", Path: "/v1/sync", RequestID: equivocationID,

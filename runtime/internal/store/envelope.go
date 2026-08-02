@@ -124,7 +124,7 @@ func (store *Store) handlePutEnvelope(ctx context.Context, call api.Request) (ap
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	newCursor := cursor + 1
-	if protocolErr := insertChange(ctx, transaction, newCursor, "envelope_changed", "", "", call.Now); protocolErr != nil {
+	if protocolErr := insertChange(ctx, transaction, newCursor, "envelope_changed", "", "", "", "", call.Now); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	response := api.Response{Status: http.StatusOK, Body: responseBody}

@@ -243,6 +243,10 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
+	changeTime, err := time.Parse("2006-01-02T15:04:05.000Z", *target.RevokedAt)
+	if err != nil {
+		return api.Response{}, api.NewError("internal_error", true)
+	}
 	body, err := marshalJSON(target)
 	if err != nil {
 		return api.Response{}, api.NewError("internal_error", true)
@@ -266,7 +270,7 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 	}
-	if protocolErr := insertChange(ctx, transaction, newCursor, "device_changed", "", "", call.Now); protocolErr != nil {
+	if protocolErr := insertChange(ctx, transaction, newCursor, "device_changed", "", "", targetDeviceID, "revoked", changeTime); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	checkpoint, protocolErr := store.storeReceipt(ctx, transaction, authenticated.DeviceID, operation, call.RequestID, fingerprint, response, call.Now)

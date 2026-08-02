@@ -17,10 +17,15 @@ import (
 )
 
 type validatedDeviceRow struct {
-	revoked     bool
-	maxCounter  uint64
-	ackCursor   uint64
-	maxReturned uint64
+	createdAt int64
+	// Zero denotes a pre-activation or recovery baseline device. Normal
+	// enrollments carry their permanent change cursor in the enrollment row.
+	createdCursor uint64
+	revoked       bool
+	revokedAt     int64
+	maxCounter    uint64
+	ackCursor     uint64
+	maxReturned   uint64
 }
 
 type validatedMarkerChange struct {
@@ -71,7 +76,7 @@ func validatePersistentState(ctx context.Context, query schemaQueryer, identity 
 	if err := validatePersistentCollectionQueues(ctx, query, serverCursor); err != nil {
 		return err
 	}
-	latestMarkerChanges, err := validatePersistentChanges(ctx, query, serverCursor)
+	latestMarkerChanges, err := validatePersistentChanges(ctx, query, devices, serverCursor)
 	if err != nil {
 		return err
 	}
@@ -104,10 +109,11 @@ func validatePersistentDevices(ctx context.Context, query schemaQueryer, serverC
 	rows, err := query.QueryContext(ctx, `
 		SELECT d.device_id, d.token_hash, length(d.scopes_json),
 		       CASE WHEN length(d.scopes_json) = ? THEN d.scopes_json END,
-		       d.created_at_ms,
+		       d.created_at_ms, e.created_cursor,
 		       d.revoked_at_ms, d.last_sync_at_ms, d.last_ack_cursor,
 		       d.max_author_counter, s.max_returned_cursor
 		FROM devices d LEFT JOIN device_sync_state s USING (device_id)
+		LEFT JOIN enrollments e USING (device_id)
 		ORDER BY d.device_id LIMIT 65`, len(wantScopes))
 	if err != nil {
 		return nil, invalidPersistentState("read device rows")
@@ -119,10 +125,10 @@ func validatePersistentDevices(ctx context.Context, query schemaQueryer, serverC
 		var deviceID string
 		var scopesJSON sql.NullString
 		var scopesLength int64
-		var tokenHash, ackBytes, counterBytes, returnedBytes []byte
+		var tokenHash, createdCursorBytes, ackBytes, counterBytes, returnedBytes []byte
 		var createdAt int64
 		var revokedAt, lastSyncAt sql.NullInt64
-		if rows.Scan(&deviceID, &tokenHash, &scopesLength, &scopesJSON, &createdAt, &revokedAt, &lastSyncAt, &ackBytes, &counterBytes, &returnedBytes) != nil ||
+		if rows.Scan(&deviceID, &tokenHash, &scopesLength, &scopesJSON, &createdAt, &createdCursorBytes, &revokedAt, &lastSyncAt, &ackBytes, &counterBytes, &returnedBytes) != nil ||
 			validateUUID(deviceID) != nil || len(tokenHash) != 32 || !boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) ||
 			previous != "" && previous >= deviceID || validateTimestamp(formatTimestamp(createdAt)) != nil {
 			return nil, invalidPersistentState("invalid device row")
@@ -136,10 +142,24 @@ func validatePersistentDevices(ctx context.Context, query schemaQueryer, serverC
 		ack, ackErr := DecodeUint64(ackBytes)
 		counter, counterErr := DecodeUint64(counterBytes)
 		returned, returnedErr := DecodeUint64(returnedBytes)
-		if ackErr != nil || counterErr != nil || returnedErr != nil || ack > returned || returned > serverCursor {
+		createdCursor := uint64(0)
+		var createdCursorErr error
+		if createdCursorBytes != nil {
+			createdCursor, createdCursorErr = DecodeUint64(createdCursorBytes)
+		}
+		if ackErr != nil || counterErr != nil || returnedErr != nil || createdCursorErr != nil || createdCursorBytes != nil && (createdCursor == 0 || createdCursor > serverCursor) || ack > returned || returned > serverCursor {
 			return nil, invalidPersistentState("invalid device cursor state")
 		}
-		result[deviceID] = validatedDeviceRow{revoked: revokedAt.Valid, maxCounter: counter, ackCursor: ack, maxReturned: returned}
+		result[deviceID] = validatedDeviceRow{
+			createdAt: createdAt, createdCursor: createdCursor,
+			revoked: revokedAt.Valid, maxCounter: counter,
+			ackCursor: ack, maxReturned: returned,
+		}
+		if revokedAt.Valid {
+			row := result[deviceID]
+			row.revokedAt = revokedAt.Int64
+			result[deviceID] = row
+		}
 		if len(result) > 64 {
 			return nil, invalidPersistentState("invalid device registry")
 		}
@@ -169,10 +189,11 @@ func validateReadinessDevices(ctx context.Context, query schemaQueryer, serverCu
 	rows, err := query.QueryContext(ctx, `
 		SELECT d.device_id, d.token_hash, length(d.scopes_json),
 		       CASE WHEN length(d.scopes_json) = ? THEN d.scopes_json END,
-		       d.created_at_ms,
+		       d.created_at_ms, e.created_cursor,
 		       d.revoked_at_ms, d.last_sync_at_ms, d.last_ack_cursor,
 		       d.max_author_counter, s.max_returned_cursor
 		FROM devices d LEFT JOIN device_sync_state s USING (device_id)
+		LEFT JOIN enrollments e USING (device_id)
 		ORDER BY d.device_id LIMIT 65`, len(wantScopes))
 	if err != nil {
 		return invalidPersistentState("read readiness device sentinel")
@@ -184,10 +205,10 @@ func validateReadinessDevices(ctx context.Context, query schemaQueryer, serverCu
 		var deviceID string
 		var scopesJSON sql.NullString
 		var scopesLength int64
-		var tokenHash, ackBytes, counterBytes, returnedBytes []byte
+		var tokenHash, createdCursorBytes, ackBytes, counterBytes, returnedBytes []byte
 		var createdAt int64
 		var revokedAt, lastSyncAt sql.NullInt64
-		if rows.Scan(&deviceID, &tokenHash, &scopesLength, &scopesJSON, &createdAt, &revokedAt, &lastSyncAt, &ackBytes, &counterBytes, &returnedBytes) != nil ||
+		if rows.Scan(&deviceID, &tokenHash, &scopesLength, &scopesJSON, &createdAt, &createdCursorBytes, &revokedAt, &lastSyncAt, &ackBytes, &counterBytes, &returnedBytes) != nil ||
 			validateUUID(deviceID) != nil || len(tokenHash) != 32 || !boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) || validateTimestamp(formatTimestamp(createdAt)) != nil ||
 			revokedAt.Valid && (revokedAt.Int64 < createdAt || validateTimestamp(formatTimestamp(revokedAt.Int64)) != nil) ||
 			lastSyncAt.Valid && (lastSyncAt.Int64 < createdAt || validateTimestamp(formatTimestamp(lastSyncAt.Int64)) != nil) {
@@ -196,7 +217,12 @@ func validateReadinessDevices(ctx context.Context, query schemaQueryer, serverCu
 		ack, ackErr := DecodeUint64(ackBytes)
 		_, counterErr := DecodeUint64(counterBytes)
 		returned, returnedErr := DecodeUint64(returnedBytes)
-		if ackErr != nil || counterErr != nil || returnedErr != nil || ack > returned || returned > serverCursor {
+		createdCursor := uint64(0)
+		var createdCursorErr error
+		if createdCursorBytes != nil {
+			createdCursor, createdCursorErr = DecodeUint64(createdCursorBytes)
+		}
+		if ackErr != nil || counterErr != nil || returnedErr != nil || createdCursorErr != nil || createdCursorBytes != nil && (createdCursor == 0 || createdCursor > serverCursor) || ack > returned || returned > serverCursor {
 			return invalidPersistentState("invalid readiness device cursor")
 		}
 	}
@@ -481,7 +507,8 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		canonicalVector, _ := json.Marshal(entries)
 		deviceRow, authorExists := devices[authorID]
 		if counterErr != nil || uptimeErr != nil || cursorErr != nil || cursor == 0 || cursor > serverCursor || vectorErr != nil ||
-			!bytes.Equal(canonicalVector, vectorBody) || vector[authorID] != counter || !authorExists || counter > deviceRow.maxCounter {
+			!bytes.Equal(canonicalVector, vectorBody) || vector[authorID] != counter || !authorExists ||
+			deviceRow.createdCursor != 0 && deviceRow.createdCursor >= cursor || counter > deviceRow.maxCounter {
 			return nil, invalidPersistentState("inconsistent revision row")
 		}
 		if currentRecord != recordID {
@@ -516,7 +543,7 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		}
 		for vectorDeviceID, vectorCounter := range vector {
 			registry, exists := devices[vectorDeviceID]
-			if !exists || vectorCounter > registry.maxCounter {
+			if !exists || registry.createdCursor != 0 && registry.createdCursor >= cursor || vectorCounter > registry.maxCounter {
 				return nil, invalidPersistentState("revision vector exceeds device registry")
 			}
 		}
@@ -848,7 +875,7 @@ func validatePersistentEnrollmentGrants(ctx context.Context, query schemaQueryer
 	return nil
 }
 
-func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverCursor uint64) (map[string]validatedMarkerChange, error) {
+func validatePersistentChanges(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor uint64) (map[string]validatedMarkerChange, error) {
 	var floorBytes []byte
 	if query.QueryRowContext(ctx, "SELECT cursor_floor FROM runtime_state WHERE singleton = 1").Scan(&floorBytes) != nil {
 		return nil, invalidPersistentState("read cursor floor")
@@ -865,6 +892,10 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 		       CASE WHEN length(c.collection_marker_record_id) = 36 THEN c.collection_marker_record_id END,
 		       length(c.collection_marker_json),
 		       CASE WHEN length(c.collection_marker_json) BETWEEN 1 AND ? THEN c.collection_marker_json END,
+		       length(c.device_changed_id),
+		       CASE WHEN length(c.device_changed_id) = 36 THEN c.device_changed_id END,
+		       length(c.device_change_kind),
+		       CASE WHEN length(c.device_change_kind) BETWEEN 1 AND 8 THEN c.device_change_kind END,
 		       r.retained
 		FROM changes c LEFT JOIN record_revisions r
 		  ON r.revision_id = c.record_revision_id
@@ -876,17 +907,28 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 	previous := uint64(0)
 	retainedCursor := floor
 	latestMarkerChanges := make(map[string]validatedMarkerChange)
+	enrollmentChanges := make(map[string]struct{}, len(devices))
+	revocationChanges := make(map[string]struct{}, len(devices))
 	for rows.Next() {
 		var cursorBytes, markerBody []byte
 		var kind string
 		var receivedAt int64
-		var revisionID, markerID sql.NullString
-		var revisionIDLength, markerIDLength, markerBodyLength sql.NullInt64
+		var revisionID, markerID, changedDeviceID, deviceChangeKind sql.NullString
+		var revisionIDLength, markerIDLength, markerBodyLength, changedDeviceIDLength, deviceChangeKindLength sql.NullInt64
 		var revisionRetained sql.NullInt64
-		if rows.Scan(&cursorBytes, &kind, &receivedAt, &revisionIDLength, &revisionID, &markerIDLength, &markerID, &markerBodyLength, &markerBody, &revisionRetained) != nil ||
+		if rows.Scan(
+			&cursorBytes, &kind, &receivedAt,
+			&revisionIDLength, &revisionID, &markerIDLength, &markerID,
+			&markerBodyLength, &markerBody,
+			&changedDeviceIDLength, &changedDeviceID,
+			&deviceChangeKindLength, &deviceChangeKind,
+			&revisionRetained,
+		) != nil ||
 			!boundedOptionalText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength.Valid && revisionIDLength.Int64 != maxUUIDBytes ||
 			!boundedOptionalText(markerIDLength, markerID, maxUUIDBytes) || markerIDLength.Valid && markerIDLength.Int64 != maxUUIDBytes ||
-			!boundedOptionalBytes(markerBodyLength, markerBody, maxBodyBytes) {
+			!boundedOptionalBytes(markerBodyLength, markerBody, maxBodyBytes) ||
+			!boundedOptionalText(changedDeviceIDLength, changedDeviceID, maxUUIDBytes) || changedDeviceIDLength.Valid && changedDeviceIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalText(deviceChangeKindLength, deviceChangeKind, 8) {
 			return nil, invalidPersistentState("invalid change row")
 		}
 		cursor, err := DecodeUint64(cursorBytes)
@@ -901,7 +943,7 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 		}
 		switch kind {
 		case "record_revision":
-			if !revisionID.Valid || markerID.Valid || markerBody != nil || validateUUID(revisionID.String) != nil {
+			if !revisionID.Valid || markerID.Valid || markerBody != nil || changedDeviceID.Valid || deviceChangeKind.Valid || validateUUID(revisionID.String) != nil {
 				return nil, invalidPersistentState("invalid revision change")
 			}
 			if !revisionRetained.Valid || revisionRetained.Int64 != 1 {
@@ -909,13 +951,39 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 			}
 		case "collection_marker":
 			marker, markerErr := decodeStoredCollectionMarker(markerBody)
-			if revisionID.Valid || !markerID.Valid || markerErr != nil || marker.RecordID != markerID.String {
+			if revisionID.Valid || !markerID.Valid || changedDeviceID.Valid || deviceChangeKind.Valid || markerErr != nil || marker.RecordID != markerID.String {
 				return nil, invalidPersistentState("invalid marker change")
 			}
 			latestMarkerChanges[markerID.String] = validatedMarkerChange{cursor: cursor, body: append([]byte(nil), markerBody...)}
-		case "envelope_changed", "device_changed":
-			if revisionID.Valid || markerID.Valid || markerBody != nil {
+		case "envelope_changed":
+			if revisionID.Valid || markerID.Valid || markerBody != nil || changedDeviceID.Valid || deviceChangeKind.Valid {
 				return nil, invalidPersistentState("invalid metadata change")
+			}
+		case "device_changed":
+			device, exists := devices[changedDeviceID.String]
+			if revisionID.Valid || markerID.Valid || markerBody != nil || !changedDeviceID.Valid || !deviceChangeKind.Valid ||
+				validateUUID(changedDeviceID.String) != nil || !exists {
+				return nil, invalidPersistentState("invalid device change")
+			}
+			switch deviceChangeKind.String {
+			case "enrolled":
+				if cursor != device.createdCursor || receivedAt != device.createdAt {
+					return nil, invalidPersistentState("device enrollment history mismatch")
+				}
+				if _, duplicate := enrollmentChanges[changedDeviceID.String]; duplicate {
+					return nil, invalidPersistentState("duplicate device enrollment change")
+				}
+				enrollmentChanges[changedDeviceID.String] = struct{}{}
+			case "revoked":
+				if !device.revoked || receivedAt != device.revokedAt {
+					return nil, invalidPersistentState("device revocation history mismatch")
+				}
+				if _, duplicate := revocationChanges[changedDeviceID.String]; duplicate {
+					return nil, invalidPersistentState("duplicate device revocation change")
+				}
+				revocationChanges[changedDeviceID.String] = struct{}{}
+			default:
+				return nil, invalidPersistentState("invalid device change kind")
 			}
 		default:
 			return nil, invalidPersistentState("invalid change kind")
@@ -927,6 +995,16 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 	}
 	if retainedCursor != serverCursor {
 		return nil, invalidPersistentState("retained change cursor gap")
+	}
+	for deviceID, device := range devices {
+		_, enrolled := enrollmentChanges[deviceID]
+		if enrolled != (device.createdCursor != 0) {
+			return nil, invalidPersistentState("device enrollment change mismatch")
+		}
+		_, revoked := revocationChanges[deviceID]
+		if revoked && !device.revoked || device.createdCursor != 0 && revoked != device.revoked {
+			return nil, invalidPersistentState("device revocation change mismatch")
+		}
 	}
 	return latestMarkerChanges, nil
 }
@@ -1016,7 +1094,7 @@ func deviceExists(devices map[string]validatedDeviceRow, deviceID string) bool {
 func validatePersistentEnrollmentsAndRotations(ctx context.Context, query schemaQueryer, identity Identity, devices map[string]validatedDeviceRow) error {
 	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	enrollmentRows, err := query.QueryContext(ctx, `
-		SELECT enrollment_id, device_id, token_hash, length(scopes_json),
+		SELECT enrollment_id, device_id, created_cursor, token_hash, length(scopes_json),
 		       CASE WHEN length(scopes_json) = ? THEN scopes_json END,
 		       request_fingerprint, length(response_json),
 		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END,
@@ -1028,15 +1106,20 @@ func validatePersistentEnrollmentsAndRotations(ctx context.Context, query schema
 	for enrollmentRows.Next() {
 		var enrollmentID, deviceID string
 		var scopesJSON sql.NullString
-		var tokenHash, fingerprint, body []byte
+		var createdCursorBytes, tokenHash, fingerprint, body []byte
 		var scopesLength, bodyLength int64
 		var status int
-		if enrollmentRows.Scan(&enrollmentID, &deviceID, &tokenHash, &scopesLength, &scopesJSON, &fingerprint, &bodyLength, &body, &status) != nil ||
+		if enrollmentRows.Scan(&enrollmentID, &deviceID, &createdCursorBytes, &tokenHash, &scopesLength, &scopesJSON, &fingerprint, &bodyLength, &body, &status) != nil ||
 			validateUUID(enrollmentID) != nil || !deviceExists(devices, deviceID) || len(tokenHash) != 32 || len(fingerprint) != 32 ||
 			!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
 			status != http.StatusCreated || validateStoredEnrollmentResponse(body, identity, deviceID) != nil {
 			enrollmentRows.Close()
 			return invalidPersistentState("invalid enrollment row")
+		}
+		createdCursor, cursorErr := DecodeUint64(createdCursorBytes)
+		if cursorErr != nil || createdCursor == 0 || devices[deviceID].createdCursor != createdCursor {
+			enrollmentRows.Close()
+			return invalidPersistentState("invalid enrollment cursor")
 		}
 	}
 	if enrollmentRows.Err() != nil || enrollmentRows.Close() != nil {
@@ -1150,7 +1233,8 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		}
 		cut, cutErr := DecodeUint64(cutBytes)
 		generation, generationErr := DecodeUint64(generationBytes)
-		if cutErr != nil || generationErr != nil || cut > serverCursor {
+		owner := devices[ownerID]
+		if cutErr != nil || generationErr != nil || cut > serverCursor || owner.createdCursor != 0 && owner.createdCursor > cut {
 			rows.Close()
 			return invalidPersistentState("inconsistent snapshot row")
 		}
@@ -1323,20 +1407,6 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 				snapshot.sourceCounters[source.DeviceID] = counter
 			}
 		}
-		// Only a current-cut snapshot can be compared exactly with the live
-		// registry. An older valid cut may predate later enrollments and author
-		// counter advances, which are not copied back into immutable pages.
-		if snapshot.cutCursor == serverCursor {
-			if len(snapshot.sourceCounters) != len(devices) {
-				return invalidPersistentState("snapshot source registry does not match current cut")
-			}
-			for deviceID, device := range devices {
-				counter, exists := snapshot.sourceCounters[deviceID]
-				if !exists || counter != device.maxCounter {
-					return invalidPersistentState("snapshot source registry does not match current cut")
-				}
-			}
-		}
 		phase := -1
 		var previousMarkerID, previousSourceID string
 		for _, page := range snapshot.pages {
@@ -1451,8 +1521,10 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		return invalidPersistentState("read snapshot refs")
 	}
 	type snapshotCutFrontierItem struct {
-		id     string
-		vector map[string]uint64
+		id        string
+		vector    map[string]uint64
+		tombstone bool
+		retained  bool
 	}
 	for _, snapshot := range snapshots {
 		encodedCut := EncodeUint64(snapshot.cutCursor)
@@ -1467,7 +1539,7 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			SELECT revision_id, record_id, author_device_id, author_counter,
 			       length(vector_json),
 			       CASE WHEN length(vector_json) BETWEEN 1 AND ? THEN vector_json END,
-			       change_cursor
+			       tombstone, retained, change_cursor
 			FROM record_revisions
 			WHERE change_cursor <= ?
 			ORDER BY record_id, change_cursor`, maxVectorBytes, encodedCut[:])
@@ -1482,9 +1554,6 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 				return nil
 			}
 			references := referencesByRecord[currentRecord]
-			if len(references) == 0 {
-				return nil
-			}
 			heads := make(map[string]struct{}, len(frontier))
 			for _, item := range frontier {
 				heads[item.id] = struct{}{}
@@ -1494,6 +1563,23 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 					return invalidPersistentState("snapshot reference was dominated at cut")
 				}
 			}
+			for _, item := range frontier {
+				if _, exists := references[item.id]; exists {
+					continue
+				}
+				markerBody, hasMarker := snapshot.markerBodies[currentRecord]
+				// Collection does not allocate a second cursor when it later
+				// removes an exact tombstone witness. The durable retained bit is
+				// therefore the proof that the marker may stand in for that head.
+				if item.tombstone && !item.retained && hasMarker {
+					marker, markerErr := decodeStoredCollectionMarker(markerBody)
+					markerFrontier, _, _, frontierErr := validateCollectionMarker(marker)
+					if markerErr == nil && frontierErr == nil && marker.WitnessRevisionID == item.id && vectorsEqual(markerFrontier, item.vector) {
+						continue
+					}
+				}
+				return invalidPersistentState("snapshot frontier head is missing at cut")
+			}
 			delete(referencesByRecord, currentRecord)
 			return nil
 		}
@@ -1501,9 +1587,10 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			var revisionID, recordID, authorID string
 			var counterBytes, vectorBody, cursorBytes []byte
 			var vectorLength int64
-			if cutRows.Scan(&revisionID, &recordID, &authorID, &counterBytes, &vectorLength, &vectorBody, &cursorBytes) != nil ||
+			var tombstone, retained int
+			if cutRows.Scan(&revisionID, &recordID, &authorID, &counterBytes, &vectorLength, &vectorBody, &tombstone, &retained, &cursorBytes) != nil ||
 				validateUUID(revisionID) != nil || validateUUID(recordID) != nil || validateUUID(authorID) != nil ||
-				!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) {
+				!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || tombstone < 0 || tombstone > 1 || retained < 0 || retained > 1 {
 				cutRows.Close()
 				return invalidPersistentState("invalid snapshot cut revision")
 			}
@@ -1542,7 +1629,9 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 				}
 			}
 			if !dominated {
-				next = append(next, snapshotCutFrontierItem{id: revisionID, vector: vector})
+				next = append(next, snapshotCutFrontierItem{
+					id: revisionID, vector: vector, tombstone: tombstone == 1, retained: retained == 1,
+				})
 				if len(next) > 32 {
 					cutRows.Close()
 					return invalidPersistentState("snapshot cut has too many undominated revisions")
@@ -1567,17 +1656,19 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		if len(referencesByRecord) != 0 {
 			return invalidPersistentState("snapshot reference was not accepted at cut")
 		}
-		for deviceID, counter := range snapshot.sourceCounters {
-			if _, exists := devices[deviceID]; !exists || counter != authorMaxima[deviceID] {
-				return invalidPersistentState("snapshot source counter does not match cut")
+		expectedSources := 0
+		for deviceID, device := range devices {
+			if device.createdCursor != 0 && device.createdCursor > snapshot.cutCursor {
+				continue
+			}
+			expectedSources++
+			counter, exists := snapshot.sourceCounters[deviceID]
+			if !exists || counter != authorMaxima[deviceID] {
+				return invalidPersistentState("snapshot source registry does not match cut")
 			}
 		}
-		for deviceID, counter := range authorMaxima {
-			if counter != 0 {
-				if sourceCounter, exists := snapshot.sourceCounters[deviceID]; !exists || sourceCounter != counter {
-					return invalidPersistentState("snapshot source registry omits cut author")
-				}
-			}
+		if len(snapshot.sourceCounters) != expectedSources {
+			return invalidPersistentState("snapshot source registry does not match cut")
 		}
 
 		remainingMarkers := make(map[string][]byte, len(snapshot.markerBodies))
