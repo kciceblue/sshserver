@@ -245,6 +245,18 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 		WHERE device_id = ? AND revoked_at_ms IS NULL`, revokedAt, targetDeviceID); err != nil {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
+	revokedCursor := EncodeUint64(newCursor)
+	result, err := transaction.ExecContext(ctx, `
+		UPDATE device_origins SET revoked_cursor = ?
+		WHERE device_id = ? AND baseline_revoked = 0 AND revoked_cursor IS NULL`,
+		revokedCursor[:], targetDeviceID)
+	if err != nil {
+		return api.Response{}, api.NewError("internal_error", true)
+	}
+	updatedOrigins, err := result.RowsAffected()
+	if err != nil || updatedOrigins != 1 {
+		return api.Response{}, api.NewError("internal_error", true)
+	}
 	target, targetHash, protocolErr := readDevice(ctx, transaction, targetDeviceID)
 	if protocolErr != nil {
 		return api.Response{}, protocolErr

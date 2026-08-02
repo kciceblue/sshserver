@@ -33,9 +33,12 @@ const createDeviceOriginsV1 = `CREATE TABLE device_origins (
 			device_id TEXT PRIMARY KEY REFERENCES devices(device_id),
 			origin_kind TEXT NOT NULL CHECK (origin_kind IN ('baseline', 'enrolled')),
 			created_cursor BLOB UNIQUE CHECK (created_cursor IS NULL OR length(created_cursor) = 8),
+			revoked_cursor BLOB UNIQUE CHECK (revoked_cursor IS NULL OR length(revoked_cursor) = 8),
 			baseline_revoked INTEGER NOT NULL CHECK (baseline_revoked IN (0, 1)),
 			CHECK ((origin_kind = 'enrolled') = (created_cursor IS NOT NULL)),
-			CHECK (origin_kind = 'baseline' OR baseline_revoked = 0)
+			CHECK (origin_kind = 'baseline' OR baseline_revoked = 0),
+			CHECK (baseline_revoked = 0 OR revoked_cursor IS NULL),
+			CHECK (revoked_cursor IS NULL OR created_cursor IS NULL OR revoked_cursor <> created_cursor)
 		) STRICT`
 
 const createRuntimeStateV1 = `CREATE TABLE runtime_state (
@@ -177,7 +180,10 @@ const createOperationReceiptsV1 = `CREATE TABLE operation_receipts (
 			response_json BLOB NOT NULL,
 			created_at_ms INTEGER NOT NULL,
 			created_uptime_ms BLOB NOT NULL CHECK (length(created_uptime_ms) = 8),
-			UNIQUE (device_id, operation, request_id)
+			UNIQUE (device_id, operation, request_id),
+			UNIQUE (device_id, request_id, operation),
+			UNIQUE (request_id, device_id, operation),
+			UNIQUE (request_fingerprint, receipt_sequence)
 		) STRICT`
 
 const createOperationReceiptRetentionV1 = `CREATE TABLE operation_receipt_retention (
@@ -185,7 +191,8 @@ const createOperationReceiptRetentionV1 = `CREATE TABLE operation_receipt_retent
 			receipt_class TEXT NOT NULL CHECK (receipt_class IN ('sync', 'other')),
 			receipt_sequence INTEGER NOT NULL,
 			created_uptime_ms BLOB NOT NULL CHECK (length(created_uptime_ms) = 8),
-			PRIMARY KEY (device_id, receipt_class, receipt_sequence)
+			PRIMARY KEY (device_id, receipt_class, receipt_sequence),
+			UNIQUE (receipt_sequence)
 		) STRICT`
 
 const createTokenRotationsV1 = `CREATE TABLE token_rotations (

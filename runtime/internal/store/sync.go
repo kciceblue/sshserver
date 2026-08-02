@@ -78,10 +78,6 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 	if afterCursor > serverCursor {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}
-	accumulatedUptimeMS, checkpoint, protocolErr := store.checkpointUptimeTx(ctx, transaction, call.Now)
-	if protocolErr != nil {
-		return api.Response{}, protocolErr
-	}
 	var storedAckBytes, maxCounterBytes, maxReturnedBytes []byte
 	var createdAtMS int64
 	if err := transaction.QueryRowContext(ctx, `
@@ -115,6 +111,10 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 	}
 	if uint64(newCount) > math.MaxUint64-serverCursor {
 		return api.Response{}, api.NewError("server_cursor_exhausted", false)
+	}
+	accumulatedUptimeMS, checkpoint, protocolErr := store.checkpointUptimeTx(ctx, transaction, call.Now)
+	if protocolErr != nil {
+		return api.Response{}, protocolErr
 	}
 	nextAssignedCursor := serverCursor
 	for _, item := range pending {
@@ -497,16 +497,20 @@ func validateVectorRegistry(ctx context.Context, transaction *sql.Tx, authorDevi
 }
 
 func validateRecordCausality(ctx context.Context, transaction *sql.Tx, recordID, revisionID string, candidate map[string]uint64, pending []pendingRevision) *api.Error {
+	markerPresent, protocolErr := preflightCollectionMarkerKey(ctx, transaction, recordID)
+	if protocolErr != nil {
+		return protocolErr
+	}
 	var markerVectorJSON []byte
 	var markerVectorLength int64
-	err := transaction.QueryRowContext(ctx, `
-		SELECT length(frontier_json),
-		       CASE WHEN length(frontier_json) BETWEEN 1 AND ? THEN frontier_json END
-		FROM collection_markers WHERE record_id = ?`, maxVectorBytes, recordID,
-	).Scan(&markerVectorLength, &markerVectorJSON)
-	if err == nil {
+	if markerPresent {
+		err := transaction.QueryRowContext(ctx, `
+			SELECT length(frontier_json),
+			       CASE WHEN length(frontier_json) BETWEEN 1 AND ? THEN frontier_json END
+			FROM collection_markers WHERE record_id = ?`, maxVectorBytes, recordID,
+		).Scan(&markerVectorLength, &markerVectorJSON)
 		var entries []vectorEntry
-		if !boundedRequiredBytes(markerVectorLength, markerVectorJSON, maxVectorBytes) || json.Unmarshal(markerVectorJSON, &entries) != nil {
+		if err != nil || !boundedRequiredBytes(markerVectorLength, markerVectorJSON, maxVectorBytes) || json.Unmarshal(markerVectorJSON, &entries) != nil {
 			return api.NewError("internal_error", true)
 		}
 		frontier, validateErr := validateVector(entries)
@@ -516,8 +520,6 @@ func validateRecordCausality(ctx context.Context, transaction *sql.Tx, recordID,
 		if !vectorDominates(candidate, frontier) {
 			return api.NewError("stale_after_collection", false)
 		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return api.NewError("internal_error", true)
 	}
 	rows, err := transaction.QueryContext(ctx, `
 		SELECT octet_length(r.revision_id),

@@ -478,8 +478,64 @@ func deleteUnreferencedRevisionObject(ctx context.Context, transaction *sql.Tx, 
 	return nil
 }
 
+const collectionMarkerKeyProbeSQL = `
+	SELECT octet_length(record_id),
+	       CASE WHEN typeof(record_id) = 'text'
+	                  AND octet_length(record_id) = ? THEN record_id END
+	FROM collection_markers
+	WHERE record_id >= ? AND record_id < ?
+	UNION ALL
+	SELECT octet_length(record_id),
+	       CASE WHEN typeof(record_id) = 'text'
+	                  AND octet_length(record_id) = ? THEN record_id END
+	FROM collection_markers
+	WHERE record_id >= ? AND record_id < ?
+	LIMIT 2`
+
+// preflightCollectionMarkerKey makes an exact-key miss authoritative without
+// scanning unrelated marker history. The two primary-key ranges use TEXT and
+// BLOB parameters separately because SQLite orders storage classes before
+// values. Each range spans the canonical key and every byte-suffixed variant.
+func preflightCollectionMarkerKey(ctx context.Context, transaction *sql.Tx, recordID string) (bool, *api.Error) {
+	if validateUUID(recordID) != nil {
+		return false, api.NewError("internal_error", true)
+	}
+	lowerBytes := []byte(recordID)
+	upperBytes := append([]byte(nil), lowerBytes...)
+	upperBytes[len(upperBytes)-1]++
+	rows, err := transaction.QueryContext(ctx, collectionMarkerKeyProbeSQL,
+		maxUUIDBytes, recordID, string(upperBytes),
+		maxUUIDBytes, lowerBytes, upperBytes,
+	)
+	if err != nil {
+		return false, api.NewError("internal_error", true)
+	}
+	count := 0
+	for rows.Next() {
+		count++
+		var storedRecordID sql.NullString
+		var recordIDLength int64
+		if rows.Scan(&recordIDLength, &storedRecordID) != nil || recordIDLength != maxUUIDBytes ||
+			!boundedRequiredText(recordIDLength, storedRecordID, maxUUIDBytes) ||
+			validateUUID(storedRecordID.String) != nil || storedRecordID.String != recordID {
+			rows.Close()
+			return false, api.NewError("internal_error", true)
+		}
+	}
+	iterationErr := rows.Err()
+	closeErr := rows.Close()
+	if iterationErr != nil || closeErr != nil || count > 1 {
+		return false, api.NewError("internal_error", true)
+	}
+	return count == 1, nil
+}
+
 func loadCollectionMarker(ctx context.Context, transaction *sql.Tx, recordID string) (storedCollectionMarker, *api.Error) {
 	var marker storedCollectionMarker
+	present, protocolErr := preflightCollectionMarkerKey(ctx, transaction, recordID)
+	if protocolErr != nil || !present {
+		return marker, protocolErr
+	}
 	var witnessRevisionID sql.NullString
 	var frontierBody, authenticator, barrierBytes []byte
 	var witnessRevisionIDLength, frontierLength, bodyLength int64
@@ -493,9 +549,6 @@ func loadCollectionMarker(ctx context.Context, transaction *sql.Tx, recordID str
 		       CASE WHEN length(marker_json) BETWEEN 1 AND ? THEN marker_json END
 		FROM collection_markers WHERE record_id = ?`, maxUUIDBytes, maxVectorBytes, maxBodyBytes, recordID,
 	).Scan(&witnessRevisionIDLength, &witnessRevisionID, &frontierLength, &frontierBody, &authenticator, &barrierBytes, &bodyLength, &marker.body)
-	if errors.Is(err, sql.ErrNoRows) {
-		return marker, nil
-	}
 	if err != nil || witnessRevisionIDLength != maxUUIDBytes || !boundedRequiredText(witnessRevisionIDLength, witnessRevisionID, maxUUIDBytes) || validateUUID(witnessRevisionID.String) != nil ||
 		!boundedRequiredBytes(frontierLength, frontierBody, maxVectorBytes) || len(authenticator) != 32 ||
 		!boundedRequiredBytes(bodyLength, marker.body, maxBodyBytes) {

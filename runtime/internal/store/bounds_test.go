@@ -487,7 +487,7 @@ func TestDeviceRevocationProvenanceFailsClosed(t *testing.T) {
 		if _, err := transaction.Exec("DELETE FROM change_origins WHERE cursor = ?", three[:]); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := transaction.Exec("UPDATE device_origins SET created_cursor = ? WHERE device_id = ?", two[:], deviceID); err != nil {
+		if _, err := transaction.Exec("UPDATE device_origins SET created_cursor = ?, revoked_cursor = ? WHERE device_id = ?", two[:], one[:], deviceID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := transaction.Exec("UPDATE enrollments SET created_cursor = ? WHERE device_id = ?", two[:], deviceID); err != nil {
@@ -496,7 +496,7 @@ func TestDeviceRevocationProvenanceFailsClosed(t *testing.T) {
 		if err := transaction.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		if err := validatePersistentState(context.Background(), opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "device revocation history mismatch") {
+		if err := validatePersistentState(context.Background(), opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid device cursor state") {
 			t.Fatalf("revocation-before-enrollment error=%v", err)
 		}
 	})

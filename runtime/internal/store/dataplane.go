@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -344,6 +345,9 @@ func (store *Store) lookupReceipt(ctx context.Context, transaction *sql.Tx, devi
 		maxBodyBytes, deviceID, operation, requestID,
 	).Scan(&storedFingerprint, &status, &bodyLength, &body)
 	if errors.Is(err, sql.ErrNoRows) {
+		if protocolErr := preflightOperationReceiptKeys(ctx, transaction, deviceID, operation, requestID, fingerprint); protocolErr != nil {
+			return api.Response{}, false, protocolErr
+		}
 		return api.Response{}, false, nil
 	}
 	if err != nil || len(storedFingerprint) != 32 || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
@@ -356,6 +360,179 @@ func (store *Store) lookupReceipt(ctx context.Context, transaction *sql.Tx, devi
 		return api.Response{}, false, api.NewError("request_id_reused", false)
 	}
 	return api.Response{Status: status, Body: append([]byte(nil), body...)}, true, nil
+}
+
+const (
+	receiptRequestCandidateLimit     = 4 // sync, envelope, one revocation, then fail closed.
+	receiptFingerprintCandidateLimit = 2 // A valid fingerprint identifies one retained request.
+)
+
+const receiptDeviceRequestCandidateQuery = `
+	SELECT receipt_sequence FROM (
+		SELECT receipt_sequence FROM operation_receipts
+		WHERE device_id = ? AND request_id >= ? AND request_id < ?
+		UNION ALL
+		SELECT receipt_sequence FROM operation_receipts
+		WHERE device_id = ? AND request_id >= ? AND request_id < ?
+	) LIMIT 4`
+
+const receiptRequestDeviceCandidateQuery = `
+	SELECT receipt_sequence FROM (
+		SELECT receipt_sequence FROM operation_receipts
+		WHERE request_id = ? AND device_id >= ? AND device_id < ?
+		UNION ALL
+		SELECT receipt_sequence FROM operation_receipts
+		WHERE request_id = ? AND device_id >= ? AND device_id < ?
+	) LIMIT 4`
+
+const receiptFingerprintCandidateQuery = `
+	SELECT receipt_sequence FROM operation_receipts
+	WHERE request_fingerprint = ? LIMIT 2`
+
+const receiptCandidateValidationQuery = `
+	SELECT r.receipt_sequence,
+	       octet_length(r.device_id),
+	       CASE WHEN typeof(r.device_id) = 'text' AND octet_length(r.device_id) = ? THEN r.device_id END,
+	       octet_length(r.operation),
+	       CASE WHEN typeof(r.operation) = 'text' AND octet_length(r.operation) BETWEEN 1 AND ? THEN r.operation END,
+	       octet_length(r.request_id),
+	       CASE WHEN typeof(r.request_id) = 'text' AND octet_length(r.request_id) = ? THEN r.request_id END,
+	       q.receipt_sequence,
+	       octet_length(q.device_id),
+	       CASE WHEN typeof(q.device_id) = 'text' AND octet_length(q.device_id) = ? THEN q.device_id END,
+	       CASE WHEN typeof(q.receipt_class) = 'text' AND q.receipt_class IN ('sync', 'other') THEN q.receipt_class END,
+	       r.created_uptime_ms, q.created_uptime_ms
+	FROM operation_receipts r
+	LEFT JOIN operation_receipt_retention q ON q.receipt_sequence = r.receipt_sequence
+	WHERE r.receipt_sequence = ? LIMIT 2`
+
+type receiptKeyCandidateSource uint8
+
+const (
+	receiptLogicalKeyCandidate receiptKeyCandidateSource = 1 << iota
+	receiptFingerprintCandidate
+)
+
+func preflightOperationReceiptKeys(ctx context.Context, transaction *sql.Tx, deviceID, operation, requestID string, fingerprint [32]byte) *api.Error {
+	if validateUUID(deviceID) != nil || !validOperationReceiptKey(operation) || validateUUID(requestID) != nil {
+		return api.NewError("internal_error", true)
+	}
+	deviceTextLower, deviceTextUpper, deviceBlobLower, deviceBlobUpper := receiptKeyPrefixBounds(deviceID)
+	requestTextLower, requestTextUpper, requestBlobLower, requestBlobUpper := receiptKeyPrefixBounds(requestID)
+	candidates := make(map[int64]receiptKeyCandidateSource, receiptRequestCandidateLimit+receiptFingerprintCandidateLimit)
+	if protocolErr := collectReceiptKeyCandidates(ctx, transaction, candidates, receiptLogicalKeyCandidate, receiptRequestCandidateLimit,
+		receiptDeviceRequestCandidateQuery,
+		deviceID, requestTextLower, requestTextUpper,
+		deviceID, requestBlobLower, requestBlobUpper,
+	); protocolErr != nil {
+		return protocolErr
+	}
+	if protocolErr := collectReceiptKeyCandidates(ctx, transaction, candidates, receiptLogicalKeyCandidate, receiptRequestCandidateLimit,
+		receiptRequestDeviceCandidateQuery,
+		requestID, deviceTextLower, deviceTextUpper,
+		requestID, deviceBlobLower, deviceBlobUpper,
+	); protocolErr != nil {
+		return protocolErr
+	}
+	if protocolErr := collectReceiptKeyCandidates(ctx, transaction, candidates, receiptFingerprintCandidate, receiptFingerprintCandidateLimit,
+		receiptFingerprintCandidateQuery, fingerprint[:],
+	); protocolErr != nil {
+		return protocolErr
+	}
+	for sequence, source := range candidates {
+		if protocolErr := validateReceiptKeyCandidate(ctx, transaction, sequence, source, deviceID, operation, requestID); protocolErr != nil {
+			return protocolErr
+		}
+	}
+	return nil
+}
+
+func collectReceiptKeyCandidates(ctx context.Context, transaction *sql.Tx, candidates map[int64]receiptKeyCandidateSource, source receiptKeyCandidateSource, limit int, query string, arguments ...any) *api.Error {
+	rows, err := transaction.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return api.NewError("internal_error", true)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var sequence int64
+		count++
+		if rows.Scan(&sequence) != nil || sequence <= 0 {
+			return api.NewError("internal_error", true)
+		}
+		candidates[sequence] |= source
+	}
+	iterationErr := rows.Err()
+	closeErr := rows.Close()
+	if iterationErr != nil || closeErr != nil || count >= limit {
+		return api.NewError("internal_error", true)
+	}
+	return nil
+}
+
+func validateReceiptKeyCandidate(ctx context.Context, transaction *sql.Tx, sequence int64, source receiptKeyCandidateSource, deviceID, currentOperation, requestID string) *api.Error {
+	if source == 0 || source & ^(receiptLogicalKeyCandidate|receiptFingerprintCandidate) != 0 {
+		return api.NewError("internal_error", true)
+	}
+	rows, err := transaction.QueryContext(ctx, receiptCandidateValidationQuery,
+		maxUUIDBytes, maxOperationBytes, maxUUIDBytes, maxUUIDBytes, sequence)
+	if err != nil {
+		return api.NewError("internal_error", true)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+		var receiptSequence int64
+		var mappingSequence sql.NullInt64
+		var receiptDeviceID, operation, storedRequestID, mappingDeviceID, receiptClass sql.NullString
+		var receiptDeviceIDLength, operationLength, storedRequestIDLength int64
+		var mappingDeviceIDLength sql.NullInt64
+		var receiptUptime, mappingUptime []byte
+		if rows.Scan(
+			&receiptSequence,
+			&receiptDeviceIDLength, &receiptDeviceID,
+			&operationLength, &operation,
+			&storedRequestIDLength, &storedRequestID,
+			&mappingSequence,
+			&mappingDeviceIDLength, &mappingDeviceID, &receiptClass,
+			&receiptUptime, &mappingUptime,
+		) != nil || receiptSequence != sequence ||
+			!boundedRequiredText(receiptDeviceIDLength, receiptDeviceID, maxUUIDBytes) || receiptDeviceIDLength != maxUUIDBytes ||
+			validateUUID(receiptDeviceID.String) != nil || receiptDeviceID.String != deviceID ||
+			!boundedRequiredText(operationLength, operation, maxOperationBytes) || !validOperationReceiptKey(operation.String) ||
+			!boundedRequiredText(storedRequestIDLength, storedRequestID, maxUUIDBytes) || storedRequestIDLength != maxUUIDBytes ||
+			validateUUID(storedRequestID.String) != nil || storedRequestID.String != requestID &&
+			(source&receiptLogicalKeyCandidate != 0 || currentOperation != "vault-envelope" || operation.String != "vault-envelope") ||
+			!mappingSequence.Valid || mappingSequence.Int64 != sequence ||
+			!boundedOptionalText(mappingDeviceIDLength, mappingDeviceID, maxUUIDBytes) || !mappingDeviceIDLength.Valid ||
+			mappingDeviceIDLength.Int64 != maxUUIDBytes || validateUUID(mappingDeviceID.String) != nil || mappingDeviceID.String != receiptDeviceID.String ||
+			!receiptClass.Valid || (operation.String == "sync") != (receiptClass.String == "sync") ||
+			decodeUint64Error(receiptUptime) != nil || decodeUint64Error(mappingUptime) != nil || !bytes.Equal(receiptUptime, mappingUptime) {
+			return api.NewError("internal_error", true)
+		}
+	}
+	iterationErr := rows.Err()
+	closeErr := rows.Close()
+	if iterationErr != nil || closeErr != nil || count != 1 {
+		return api.NewError("internal_error", true)
+	}
+	return nil
+}
+
+func receiptKeyPrefixBounds(value string) (string, string, []byte, []byte) {
+	lower := []byte(value)
+	upper := append([]byte(nil), lower...)
+	upper[len(upper)-1]++
+	return value, string(upper), lower, append([]byte(nil), upper...)
+}
+
+func validOperationReceiptKey(operation string) bool {
+	if operation == "sync" || operation == "vault-envelope" {
+		return true
+	}
+	const prefix = "device-revocation/"
+	return strings.HasPrefix(operation, prefix) && validateUUID(strings.TrimPrefix(operation, prefix)) == nil
 }
 
 func (store *Store) storeReceipt(ctx context.Context, transaction *sql.Tx, deviceID, operation, requestID string, fingerprint [32]byte, response api.Response, now time.Time) (pendingUptimeCheckpoint, *api.Error) {

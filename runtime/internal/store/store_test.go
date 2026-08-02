@@ -320,13 +320,13 @@ func TestOpenMigratesReviewedTask21SchemaWithoutChangingIdentityOrCredentials(t 
 		baselineRevoked int
 	}{{deviceID: deviceID}, {deviceID: preRevokedDeviceID, baselineRevoked: 1}} {
 		var originKind string
-		var originCursor []byte
+		var originCursor, revokedCursor []byte
 		var baselineRevoked int
 		if err := opened.db.QueryRowContext(ctx, `
-			SELECT origin_kind, created_cursor, baseline_revoked
+			SELECT origin_kind, created_cursor, revoked_cursor, baseline_revoked
 			FROM device_origins WHERE device_id = ?`, expected.deviceID,
-		).Scan(&originKind, &originCursor, &baselineRevoked); err != nil || originKind != "baseline" || originCursor != nil || baselineRevoked != expected.baselineRevoked {
-			t.Fatalf("migrated origin %s: kind=%q cursor=%x baseline_revoked=%d error=%v", expected.deviceID, originKind, originCursor, baselineRevoked, err)
+		).Scan(&originKind, &originCursor, &revokedCursor, &baselineRevoked); err != nil || originKind != "baseline" || originCursor != nil || revokedCursor != nil || baselineRevoked != expected.baselineRevoked {
+			t.Fatalf("migrated origin %s: kind=%q cursor=%x revoked_cursor=%x baseline_revoked=%d error=%v", expected.deviceID, originKind, originCursor, revokedCursor, baselineRevoked, err)
 		}
 	}
 	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM enrollments").Scan(&enrollmentRows); err != nil || enrollmentRows != 0 {
