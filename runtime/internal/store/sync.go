@@ -78,7 +78,7 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 	if afterCursor > serverCursor {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}
-	accumulatedUptimeMS, protocolErr := store.checkpointUptimeTx(ctx, transaction, call.Now)
+	accumulatedUptimeMS, checkpoint, protocolErr := store.checkpointUptimeTx(ctx, transaction, call.Now)
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
@@ -269,10 +269,10 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 		}
 	}
 	response := api.Response{Status: http.StatusOK, Body: responseBody}
-	if protocolErr := store.storeReceipt(ctx, transaction, authenticated.DeviceID, "sync", call.RequestID, fingerprint, response, call.Now); protocolErr != nil {
+	if protocolErr := store.storeReceiptAtUptime(ctx, transaction, authenticated.DeviceID, "sync", call.RequestID, fingerprint, response, call.Now, accumulatedUptimeMS); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
-	if protocolErr := commitTransaction(transaction); protocolErr != nil {
+	if protocolErr := store.commitUptimeTransaction(transaction, checkpoint); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	return response, nil

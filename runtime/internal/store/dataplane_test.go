@@ -1580,6 +1580,77 @@ func TestReconstructedFrontierUsesAcceptanceOrder(t *testing.T) {
 	}
 }
 
+func TestRolledBackUptimeCheckpointRetainsElapsedTime(t *testing.T) {
+	opened, _ := openDataPlane(t)
+	defer opened.Close()
+	checkpointStart := protocolFixtureTime
+	checkpointEnd := checkpointStart.Add(time.Hour)
+	opened.ephemeral.mu.Lock()
+	opened.ephemeral.uptimeCheckpoint = checkpointStart
+	opened.ephemeral.mu.Unlock()
+
+	transaction, err := opened.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accumulated, _, protocolErr := opened.checkpointUptimeTx(context.Background(), transaction, checkpointEnd)
+	if protocolErr != nil || accumulated != uint64(time.Hour/time.Millisecond) {
+		transaction.Rollback()
+		t.Fatalf("tentative uptime checkpoint = %d error=%v", accumulated, protocolErr)
+	}
+	if err := transaction.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	opened.ephemeral.mu.Lock()
+	checkpointAfterRollback := opened.ephemeral.uptimeCheckpoint
+	opened.ephemeral.mu.Unlock()
+	if !checkpointAfterRollback.Equal(checkpointStart) {
+		t.Fatalf("rolled-back in-memory checkpoint = %v want %v", checkpointAfterRollback, checkpointStart)
+	}
+	if err := opened.CheckpointUptime(context.Background(), checkpointEnd); err != nil {
+		t.Fatal(err)
+	}
+	var encoded []byte
+	if err := opened.db.QueryRow("SELECT accumulated_uptime_ms FROM runtime_state WHERE singleton = 1").Scan(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	durable, err := DecodeUint64(encoded)
+	if err != nil || durable != uint64(time.Hour/time.Millisecond) {
+		t.Fatalf("durable uptime after retry = %d error=%v", durable, err)
+	}
+}
+
+func TestOversizedRevisionObjectFailsClosedBeforeBodyScan(t *testing.T) {
+	opened, path := openDataPlane(t)
+	deviceID := "de000000-0000-4000-8000-000000000001"
+	token := tokenWithByte(0xde)
+	enrollDevice(
+		t, opened, protocolFixtureTime,
+		"de000000-0000-4000-8000-000000000002",
+		deviceID,
+		"de000000-0000-4000-8000-000000000003",
+		token,
+	)
+	revision := recordRevision{
+		RecordID: "de000000-0000-4000-8000-000000000004", RevisionID: "de000000-0000-4000-8000-000000000005", AuthorDeviceID: deviceID,
+		AuthorCounter: "1", VersionVector: []vectorEntry{{DeviceID: deviceID, Counter: "1"}},
+		PayloadSchema: "1", CryptoSuite: cryptoSuite,
+		Nonce:      base64.RawURLEncoding.EncodeToString(make([]byte, 24)),
+		Ciphertext: base64.RawURLEncoding.EncodeToString(make([]byte, 16)),
+	}
+	syncMutation(t, opened, deviceID, token, "de000000-0000-4000-8000-000000000006", revision, protocolFixtureTime)
+	if _, err := opened.db.Exec("UPDATE revision_objects SET revision_json = zeroblob(?)", maxBodyBytes+1); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(context.Background(), path, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "revision object exceeds body limit") {
+		t.Fatalf("oversized revision startup error = %v", err)
+	}
+}
+
 func TestOperationReceiptRetentionClassesAreIndependent(t *testing.T) {
 	opened, _ := openDataPlane(t)
 	defer opened.Close()

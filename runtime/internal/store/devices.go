@@ -206,10 +206,11 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 	if target.Status == "revoked" {
 		body, _ := marshalJSON(target)
 		response := api.Response{Status: http.StatusOK, Body: body}
-		if protocolErr := store.storeReceipt(ctx, transaction, authenticated.DeviceID, operation, call.RequestID, fingerprint, response, call.Now); protocolErr != nil {
+		checkpoint, protocolErr := store.storeReceipt(ctx, transaction, authenticated.DeviceID, operation, call.RequestID, fingerprint, response, call.Now)
+		if protocolErr != nil {
 			return api.Response{}, protocolErr
 		}
-		if protocolErr := commitTransaction(transaction); protocolErr != nil {
+		if protocolErr := store.commitUptimeTransaction(transaction, checkpoint); protocolErr != nil {
 			return api.Response{}, protocolErr
 		}
 		return response, nil
@@ -264,13 +265,14 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 	if protocolErr := insertChange(ctx, transaction, newCursor, "device_changed", "", "", call.Now); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
-	if protocolErr := store.storeReceipt(ctx, transaction, authenticated.DeviceID, operation, call.RequestID, fingerprint, response, call.Now); protocolErr != nil {
+	checkpoint, protocolErr := store.storeReceipt(ctx, transaction, authenticated.DeviceID, operation, call.RequestID, fingerprint, response, call.Now)
+	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	if protocolErr := setServerCursor(ctx, transaction, newCursor); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
-	if protocolErr := commitTransaction(transaction); protocolErr != nil {
+	if protocolErr := store.commitUptimeTransaction(transaction, checkpoint); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	return response, nil

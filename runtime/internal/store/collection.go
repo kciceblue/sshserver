@@ -41,6 +41,10 @@ type storedCollectionMarker struct {
 	body              []byte
 }
 
+type pendingUptimeCheckpoint struct {
+	next time.Time
+}
+
 // CheckpointUptime durably accounts only positive elapsed daemon-monotonic
 // time. Lost time after an abrupt crash can delay collection but can never
 // accelerate the 90-day retention floor.
@@ -50,35 +54,41 @@ func (store *Store) CheckpointUptime(ctx context.Context, now time.Time) error {
 		return err
 	}
 	defer transaction.Rollback()
-	if _, protocolErr := store.checkpointUptimeTx(ctx, transaction, now); protocolErr != nil {
+	_, checkpoint, protocolErr := store.checkpointUptimeTx(ctx, transaction, now)
+	if protocolErr != nil {
 		return protocolErr
 	}
-	return transaction.Commit()
+	if protocolErr := store.commitUptimeTransaction(transaction, checkpoint); protocolErr != nil {
+		return protocolErr
+	}
+	return nil
 }
 
-func (store *Store) checkpointUptimeTx(ctx context.Context, transaction *sql.Tx, now time.Time) (uint64, *api.Error) {
+func (store *Store) checkpointUptimeTx(ctx context.Context, transaction *sql.Tx, now time.Time) (uint64, pendingUptimeCheckpoint, *api.Error) {
 	store.ephemeral.mu.Lock()
 	if !store.ephemeral.booted {
 		store.ephemeral.mu.Unlock()
-		return 0, api.NewError("internal_error", true)
+		return 0, pendingUptimeCheckpoint{}, api.NewError("internal_error", true)
 	}
-	elapsed := now.Sub(store.ephemeral.uptimeCheckpoint)
+	currentCheckpoint := store.ephemeral.uptimeCheckpoint
+	elapsed := now.Sub(currentCheckpoint)
 	elapsedMilliseconds := elapsed.Milliseconds()
+	nextCheckpoint := currentCheckpoint
 	if elapsedMilliseconds > 0 {
-		store.ephemeral.uptimeCheckpoint = store.ephemeral.uptimeCheckpoint.Add(time.Duration(elapsedMilliseconds) * time.Millisecond)
+		nextCheckpoint = currentCheckpoint.Add(time.Duration(elapsedMilliseconds) * time.Millisecond)
 	}
 	store.ephemeral.mu.Unlock()
 
 	var encoded []byte
 	if err := transaction.QueryRowContext(ctx, "SELECT accumulated_uptime_ms FROM runtime_state WHERE singleton = 1").Scan(&encoded); err != nil {
-		return 0, api.NewError("internal_error", true)
+		return 0, pendingUptimeCheckpoint{}, api.NewError("internal_error", true)
 	}
 	accumulated, err := DecodeUint64(encoded)
 	if err != nil {
-		return 0, api.NewError("internal_error", true)
+		return 0, pendingUptimeCheckpoint{}, api.NewError("internal_error", true)
 	}
 	if elapsedMilliseconds <= 0 {
-		return accumulated, nil
+		return accumulated, pendingUptimeCheckpoint{next: nextCheckpoint}, nil
 	}
 	delta := uint64(elapsedMilliseconds)
 	if delta > math.MaxUint64-accumulated {
@@ -88,9 +98,24 @@ func (store *Store) checkpointUptimeTx(ctx context.Context, transaction *sql.Tx,
 	}
 	updated := EncodeUint64(accumulated)
 	if _, err := transaction.ExecContext(ctx, "UPDATE runtime_state SET accumulated_uptime_ms = ? WHERE singleton = 1", updated[:]); err != nil {
-		return 0, api.NewError("internal_error", true)
+		return 0, pendingUptimeCheckpoint{}, api.NewError("internal_error", true)
 	}
-	return accumulated, nil
+	return accumulated, pendingUptimeCheckpoint{next: nextCheckpoint}, nil
+}
+
+func (store *Store) commitUptimeTransaction(transaction *sql.Tx, checkpoint pendingUptimeCheckpoint) *api.Error {
+	// Hold the ephemeral lock across commit so a transaction that begins as the
+	// connection is released cannot read the old checkpoint and double-account
+	// the same elapsed interval.
+	store.ephemeral.mu.Lock()
+	defer store.ephemeral.mu.Unlock()
+	if err := transaction.Commit(); err != nil {
+		return api.NewError("internal_error", true)
+	}
+	if checkpoint.next.After(store.ephemeral.uptimeCheckpoint) {
+		store.ephemeral.uptimeCheckpoint = checkpoint.next
+	}
+	return nil
 }
 
 func (store *Store) collectEligible(ctx context.Context, transaction *sql.Tx, now time.Time, accumulatedUptimeMS, serverCursor uint64) (uint64, *api.Error) {

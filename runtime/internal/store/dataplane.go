@@ -305,11 +305,18 @@ func (store *Store) lookupReceipt(ctx context.Context, transaction *sql.Tx, devi
 	return api.Response{Status: status, Body: append([]byte(nil), body...)}, true, nil
 }
 
-func (store *Store) storeReceipt(ctx context.Context, transaction *sql.Tx, deviceID, operation, requestID string, fingerprint [32]byte, response api.Response, now time.Time) *api.Error {
-	accumulatedUptimeMS, protocolErr := store.checkpointUptimeTx(ctx, transaction, now)
+func (store *Store) storeReceipt(ctx context.Context, transaction *sql.Tx, deviceID, operation, requestID string, fingerprint [32]byte, response api.Response, now time.Time) (pendingUptimeCheckpoint, *api.Error) {
+	accumulatedUptimeMS, checkpoint, protocolErr := store.checkpointUptimeTx(ctx, transaction, now)
 	if protocolErr != nil {
-		return protocolErr
+		return pendingUptimeCheckpoint{}, protocolErr
 	}
+	if protocolErr := store.storeReceiptAtUptime(ctx, transaction, deviceID, operation, requestID, fingerprint, response, now, accumulatedUptimeMS); protocolErr != nil {
+		return pendingUptimeCheckpoint{}, protocolErr
+	}
+	return checkpoint, nil
+}
+
+func (store *Store) storeReceiptAtUptime(ctx context.Context, transaction *sql.Tx, deviceID, operation, requestID string, fingerprint [32]byte, response api.Response, now time.Time, accumulatedUptimeMS uint64) *api.Error {
 	encodedUptime := EncodeUint64(accumulatedUptimeMS)
 	result, err := transaction.ExecContext(ctx, `
 		INSERT INTO operation_receipts (

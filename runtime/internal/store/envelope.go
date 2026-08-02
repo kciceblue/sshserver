@@ -123,13 +123,14 @@ func (store *Store) handlePutEnvelope(ctx context.Context, call api.Request) (ap
 		return api.Response{}, protocolErr
 	}
 	response := api.Response{Status: http.StatusOK, Body: responseBody}
-	if protocolErr := store.storeReceipt(ctx, transaction, authenticated.DeviceID, "vault-envelope", call.RequestID, fingerprint, response, call.Now); protocolErr != nil {
+	checkpoint, protocolErr := store.storeReceipt(ctx, transaction, authenticated.DeviceID, "vault-envelope", call.RequestID, fingerprint, response, call.Now)
+	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	if protocolErr := setServerCursor(ctx, transaction, newCursor); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
-	if protocolErr := commitTransaction(transaction); protocolErr != nil {
+	if protocolErr := store.commitUptimeTransaction(transaction, checkpoint); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	return response, nil

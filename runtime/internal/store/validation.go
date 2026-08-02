@@ -243,15 +243,22 @@ func validatePersistentEnvelope(ctx context.Context, query schemaQueryer, identi
 }
 
 func validatePersistentRevisionObjects(ctx context.Context, query schemaQueryer) error {
-	rows, err := query.QueryContext(ctx, "SELECT content_hash, revision_json FROM revision_objects ORDER BY content_hash")
+	rows, err := query.QueryContext(ctx, `
+		SELECT content_hash, length(revision_json),
+		       CASE WHEN length(revision_json) BETWEEN 1 AND ? THEN revision_json END
+		FROM revision_objects ORDER BY content_hash`, maxBodyBytes)
 	if err != nil {
 		return invalidPersistentState("read revision objects")
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var hashBytes, body []byte
+		var bodyLength int64
 		var revision recordRevision
-		if rows.Scan(&hashBytes, &body) != nil || len(hashBytes) != 32 || decodeStoredCanonical(body, &revision) != nil {
+		if rows.Scan(&hashBytes, &bodyLength, &body) != nil || len(hashBytes) != 32 || bodyLength <= 0 || bodyLength > maxBodyBytes || int64(len(body)) != bodyLength {
+			return invalidPersistentState("revision object exceeds body limit")
+		}
+		if decodeStoredCanonical(body, &revision) != nil {
 			return invalidPersistentState("invalid revision object")
 		}
 		computed := sha256.Sum256(body)
@@ -371,13 +378,15 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		       r.vector_json, r.collection_witness_authenticator, r.tombstone,
 		       r.content_hash, r.received_at_ms, r.accepted_uptime_ms,
 		       r.change_cursor, r.retained, r.undominated,
-		       o.revision_json, c.cursor
+		       length(o.revision_json),
+		       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END,
+		       c.cursor
 		FROM record_revisions r
 		LEFT JOIN revision_objects o USING (content_hash)
 		LEFT JOIN changes c
 		  ON c.cursor = r.change_cursor AND c.kind = 'record_revision'
 		 AND c.record_revision_id = r.revision_id
-		ORDER BY r.record_id, r.change_cursor`)
+		ORDER BY r.record_id, r.change_cursor`, maxBodyBytes)
 	if err != nil {
 		return nil, invalidPersistentState("read revision rows")
 	}
@@ -404,9 +413,10 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 	for rows.Next() {
 		var revisionID, recordID, authorID string
 		var counterBytes, vectorBody, witness, hashBytes, uptimeBytes, cursorBytes, objectBody, matchingChange []byte
+		var objectLength sql.NullInt64
 		var receivedAt int64
 		var tombstone, retained, undominated int
-		if rows.Scan(&revisionID, &recordID, &authorID, &counterBytes, &vectorBody, &witness, &tombstone, &hashBytes, &receivedAt, &uptimeBytes, &cursorBytes, &retained, &undominated, &objectBody, &matchingChange) != nil ||
+		if rows.Scan(&revisionID, &recordID, &authorID, &counterBytes, &vectorBody, &witness, &tombstone, &hashBytes, &receivedAt, &uptimeBytes, &cursorBytes, &retained, &undominated, &objectLength, &objectBody, &matchingChange) != nil ||
 			validateUUID(revisionID) != nil || validateUUID(recordID) != nil || validateUUID(authorID) != nil || len(hashBytes) != 32 ||
 			witness != nil && len(witness) != 32 || tombstone < 0 || tombstone > 1 || retained < 0 || retained > 1 || undominated < 0 || undominated > 1 ||
 			retained == 0 && undominated != 0 ||
@@ -476,7 +486,10 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 			}
 		}
 		var bodyRevision recordRevision
-		objectExists := objectBody != nil
+		objectExists := objectLength.Valid
+		if objectExists && (objectLength.Int64 <= 0 || objectLength.Int64 > maxBodyBytes || int64(len(objectBody)) != objectLength.Int64) {
+			return nil, invalidPersistentState("revision object exceeds body limit")
+		}
 		if objectExists && decodeStoredCanonical(objectBody, &bodyRevision) != nil {
 			return nil, invalidPersistentState("invalid referenced revision object")
 		}
