@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -204,6 +205,289 @@ func seedBoundedPersistence(t *testing.T, options boundedSeedOptions) boundedPer
 		t.Fatalf("seed persistent state: %v", err)
 	}
 	return seed
+}
+
+func collectBoundedSeedRevision(t *testing.T, seed boundedPersistenceSeed) {
+	t.Helper()
+	one := EncodeUint64(1)
+	floor := EncodeUint64(3)
+	transaction, err := seed.opened.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE record_revisions
+		  SET retained = 0, undominated = 0, collected_generation = ?
+		  WHERE revision_id = ?`, []any{one[:], seed.revisionID}},
+		{"DELETE FROM record_heads WHERE revision_id = ?", []any{seed.revisionID}},
+		{"DELETE FROM changes WHERE record_revision_id = ?", []any{seed.revisionID}},
+		{"DELETE FROM collection_candidates WHERE revision_id = ?", []any{seed.revisionID}},
+		{"DELETE FROM collection_records WHERE record_id = ?", []any{seed.recordID}},
+		{"UPDATE runtime_state SET cursor_floor = ?, collection_generation = ? WHERE singleton = 1", []any{floor[:], one[:]}},
+	} {
+		if _, err := transaction.Exec(statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePersistentState(context.Background(), seed.opened.db, testIdentity); err != nil {
+		t.Fatalf("coherent collected seed: %v", err)
+	}
+}
+
+func TestCollectionGenerationCorruptionFailsClosed(t *testing.T) {
+	one := EncodeUint64(1)
+	two := EncodeUint64(2)
+	zero := EncodeUint64(0)
+	tests := []struct {
+		name   string
+		detail string
+		mutate func(*testing.T, boundedPersistenceSeed)
+	}{
+		{
+			name: "zero collected generation", detail: "inconsistent revision row",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				if _, err := seed.opened.db.Exec("UPDATE record_revisions SET collected_generation = ? WHERE revision_id = ?", zero[:], seed.revisionID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "future collected generation", detail: "inconsistent revision row",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				if _, err := seed.opened.db.Exec("UPDATE record_revisions SET collected_generation = ? WHERE revision_id = ?", two[:], seed.revisionID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "gapped collected generation", detail: "collection generation does not match accepted history",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				transaction, err := seed.opened.db.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer transaction.Rollback()
+				if _, err := transaction.Exec("UPDATE record_revisions SET collected_generation = ? WHERE revision_id = ?", two[:], seed.revisionID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := transaction.Exec("UPDATE runtime_state SET collection_generation = ? WHERE singleton = 1", two[:]); err != nil {
+					t.Fatal(err)
+				}
+				if err := transaction.Commit(); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "inflated runtime generation", detail: "collection generation does not match accepted history",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				if _, err := seed.opened.db.Exec("UPDATE runtime_state SET collection_generation = ? WHERE singleton = 1", two[:]); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "future snapshot generation", detail: "inconsistent snapshot row",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				if _, err := seed.opened.db.Exec("UPDATE snapshots SET collection_generation = ? WHERE snapshot_id = ?", two[:], seed.snapshot.SnapshotID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "post-collection snapshot reference", detail: "snapshot reference was collected before snapshot",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				if _, err := seed.opened.db.Exec("UPDATE snapshots SET collection_generation = ? WHERE snapshot_id = ?", one[:], seed.snapshot.SnapshotID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			seed := seedBoundedPersistence(t, boundedSeedOptions{marker: true})
+			defer seed.opened.Close()
+			collectBoundedSeedRevision(t, seed)
+			test.mutate(t, seed)
+			err := validatePersistentState(context.Background(), seed.opened.db, testIdentity)
+			if !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), test.detail) {
+				t.Fatalf("collection generation corruption error=%v", err)
+			}
+		})
+	}
+}
+
+func TestDeviceOriginProvenanceFailsClosed(t *testing.T) {
+	t.Run("missing origin", func(t *testing.T) {
+		opened, _ := openDataPlane(t)
+		defer opened.Close()
+		deviceID := "f7000000-0000-4000-8000-000000000001"
+		enrollDevice(t, opened, protocolFixtureTime,
+			"f7000000-0000-4000-8000-000000000002", deviceID,
+			"f7000000-0000-4000-8000-000000000003", tokenWithByte(0xf7))
+		if _, err := opened.db.Exec("DELETE FROM device_origins WHERE device_id = ?", deviceID); err != nil {
+			t.Fatal(err)
+		}
+		if err := validatePersistentState(context.Background(), opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid device row") {
+			t.Fatalf("missing device origin error=%v", err)
+		}
+	})
+
+	t.Run("deleted enrollment row and event", func(t *testing.T) {
+		opened, _ := openDataPlane(t)
+		defer opened.Close()
+		deviceID := "f8000000-0000-4000-8000-000000000001"
+		enrollDevice(t, opened, protocolFixtureTime,
+			"f8000000-0000-4000-8000-000000000002", deviceID,
+			"f8000000-0000-4000-8000-000000000003", tokenWithByte(0xf8))
+		one := EncodeUint64(1)
+		transaction, err := opened.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer transaction.Rollback()
+		for _, statement := range []string{
+			"DELETE FROM enrollment_grants",
+			"DELETE FROM enrollments WHERE device_id = 'f8000000-0000-4000-8000-000000000001'",
+			"DELETE FROM changes WHERE device_changed_id = 'f8000000-0000-4000-8000-000000000001' AND device_change_kind = 'enrolled'",
+		} {
+			if _, err := transaction.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := transaction.Exec("UPDATE runtime_state SET cursor_floor = ? WHERE singleton = 1", one[:]); err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := validatePersistentState(context.Background(), opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) {
+			t.Fatalf("deleted enrollment provenance startup error=%v", err)
+		}
+		devices, err := validatePersistentDevices(context.Background(), opened.db, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := validatePersistentChanges(context.Background(), opened.db, devices, 1); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "device enrollment change mismatch") {
+			t.Fatalf("deleted enrollment provenance error=%v", err)
+		}
+	})
+
+	t.Run("origin and enrollment cursor mismatch", func(t *testing.T) {
+		opened, _ := openDataPlane(t)
+		defer opened.Close()
+		deviceID := "f9000000-0000-4000-8000-000000000001"
+		token := tokenWithByte(0xf9)
+		enrollDevice(t, opened, protocolFixtureTime,
+			"f9000000-0000-4000-8000-000000000002", deviceID,
+			"f9000000-0000-4000-8000-000000000003", token)
+		var envelopeFixture struct {
+			BaseMode putEnvelopeRequest `json:"base_mode"`
+		}
+		loadFixture(t, "vault-envelope.json", &envelopeFixture)
+		envelopeBody, _ := marshalJSON(envelopeFixture.BaseMode)
+		if response, protocolErr := opened.HandleAPI(context.Background(), api.Request{
+			Method: "PUT", Path: "/v1/vault-envelope", RequestID: "f9000000-0000-4000-8000-000000000004",
+			Authorization: authorization(token), Body: envelopeBody, Now: protocolFixtureTime,
+		}); protocolErr != nil || response.Status != http.StatusOK {
+			t.Fatalf("put envelope: response=%+v error=%v", response, protocolErr)
+		}
+		two := EncodeUint64(2)
+		if _, err := opened.db.Exec("UPDATE enrollments SET created_cursor = ? WHERE device_id = ?", two[:], deviceID); err != nil {
+			t.Fatal(err)
+		}
+		if err := validatePersistentState(context.Background(), opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid enrollment cursor") {
+			t.Fatalf("origin/enrollment cursor mismatch error=%v", err)
+		}
+	})
+}
+
+func TestDeviceRevocationProvenanceFailsClosed(t *testing.T) {
+	t.Run("active baseline needs revocation event", func(t *testing.T) {
+		ctx := context.Background()
+		opened, err := Open(ctx, filepath.Join(t.TempDir(), "server.db"), testIdentity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer opened.Close()
+		managerID := "fa000000-0000-4000-8000-000000000001"
+		targetID := "fa000000-0000-4000-8000-000000000002"
+		managerToken := tokenWithByte(0xfa)
+		if err := opened.CreateDevice(ctx, managerID, managerToken, auth.FixedScopes(), protocolFixtureTime); err != nil {
+			t.Fatal(err)
+		}
+		if err := opened.CreateDevice(ctx, targetID, tokenWithByte(0xfb), auth.FixedScopes(), protocolFixtureTime); err != nil {
+			t.Fatal(err)
+		}
+		if err := opened.StartBoot(ctx); err != nil {
+			t.Fatal(err)
+		}
+		revokeDevice(t, opened, targetID, managerToken, false, "fa000000-0000-4000-8000-000000000003", protocolFixtureTime.Add(time.Second))
+		one := EncodeUint64(1)
+		if _, err := opened.db.Exec("DELETE FROM changes WHERE device_changed_id = ? AND device_change_kind = 'revoked'", targetID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := opened.db.Exec("UPDATE runtime_state SET cursor_floor = ? WHERE singleton = 1", one[:]); err != nil {
+			t.Fatal(err)
+		}
+		if err := validatePersistentState(ctx, opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) {
+			t.Fatalf("missing baseline revocation startup error=%v", err)
+		}
+		devices, err := validatePersistentDevices(ctx, opened.db, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := validatePersistentChanges(ctx, opened.db, devices, 1); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "device revocation change mismatch") {
+			t.Fatalf("missing baseline revocation event error=%v", err)
+		}
+	})
+
+	t.Run("revocation cannot predate enrollment", func(t *testing.T) {
+		opened, _ := openDataPlane(t)
+		defer opened.Close()
+		deviceID := "fb000000-0000-4000-8000-000000000001"
+		token := tokenWithByte(0xfc)
+		enrollDevice(t, opened, protocolFixtureTime,
+			"fb000000-0000-4000-8000-000000000002", deviceID,
+			"fb000000-0000-4000-8000-000000000003", token)
+		revokeDevice(t, opened, deviceID, token, true, "fb000000-0000-4000-8000-000000000004", protocolFixtureTime.Add(time.Second))
+		one := EncodeUint64(1)
+		two := EncodeUint64(2)
+		three := EncodeUint64(3)
+		transaction, err := opened.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer transaction.Rollback()
+		if _, err := transaction.Exec("UPDATE changes SET cursor = ? WHERE device_changed_id = ? AND device_change_kind = 'revoked'", three[:], deviceID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec("UPDATE changes SET cursor = ? WHERE device_changed_id = ? AND device_change_kind = 'enrolled'", two[:], deviceID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec("UPDATE changes SET cursor = ? WHERE device_changed_id = ? AND device_change_kind = 'revoked'", one[:], deviceID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec("UPDATE device_origins SET created_cursor = ? WHERE device_id = ?", two[:], deviceID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec("UPDATE enrollments SET created_cursor = ? WHERE device_id = ?", two[:], deviceID); err != nil {
+			t.Fatal(err)
+		}
+		if err := transaction.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if err := validatePersistentState(context.Background(), opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "device revocation history mismatch") {
+			t.Fatalf("revocation-before-enrollment error=%v", err)
+		}
+	})
 }
 
 func TestMaximumStoredVectorBoundMatchesCanonicalProfile(t *testing.T) {
@@ -614,7 +898,7 @@ func TestSnapshotReferenceAcceptedAfterCutFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	serverCursor, _, _, err := validatePersistentRuntime(ctx, seed.opened.db)
+	serverCursor, _, _, collectionGeneration, err := validatePersistentRuntime(ctx, seed.opened.db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +906,7 @@ func TestSnapshotReferenceAcceptedAfterCutFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, serverCursor); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot reference accepted after cut") {
+	if err := validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, serverCursor, collectionGeneration); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot reference accepted after cut") {
 		t.Fatalf("post-cut snapshot reference error=%v", err)
 	}
 }
@@ -986,7 +1270,7 @@ func rewriteSnapshotCutCursor(t *testing.T, opened *Store, snapshotID string, cu
 func validateSnapshotsAtCurrentState(t *testing.T, opened *Store) error {
 	t.Helper()
 	ctx := context.Background()
-	serverCursor, _, _, err := validatePersistentRuntime(ctx, opened.db)
+	serverCursor, _, _, collectionGeneration, err := validatePersistentRuntime(ctx, opened.db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -994,7 +1278,7 @@ func validateSnapshotsAtCurrentState(t *testing.T, opened *Store) error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return validatePersistentSnapshots(ctx, opened.db, testIdentity, devices, serverCursor)
+	return validatePersistentSnapshots(ctx, opened.db, testIdentity, devices, serverCursor, collectionGeneration)
 }
 
 func boundedSyncCall(seed boundedPersistenceSeed, requestID, afterCursor string, mutations []recordRevision) api.Request {
@@ -1226,8 +1510,8 @@ func TestOversizedRevisionVectorIsGuardedAtEveryStartupJoin(t *testing.T) {
 		detail string
 		check  func(context.Context, boundedPersistenceSeed, uint64, uint64, map[string]validatedDeviceRow, map[string]validatedMarkerChange) error
 	}{
-		{name: "revision replay", detail: "invalid revision row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, _ uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
-			_, err := validatePersistentRevisions(ctx, seed.opened.db, devices, cursor)
+		{name: "revision replay", detail: "invalid revision row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, collectionGeneration uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
+			_, err := validatePersistentRevisions(ctx, seed.opened.db, devices, cursor, collectionGeneration)
 			return err
 		}},
 		{name: "permanent vector index", detail: "invalid record vector index", check: func(ctx context.Context, seed boundedPersistenceSeed, _, _ uint64, _ map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
@@ -1236,9 +1520,8 @@ func TestOversizedRevisionVectorIsGuardedAtEveryStartupJoin(t *testing.T) {
 		{name: "marker witness join", detail: "invalid marker row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, _ uint64, devices map[string]validatedDeviceRow, changes map[string]validatedMarkerChange) error {
 			return validatePersistentMarkers(ctx, seed.opened.db, devices, cursor, changes)
 		}},
-		{name: "snapshot reference join", detail: "invalid snapshot reference", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, generation uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
-			_ = generation
-			return validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, cursor)
+		{name: "snapshot reference join", detail: "invalid snapshot reference", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, collectionGeneration uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
+			return validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, cursor, collectionGeneration)
 		}},
 	}
 	for _, test := range tests {
@@ -1249,7 +1532,7 @@ func TestOversizedRevisionVectorIsGuardedAtEveryStartupJoin(t *testing.T) {
 				t.Fatal(err)
 			}
 			ctx := context.Background()
-			cursor, generation, _, err := validatePersistentRuntime(ctx, seed.opened.db)
+			cursor, _, _, collectionGeneration, err := validatePersistentRuntime(ctx, seed.opened.db)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1261,7 +1544,7 @@ func TestOversizedRevisionVectorIsGuardedAtEveryStartupJoin(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = test.check(ctx, seed, cursor, generation, devices, changes)
+			err = test.check(ctx, seed, cursor, collectionGeneration, devices, changes)
 			if !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), test.detail) {
 				t.Fatalf("guarded vector join error=%v", err)
 			}
@@ -1284,6 +1567,10 @@ func TestStartupRejectsSixtyFifthDeviceAtSentinel(t *testing.T) {
 		if _, err := transaction.Exec(`
 			INSERT INTO devices (device_id, token_hash, scopes_json, created_at_ms, last_ack_cursor, max_author_counter)
 			VALUES (?, ?, ?, ?, ?, ?)`, deviceID, hash, string(wantScopes), protocolFixtureTime.UnixMilli(), zero[:], zero[:]); err != nil {
+			transaction.Rollback()
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec("INSERT INTO device_origins (device_id, origin_kind, baseline_revoked) VALUES (?, 'baseline', 0)", deviceID); err != nil {
 			transaction.Rollback()
 			t.Fatal(err)
 		}
@@ -1428,6 +1715,10 @@ func TestHistoricalFrontierRejectsCollectedThirtyThirdSiblingBeforeResolution(t 
 			transaction.Rollback()
 			t.Fatal(err)
 		}
+		if _, err := transaction.Exec("INSERT INTO device_origins (device_id, origin_kind, baseline_revoked) VALUES (?, 'baseline', 0)", deviceIDs[index]); err != nil {
+			transaction.Rollback()
+			t.Fatal(err)
+		}
 		if _, err := transaction.Exec("INSERT INTO device_sync_state (device_id, max_returned_cursor) VALUES (?, ?)", deviceIDs[index], zero[:]); err != nil {
 			transaction.Rollback()
 			t.Fatal(err)
@@ -1441,9 +1732,9 @@ func TestHistoricalFrontierRejectsCollectedThirtyThirdSiblingBeforeResolution(t 
 			INSERT INTO record_revisions (
 				revision_id, record_id, author_device_id, author_counter, vector_json,
 				collection_witness_authenticator, tombstone, content_hash, received_at_ms,
-				accepted_uptime_ms, change_cursor, retained, undominated
-			) VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, 0, 0)`,
-			revisionID, recordID, deviceIDs[index], one[:], vectorBody, contentHash[:], protocolFixtureTime.UnixMilli(), zero[:], cursor[:],
+				accepted_uptime_ms, change_cursor, collected_generation, retained, undominated
+			) VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, 0, 0)`,
+			revisionID, recordID, deviceIDs[index], one[:], vectorBody, contentHash[:], protocolFixtureTime.UnixMilli(), zero[:], cursor[:], one[:],
 		); err != nil {
 			transaction.Rollback()
 			t.Fatal(err)
@@ -1502,7 +1793,7 @@ func TestHistoricalFrontierRejectsCollectedThirtyThirdSiblingBeforeResolution(t 
 		}
 	}
 	floor := EncodeUint64(33)
-	if _, err := transaction.Exec("UPDATE runtime_state SET server_cursor = ?, cursor_floor = ? WHERE singleton = 1", cursor34[:], floor[:]); err != nil {
+	if _, err := transaction.Exec("UPDATE runtime_state SET server_cursor = ?, cursor_floor = ?, collection_generation = ? WHERE singleton = 1", cursor34[:], floor[:], one[:]); err != nil {
 		transaction.Rollback()
 		t.Fatal(err)
 	}

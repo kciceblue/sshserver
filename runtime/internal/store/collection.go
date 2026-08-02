@@ -119,6 +119,20 @@ func (store *Store) commitUptimeTransaction(transaction *sql.Tx, checkpoint pend
 }
 
 func (store *Store) collectEligible(ctx context.Context, transaction *sql.Tx, now time.Time, accumulatedUptimeMS, serverCursor uint64) (uint64, *api.Error) {
+	var collectionGenerationBytes []byte
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT collection_generation FROM runtime_state WHERE singleton = 1`,
+	).Scan(&collectionGenerationBytes); err != nil {
+		return 0, api.NewError("internal_error", true)
+	}
+	collectionGeneration, err := DecodeUint64(collectionGenerationBytes)
+	if err != nil {
+		return 0, api.NewError("internal_error", true)
+	}
+	if collectionGeneration == math.MaxUint64 {
+		return serverCursor, nil
+	}
+	collectionAdvanced := false
 	activeAcks, protocolErr := loadActiveAcknowledgements(ctx, transaction)
 	if protocolErr != nil {
 		return 0, protocolErr
@@ -181,11 +195,17 @@ func (store *Store) collectEligible(ctx context.Context, transaction *sql.Tx, no
 				return 0, protocolErr
 			}
 		}
+		if !collectionAdvanced {
+			collectionGeneration++
+			collectionAdvanced = true
+		}
+		encodedCollectionGeneration := EncodeUint64(collectionGeneration)
 
 		for _, candidate := range selected {
 			if _, err := transaction.ExecContext(ctx, `
-				UPDATE record_revisions SET retained = 0, undominated = 0
-				WHERE revision_id = ? AND retained = 1`, candidate.revisionID); err != nil {
+				UPDATE record_revisions
+				SET retained = 0, undominated = 0, collected_generation = ?
+				WHERE revision_id = ? AND retained = 1`, encodedCollectionGeneration[:], candidate.revisionID); err != nil {
 				return 0, api.NewError("internal_error", true)
 			}
 			if _, err := transaction.ExecContext(ctx, "DELETE FROM record_heads WHERE record_id = ? AND revision_id = ?", candidate.recordID, candidate.revisionID); err != nil {
@@ -216,10 +236,12 @@ func (store *Store) collectEligible(ctx context.Context, transaction *sql.Tx, no
 	}
 	encodedFloor := EncodeUint64(cursorFloor)
 	encodedCursor := EncodeUint64(serverCursor)
+	encodedCollectionGeneration := EncodeUint64(collectionGeneration)
 	if _, err := transaction.ExecContext(ctx, `
 		UPDATE runtime_state
-		SET cursor_floor = ?, server_cursor = ?, collection_scan_after_record_id = ?
-		WHERE singleton = 1`, encodedFloor[:], encodedCursor[:], recordIDs[len(recordIDs)-1]); err != nil {
+		SET cursor_floor = ?, server_cursor = ?, collection_generation = ?,
+		    collection_scan_after_record_id = ?
+		WHERE singleton = 1`, encodedFloor[:], encodedCursor[:], encodedCollectionGeneration[:], recordIDs[len(recordIDs)-1]); err != nil {
 		return 0, api.NewError("internal_error", true)
 	}
 	return serverCursor, nil

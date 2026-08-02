@@ -29,12 +29,22 @@ const createDevicesV1 = `CREATE TABLE devices (
 			CHECK (last_sync_at_ms IS NULL OR last_sync_at_ms >= created_at_ms)
 		) STRICT`
 
+const createDeviceOriginsV1 = `CREATE TABLE device_origins (
+			device_id TEXT PRIMARY KEY REFERENCES devices(device_id),
+			origin_kind TEXT NOT NULL CHECK (origin_kind IN ('baseline', 'enrolled')),
+			created_cursor BLOB UNIQUE CHECK (created_cursor IS NULL OR length(created_cursor) = 8),
+			baseline_revoked INTEGER NOT NULL CHECK (baseline_revoked IN (0, 1)),
+			CHECK ((origin_kind = 'enrolled') = (created_cursor IS NOT NULL)),
+			CHECK (origin_kind = 'baseline' OR baseline_revoked = 0)
+		) STRICT`
+
 const createRuntimeStateV1 = `CREATE TABLE runtime_state (
 			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
 			server_cursor BLOB NOT NULL CHECK (length(server_cursor) = 8),
 			cursor_floor BLOB NOT NULL CHECK (length(cursor_floor) = 8),
 			envelope_generation BLOB NOT NULL CHECK (length(envelope_generation) = 8),
 			instance_secret_generation BLOB NOT NULL CHECK (length(instance_secret_generation) = 8),
+			collection_generation BLOB NOT NULL CHECK (length(collection_generation) = 8),
 			accumulated_uptime_ms BLOB NOT NULL CHECK (length(accumulated_uptime_ms) = 8),
 			active_boot_id BLOB CHECK (active_boot_id IS NULL OR length(active_boot_id) = 16),
 			collection_scan_after_record_id TEXT NOT NULL
@@ -87,10 +97,12 @@ const createRecordRevisionsV1 = `CREATE TABLE record_revisions (
 			received_at_ms INTEGER NOT NULL,
 			accepted_uptime_ms BLOB NOT NULL CHECK (length(accepted_uptime_ms) = 8),
 			change_cursor BLOB NOT NULL UNIQUE CHECK (length(change_cursor) = 8),
+			collected_generation BLOB CHECK (collected_generation IS NULL OR length(collected_generation) = 8),
 			retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
 			undominated INTEGER NOT NULL CHECK (undominated IN (0, 1)),
 			UNIQUE (author_device_id, author_counter),
-			CHECK (retained = 1 OR undominated = 0)
+			CHECK (retained = 1 OR undominated = 0),
+			CHECK ((retained = 0) = (collected_generation IS NOT NULL))
 		) STRICT`
 
 const createCollectionRecordsV1 = `CREATE TABLE collection_records (
@@ -194,6 +206,7 @@ const createSnapshotsV1 = `CREATE TABLE snapshots (
 			request_fingerprint BLOB NOT NULL CHECK (length(request_fingerprint) = 32),
 			cut_cursor BLOB NOT NULL CHECK (length(cut_cursor) = 8),
 			envelope_generation BLOB NOT NULL CHECK (length(envelope_generation) = 8),
+			collection_generation BLOB NOT NULL CHECK (length(collection_generation) = 8),
 			expires_at_ms INTEGER NOT NULL,
 			metadata_bytes INTEGER NOT NULL CHECK (metadata_bytes >= 0),
 			create_response_json BLOB NOT NULL,
@@ -220,6 +233,7 @@ var fullSchemaTables = map[string]string{
 	"collection_candidates":       createCollectionCandidatesV1,
 	"collection_markers":          createCollectionMarkersV1,
 	"collection_records":          createCollectionRecordsV1,
+	"device_origins":              createDeviceOriginsV1,
 	"device_sync_state":           createDeviceSyncStateV1,
 	"devices":                     createDevicesV1,
 	"enrollment_grants":           createEnrollmentGrantsV1,
@@ -347,6 +361,7 @@ func createSchemaV1(ctx context.Context, transaction *sql.Tx) error {
 	for _, statement := range []string{
 		createInstanceMetadataV1,
 		createDevicesV1,
+		createDeviceOriginsV1,
 		createRuntimeStateV1,
 		createDeviceSyncStateV1,
 		createEnrollmentGrantsV1,
@@ -378,6 +393,7 @@ func createSchemaV1(ctx context.Context, transaction *sql.Tx) error {
 
 func migrateLegacySchemaV1(ctx context.Context, transaction *sql.Tx) error {
 	for _, statement := range []string{
+		createDeviceOriginsV1,
 		createRuntimeStateV1,
 		createDeviceSyncStateV1,
 		createEnrollmentGrantsV1,
@@ -402,6 +418,15 @@ func migrateLegacySchemaV1(ctx context.Context, transaction *sql.Tx) error {
 		if _, err := transaction.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("migrate storage schema: %w", err)
 		}
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO device_origins (
+			device_id, origin_kind, created_cursor, baseline_revoked
+		)
+		SELECT device_id, 'baseline', NULL,
+		       CASE WHEN revoked_at_ms IS NULL THEN 0 ELSE 1 END
+		FROM devices`); err != nil {
+		return fmt.Errorf("migrate storage schema: record baseline device origins: %w", err)
 	}
 	return nil
 }

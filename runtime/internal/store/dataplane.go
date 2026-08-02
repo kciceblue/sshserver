@@ -448,25 +448,29 @@ func pruneOperationReceipts(ctx context.Context, transaction *sql.Tx, deviceID, 
 	return nil
 }
 
-func readRuntimeState(ctx context.Context, transaction *sql.Tx) (cursor, envelopeGeneration, secretGeneration uint64, err *api.Error) {
-	var cursorBytes, envelopeBytes, secretBytes []byte
+func readRuntimeState(ctx context.Context, transaction *sql.Tx) (cursor, envelopeGeneration, secretGeneration, collectionGeneration uint64, err *api.Error) {
+	var cursorBytes, envelopeBytes, secretBytes, collectionBytes []byte
 	if scanErr := transaction.QueryRowContext(ctx, `
-		SELECT server_cursor, envelope_generation, instance_secret_generation
+		SELECT server_cursor, envelope_generation, instance_secret_generation,
+		       collection_generation
 		FROM runtime_state WHERE singleton = 1`,
-	).Scan(&cursorBytes, &envelopeBytes, &secretBytes); scanErr != nil {
-		return 0, 0, 0, api.NewError("internal_error", true)
+	).Scan(&cursorBytes, &envelopeBytes, &secretBytes, &collectionBytes); scanErr != nil {
+		return 0, 0, 0, 0, api.NewError("internal_error", true)
 	}
 	var decodeErr error
 	if cursor, decodeErr = DecodeUint64(cursorBytes); decodeErr != nil {
-		return 0, 0, 0, api.NewError("internal_error", true)
+		return 0, 0, 0, 0, api.NewError("internal_error", true)
 	}
 	if envelopeGeneration, decodeErr = DecodeUint64(envelopeBytes); decodeErr != nil {
-		return 0, 0, 0, api.NewError("internal_error", true)
+		return 0, 0, 0, 0, api.NewError("internal_error", true)
 	}
 	if secretGeneration, decodeErr = DecodeUint64(secretBytes); decodeErr != nil {
-		return 0, 0, 0, api.NewError("internal_error", true)
+		return 0, 0, 0, 0, api.NewError("internal_error", true)
 	}
-	return cursor, envelopeGeneration, secretGeneration, nil
+	if collectionGeneration, decodeErr = DecodeUint64(collectionBytes); decodeErr != nil {
+		return 0, 0, 0, 0, api.NewError("internal_error", true)
+	}
+	return cursor, envelopeGeneration, secretGeneration, collectionGeneration, nil
 }
 
 func readCursorFloor(ctx context.Context, transaction *sql.Tx) (uint64, *api.Error) {
@@ -482,7 +486,7 @@ func readCursorFloor(ctx context.Context, transaction *sql.Tx) (uint64, *api.Err
 }
 
 func reserveCursors(ctx context.Context, transaction *sql.Tx, count uint64) (uint64, *api.Error) {
-	cursor, _, _, protocolErr := readRuntimeState(ctx, transaction)
+	cursor, _, _, _, protocolErr := readRuntimeState(ctx, transaction)
 	if protocolErr != nil {
 		return 0, protocolErr
 	}

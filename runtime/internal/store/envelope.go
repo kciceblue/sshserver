@@ -24,7 +24,7 @@ func (store *Store) handleGetEnvelope(ctx context.Context, call api.Request) (ap
 	if _, protocolErr := store.authenticate(ctx, transaction, call.Authorization, "envelope:read"); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
-	_, runtimeGeneration, secretGeneration, protocolErr := readRuntimeState(ctx, transaction)
+	_, runtimeGeneration, secretGeneration, _, protocolErr := readRuntimeState(ctx, transaction)
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
@@ -83,7 +83,7 @@ func (store *Store) handlePutEnvelope(ctx context.Context, call api.Request) (ap
 	if response, found, protocolErr := store.lookupReceipt(ctx, transaction, authenticated.DeviceID, "vault-envelope", call.RequestID, fingerprint); protocolErr != nil || found {
 		return response, protocolErr
 	}
-	cursor, storedGeneration, secretGeneration, protocolErr := readRuntimeState(ctx, transaction)
+	cursor, storedGeneration, secretGeneration, _, protocolErr := readRuntimeState(ctx, transaction)
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}

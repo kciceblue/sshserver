@@ -109,7 +109,7 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
-	_, envelopeGeneration, _, protocolErr := readRuntimeState(ctx, transaction)
+	_, envelopeGeneration, _, _, protocolErr := readRuntimeState(ctx, transaction)
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
@@ -124,6 +124,12 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 		) VALUES (?, ?, ?, ?, ?, ?)`,
 		request.DeviceID, tokenHash[:], string(scopesJSON), createdAt.UnixMilli(), zero[:], zero[:],
 	); err != nil {
+		return api.Response{}, api.NewError("internal_error", true)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO device_origins (
+			device_id, origin_kind, created_cursor, baseline_revoked
+		) VALUES (?, 'enrolled', ?, 0)`, request.DeviceID, createdCursor[:]); err != nil {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	if _, err := transaction.ExecContext(ctx, "INSERT INTO device_sync_state (device_id, max_returned_cursor) VALUES (?, ?)", request.DeviceID, zero[:]); err != nil {

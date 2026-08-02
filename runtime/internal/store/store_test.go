@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,6 +256,7 @@ func TestOpenMigratesReviewedTask21SchemaWithoutChangingIdentityOrCredentials(t 
 		t.Fatal(err)
 	}
 	deviceID := "00000000-0000-4000-8000-000000000003"
+	preRevokedDeviceID := "00000000-0000-4000-8000-000000000004"
 	token := tokenWithByte(0x42)
 	hash, err := auth.DeviceTokenHash(testIdentity.InstanceID, testIdentity.VaultID, deviceID, token)
 	if err != nil {
@@ -268,6 +270,22 @@ func TestOpenMigratesReviewedTask21SchemaWithoutChangingIdentityOrCredentials(t 
 			device_id, token_hash, scopes_json, created_at_ms,
 			last_ack_cursor, max_author_counter
 		) VALUES (?, ?, ?, ?, ?, ?)`, deviceID, hash[:], string(scopes), time.Now().UTC().UnixMilli(), zero[:], zero[:]); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	preRevokedToken := tokenWithByte(0x43)
+	preRevokedHash, err := auth.DeviceTokenHash(testIdentity.InstanceID, testIdentity.VaultID, preRevokedDeviceID, preRevokedToken)
+	if err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	createdAt := time.Now().UTC().Add(-time.Second).UnixMilli()
+	revokedAt := createdAt + 1
+	if _, err := raw.ExecContext(ctx, `
+		INSERT INTO devices (
+			device_id, token_hash, scopes_json, created_at_ms, revoked_at_ms,
+			last_ack_cursor, max_author_counter
+		) VALUES (?, ?, ?, ?, ?, ?, ?)`, preRevokedDeviceID, preRevokedHash[:], string(scopes), createdAt, revokedAt, zero[:], zero[:]); err != nil {
 		raw.Close()
 		t.Fatal(err)
 	}
@@ -294,8 +312,22 @@ func TestOpenMigratesReviewedTask21SchemaWithoutChangingIdentityOrCredentials(t 
 	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM runtime_state").Scan(&runtimeRows); err != nil || runtimeRows != 1 {
 		t.Fatalf("runtime rows=%d error=%v", runtimeRows, err)
 	}
-	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM device_sync_state WHERE device_id = ?", deviceID).Scan(&syncRows); err != nil || syncRows != 1 {
+	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM device_sync_state").Scan(&syncRows); err != nil || syncRows != 2 {
 		t.Fatalf("sync rows=%d error=%v", syncRows, err)
+	}
+	for _, expected := range []struct {
+		deviceID        string
+		baselineRevoked int
+	}{{deviceID: deviceID}, {deviceID: preRevokedDeviceID, baselineRevoked: 1}} {
+		var originKind string
+		var originCursor []byte
+		var baselineRevoked int
+		if err := opened.db.QueryRowContext(ctx, `
+			SELECT origin_kind, created_cursor, baseline_revoked
+			FROM device_origins WHERE device_id = ?`, expected.deviceID,
+		).Scan(&originKind, &originCursor, &baselineRevoked); err != nil || originKind != "baseline" || originCursor != nil || baselineRevoked != expected.baselineRevoked {
+			t.Fatalf("migrated origin %s: kind=%q cursor=%x baseline_revoked=%d error=%v", expected.deviceID, originKind, originCursor, baselineRevoked, err)
+		}
 	}
 	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM enrollments").Scan(&enrollmentRows); err != nil || enrollmentRows != 0 {
 		t.Fatalf("migrated baseline enrollment rows=%d error=%v", enrollmentRows, err)
@@ -303,12 +335,36 @@ func TestOpenMigratesReviewedTask21SchemaWithoutChangingIdentityOrCredentials(t 
 	if err := opened.db.QueryRowContext(ctx, "SELECT count(*) FROM changes").Scan(&changeRows); err != nil || changeRows != 0 {
 		t.Fatalf("migrated baseline change rows=%d error=%v", changeRows, err)
 	}
-	var cursorBytes []byte
-	if err := opened.db.QueryRowContext(ctx, "SELECT server_cursor FROM runtime_state WHERE singleton = 1").Scan(&cursorBytes); err != nil {
+	var cursorBytes, collectionGenerationBytes []byte
+	if err := opened.db.QueryRowContext(ctx, "SELECT server_cursor, collection_generation FROM runtime_state WHERE singleton = 1").Scan(&cursorBytes, &collectionGenerationBytes); err != nil {
 		t.Fatal(err)
 	}
 	if cursor, err := DecodeUint64(cursorBytes); err != nil || cursor != 0 {
 		t.Fatalf("migrated baseline cursor=%d error=%v", cursor, err)
+	}
+	if generation, err := DecodeUint64(collectionGenerationBytes); err != nil || generation != 0 {
+		t.Fatalf("migrated collection generation=%d error=%v", generation, err)
+	}
+	one := EncodeUint64(1)
+	transaction, err := opened.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO changes (
+			cursor, kind, received_at_ms, device_changed_id, device_change_kind
+		) VALUES (?, 'device_changed', ?, ?, 'revoked')`, one[:], revokedAt, preRevokedDeviceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transaction.ExecContext(ctx, "UPDATE runtime_state SET server_cursor = ? WHERE singleton = 1", one[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePersistentState(ctx, opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "device revocation change mismatch") {
+		t.Fatalf("spurious migrated-baseline revocation error=%v", err)
 	}
 }
 

@@ -64,7 +64,7 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 	if response, found, protocolErr := store.lookupReceipt(ctx, transaction, authenticated.DeviceID, "sync", call.RequestID, fingerprint); protocolErr != nil || found {
 		return response, protocolErr
 	}
-	serverCursor, envelopeGeneration, _, protocolErr := readRuntimeState(ctx, transaction)
+	serverCursor, envelopeGeneration, _, _, protocolErr := readRuntimeState(ctx, transaction)
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}

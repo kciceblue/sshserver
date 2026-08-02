@@ -114,7 +114,7 @@ func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) 
 	if activeMetadata < 0 || activeMetadata > snapshotMetadataLimit {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
-	serverCursor, envelopeGeneration, secretGeneration, protocolErr := readRuntimeState(ctx, transaction)
+	serverCursor, envelopeGeneration, secretGeneration, collectionGeneration, protocolErr := readRuntimeState(ctx, transaction)
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
@@ -165,14 +165,15 @@ func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) 
 	}
 	cutCursor := EncodeUint64(serverCursor)
 	encodedGeneration := EncodeUint64(envelopeGeneration)
+	encodedCollectionGeneration := EncodeUint64(collectionGeneration)
 	if _, err := transaction.ExecContext(ctx, `
 		INSERT INTO snapshots (
 			snapshot_id, owner_device_id, request_id, request_fingerprint,
-			cut_cursor, envelope_generation, expires_at_ms, metadata_bytes,
-			create_response_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			cut_cursor, envelope_generation, collection_generation,
+			expires_at_ms, metadata_bytes, create_response_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		snapshotID, authenticated.DeviceID, call.RequestID, fingerprint[:], cutCursor[:], encodedGeneration[:],
-		expiresAt.UnixMilli(), metadataBytes, createBody,
+		encodedCollectionGeneration[:], expiresAt.UnixMilli(), metadataBytes, createBody,
 	); err != nil {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
@@ -775,7 +776,7 @@ func accountingUint64(value uint64) []byte {
 func accountSnapshotBase(account *snapshotMetadataAccounting, snapshotID, ownerDeviceID, requestID string, createBody []byte) {
 	zero32 := make([]byte, 32)
 	zero8 := make([]byte, 8)
-	account.addRecord("snapshots.row", []byte(snapshotID), []byte(ownerDeviceID), []byte(requestID), zero32, zero8, zero8, zero8, zero8, createBody)
+	account.addRecord("snapshots.row", []byte(snapshotID), []byte(ownerDeviceID), []byte(requestID), zero32, zero8, zero8, zero8, zero8, zero8, createBody)
 	account.addRecord("snapshots.pk", []byte(snapshotID))
 	account.addRecord("snapshots.owner_request.unique", []byte(ownerDeviceID), []byte(requestID), []byte(snapshotID))
 	account.addRecord("snapshots.monotonic_lease", []byte(snapshotID), zero8)

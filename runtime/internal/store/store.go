@@ -123,7 +123,7 @@ func validateReadinessSnapshot(ctx context.Context, query schemaQueryer, identit
 	if err := validateIdentity(ctx, query, identity); err != nil {
 		return err
 	}
-	serverCursor, envelopeGeneration, secretGeneration, err := validatePersistentRuntime(ctx, query)
+	serverCursor, envelopeGeneration, secretGeneration, _, err := validatePersistentRuntime(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -192,6 +192,12 @@ func (store *Store) CreateDevice(ctx context.Context, deviceID string, token []b
 	)
 	if err != nil {
 		return fmt.Errorf("create device: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO device_origins (
+			device_id, origin_kind, created_cursor, baseline_revoked
+		) VALUES (?, 'baseline', NULL, 0)`, deviceID); err != nil {
+		return fmt.Errorf("create device origin: %w", err)
 	}
 	if _, err := transaction.ExecContext(ctx, "INSERT INTO device_sync_state (device_id, max_returned_cursor) VALUES (?, ?)", deviceID, zero[:]); err != nil {
 		return fmt.Errorf("create device sync state: %w", err)
@@ -322,9 +328,10 @@ func (store *Store) initialize(ctx context.Context) error {
 		if _, err := transaction.ExecContext(ctx, `
 			INSERT INTO runtime_state (
 				singleton, server_cursor, cursor_floor, envelope_generation,
-				instance_secret_generation, accumulated_uptime_ms, active_boot_id,
+				instance_secret_generation, collection_generation,
+				accumulated_uptime_ms, active_boot_id,
 				collection_scan_after_record_id
-			) VALUES (1, ?, ?, ?, ?, ?, NULL, '')`, zero[:], zero[:], zero[:], one[:], zero[:]); err != nil {
+			) VALUES (1, ?, ?, ?, ?, ?, ?, NULL, '')`, zero[:], zero[:], zero[:], one[:], zero[:], zero[:]); err != nil {
 			return fmt.Errorf("initialize runtime state: %w", err)
 		}
 		if _, err := transaction.ExecContext(ctx, `
