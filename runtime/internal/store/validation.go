@@ -102,11 +102,13 @@ func validatePersistentState(ctx context.Context, query schemaQueryer, identity 
 func validatePersistentDevices(ctx context.Context, query schemaQueryer, serverCursor uint64) (map[string]validatedDeviceRow, error) {
 	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	rows, err := query.QueryContext(ctx, `
-		SELECT d.device_id, d.token_hash, d.scopes_json, d.created_at_ms,
+		SELECT d.device_id, d.token_hash, length(d.scopes_json),
+		       CASE WHEN length(d.scopes_json) = ? THEN d.scopes_json END,
+		       d.created_at_ms,
 		       d.revoked_at_ms, d.last_sync_at_ms, d.last_ack_cursor,
 		       d.max_author_counter, s.max_returned_cursor
 		FROM devices d LEFT JOIN device_sync_state s USING (device_id)
-		ORDER BY d.device_id`)
+		ORDER BY d.device_id LIMIT 65`, len(wantScopes))
 	if err != nil {
 		return nil, invalidPersistentState("read device rows")
 	}
@@ -114,12 +116,14 @@ func validatePersistentDevices(ctx context.Context, query schemaQueryer, serverC
 	result := make(map[string]validatedDeviceRow)
 	var previous string
 	for rows.Next() {
-		var deviceID, scopesJSON string
+		var deviceID string
+		var scopesJSON sql.NullString
+		var scopesLength int64
 		var tokenHash, ackBytes, counterBytes, returnedBytes []byte
 		var createdAt int64
 		var revokedAt, lastSyncAt sql.NullInt64
-		if rows.Scan(&deviceID, &tokenHash, &scopesJSON, &createdAt, &revokedAt, &lastSyncAt, &ackBytes, &counterBytes, &returnedBytes) != nil ||
-			validateUUID(deviceID) != nil || len(tokenHash) != 32 || scopesJSON != string(wantScopes) ||
+		if rows.Scan(&deviceID, &tokenHash, &scopesLength, &scopesJSON, &createdAt, &revokedAt, &lastSyncAt, &ackBytes, &counterBytes, &returnedBytes) != nil ||
+			validateUUID(deviceID) != nil || len(tokenHash) != 32 || !boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) ||
 			previous != "" && previous >= deviceID || validateTimestamp(formatTimestamp(createdAt)) != nil {
 			return nil, invalidPersistentState("invalid device row")
 		}
@@ -136,6 +140,9 @@ func validatePersistentDevices(ctx context.Context, query schemaQueryer, serverC
 			return nil, invalidPersistentState("invalid device cursor state")
 		}
 		result[deviceID] = validatedDeviceRow{revoked: revokedAt.Valid, maxCounter: counter, ackCursor: ack, maxReturned: returned}
+		if len(result) > 64 {
+			return nil, invalidPersistentState("invalid device registry")
+		}
 		previous = deviceID
 	}
 	if rows.Err() != nil || len(result) > 64 {
@@ -160,11 +167,13 @@ func validatePersistentDevices(ctx context.Context, query schemaQueryer, serverC
 func validateReadinessDevices(ctx context.Context, query schemaQueryer, serverCursor uint64) error {
 	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	rows, err := query.QueryContext(ctx, `
-		SELECT d.device_id, d.token_hash, d.scopes_json, d.created_at_ms,
+		SELECT d.device_id, d.token_hash, length(d.scopes_json),
+		       CASE WHEN length(d.scopes_json) = ? THEN d.scopes_json END,
+		       d.created_at_ms,
 		       d.revoked_at_ms, d.last_sync_at_ms, d.last_ack_cursor,
 		       d.max_author_counter, s.max_returned_cursor
 		FROM devices d LEFT JOIN device_sync_state s USING (device_id)
-		ORDER BY d.device_id LIMIT 65`)
+		ORDER BY d.device_id LIMIT 65`, len(wantScopes))
 	if err != nil {
 		return invalidPersistentState("read readiness device sentinel")
 	}
@@ -172,12 +181,14 @@ func validateReadinessDevices(ctx context.Context, query schemaQueryer, serverCu
 	count := 0
 	for rows.Next() {
 		count++
-		var deviceID, scopesJSON string
+		var deviceID string
+		var scopesJSON sql.NullString
+		var scopesLength int64
 		var tokenHash, ackBytes, counterBytes, returnedBytes []byte
 		var createdAt int64
 		var revokedAt, lastSyncAt sql.NullInt64
-		if rows.Scan(&deviceID, &tokenHash, &scopesJSON, &createdAt, &revokedAt, &lastSyncAt, &ackBytes, &counterBytes, &returnedBytes) != nil ||
-			validateUUID(deviceID) != nil || len(tokenHash) != 32 || scopesJSON != string(wantScopes) || validateTimestamp(formatTimestamp(createdAt)) != nil ||
+		if rows.Scan(&deviceID, &tokenHash, &scopesLength, &scopesJSON, &createdAt, &revokedAt, &lastSyncAt, &ackBytes, &counterBytes, &returnedBytes) != nil ||
+			validateUUID(deviceID) != nil || len(tokenHash) != 32 || !boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) || validateTimestamp(formatTimestamp(createdAt)) != nil ||
 			revokedAt.Valid && (revokedAt.Int64 < createdAt || validateTimestamp(formatTimestamp(revokedAt.Int64)) != nil) ||
 			lastSyncAt.Valid && (lastSyncAt.Int64 < createdAt || validateTimestamp(formatTimestamp(lastSyncAt.Int64)) != nil) {
 			return invalidPersistentState("invalid readiness device sentinel")
@@ -220,7 +231,12 @@ func validatePersistentRuntime(ctx context.Context, query schemaQueryer) (uint64
 
 func validatePersistentEnvelope(ctx context.Context, query schemaQueryer, identity Identity, runtimeGeneration, secretGeneration uint64) error {
 	var generationBytes, body []byte
-	err := query.QueryRowContext(ctx, "SELECT generation, envelope_json FROM vault_envelope WHERE singleton = 1").Scan(&generationBytes, &body)
+	var bodyLength int64
+	err := query.QueryRowContext(ctx, `
+		SELECT generation, length(envelope_json),
+		       CASE WHEN length(envelope_json) BETWEEN 1 AND ? THEN envelope_json END
+		FROM vault_envelope WHERE singleton = 1`, maxBodyBytes,
+	).Scan(&generationBytes, &bodyLength, &body)
 	if errors.Is(err, sql.ErrNoRows) {
 		if runtimeGeneration != 0 {
 			return invalidPersistentState("runtime envelope generation has no envelope")
@@ -232,7 +248,7 @@ func validatePersistentEnvelope(ctx context.Context, query schemaQueryer, identi
 	}
 	generation, err := DecodeUint64(generationBytes)
 	var envelope vaultEnvelope
-	if err != nil || decodeStoredCanonical(body, &envelope) != nil {
+	if err != nil || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) || decodeStoredCanonical(body, &envelope) != nil {
 		return invalidPersistentState("invalid envelope row")
 	}
 	bodyGeneration, bodySecret, err := validateEnvelope(envelope, identity)
@@ -375,7 +391,11 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 	// revision UUIDs.
 	rows, err := query.QueryContext(ctx, `
 		SELECT r.revision_id, r.record_id, r.author_device_id, r.author_counter,
-		       r.vector_json, r.collection_witness_authenticator, r.tombstone,
+		       length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
+		       length(r.collection_witness_authenticator),
+		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
+		       r.tombstone,
 		       r.content_hash, r.received_at_ms, r.accepted_uptime_ms,
 		       r.change_cursor, r.retained, r.undominated,
 		       length(o.revision_json),
@@ -386,7 +406,7 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		LEFT JOIN changes c
 		  ON c.cursor = r.change_cursor AND c.kind = 'record_revision'
 		 AND c.record_revision_id = r.revision_id
-		ORDER BY r.record_id, r.change_cursor`, maxBodyBytes)
+		ORDER BY r.record_id, r.change_cursor`, maxVectorBytes, maxBodyBytes)
 	if err != nil {
 		return nil, invalidPersistentState("read revision rows")
 	}
@@ -397,28 +417,54 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		vector map[string]uint64
 	}
 	var currentRecord string
-	var frontier []frontierItem
+	var historicalFrontier []frontierItem
+	var retainedFrontier []frontierItem
 	storedHeads := make(map[string]struct{})
 	flushFrontier := func() error {
-		if len(frontier) != len(storedHeads) || len(frontier) > 32 {
+		if len(retainedFrontier) != len(storedHeads) || len(retainedFrontier) > 32 {
 			return invalidPersistentState("invalid stored undominated frontier")
 		}
-		for _, item := range frontier {
+		for _, item := range retainedFrontier {
 			if _, exists := storedHeads[item.id]; !exists {
 				return invalidPersistentState("incorrect stored undominated flag")
 			}
 		}
 		return nil
 	}
+	advanceFrontier := func(frontier []frontierItem, revisionID string, vector map[string]uint64) ([]frontierItem, error) {
+		dominated := false
+		next := frontier[:0]
+		for _, existing := range frontier {
+			if vectorsEqual(existing.vector, vector) {
+				return nil, invalidPersistentState("equal-vector revision equivocation")
+			}
+			if vectorDominates(existing.vector, vector) {
+				dominated = true
+			}
+			if !vectorDominates(vector, existing.vector) {
+				next = append(next, existing)
+			}
+		}
+		if !dominated {
+			next = append(next, frontierItem{id: revisionID, vector: vector})
+			if len(next) > 32 {
+				return nil, invalidPersistentState("too many reconstructed undominated revisions")
+			}
+		}
+		return next, nil
+	}
 	for rows.Next() {
 		var revisionID, recordID, authorID string
 		var counterBytes, vectorBody, witness, hashBytes, uptimeBytes, cursorBytes, objectBody, matchingChange []byte
+		var vectorLength int64
+		var witnessLength sql.NullInt64
 		var objectLength sql.NullInt64
 		var receivedAt int64
 		var tombstone, retained, undominated int
-		if rows.Scan(&revisionID, &recordID, &authorID, &counterBytes, &vectorBody, &witness, &tombstone, &hashBytes, &receivedAt, &uptimeBytes, &cursorBytes, &retained, &undominated, &objectLength, &objectBody, &matchingChange) != nil ||
+		if rows.Scan(&revisionID, &recordID, &authorID, &counterBytes, &vectorLength, &vectorBody, &witnessLength, &witness, &tombstone, &hashBytes, &receivedAt, &uptimeBytes, &cursorBytes, &retained, &undominated, &objectLength, &objectBody, &matchingChange) != nil ||
 			validateUUID(revisionID) != nil || validateUUID(recordID) != nil || validateUUID(authorID) != nil || len(hashBytes) != 32 ||
-			witness != nil && len(witness) != 32 || tombstone < 0 || tombstone > 1 || retained < 0 || retained > 1 || undominated < 0 || undominated > 1 ||
+			!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || !boundedOptionalBytes(witnessLength, witness, 32) || witnessLength.Valid && witnessLength.Int64 != 32 ||
+			tombstone < 0 || tombstone > 1 || retained < 0 || retained > 1 || undominated < 0 || undominated > 1 ||
 			retained == 0 && undominated != 0 ||
 			validateTimestamp(formatTimestamp(receivedAt)) != nil {
 			return nil, invalidPersistentState("invalid revision row")
@@ -445,29 +491,18 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 				}
 			}
 			currentRecord = recordID
-			frontier = nil
+			historicalFrontier = nil
+			retainedFrontier = nil
 			clear(storedHeads)
 		}
+		historicalFrontier, err = advanceFrontier(historicalFrontier, revisionID, vector)
+		if err != nil {
+			return nil, err
+		}
 		if retained == 1 {
-			dominated := false
-			retainedFrontier := frontier[:0]
-			for _, existing := range frontier {
-				if vectorsEqual(existing.vector, vector) {
-					return nil, invalidPersistentState("equal-vector revision equivocation")
-				}
-				if vectorDominates(existing.vector, vector) {
-					dominated = true
-				}
-				if !vectorDominates(vector, existing.vector) {
-					retainedFrontier = append(retainedFrontier, existing)
-				}
-			}
-			frontier = retainedFrontier
-			if !dominated {
-				frontier = append(frontier, frontierItem{id: revisionID, vector: vector})
-				if len(frontier) > 32 {
-					return nil, invalidPersistentState("too many reconstructed undominated revisions")
-				}
+			retainedFrontier, err = advanceFrontier(retainedFrontier, revisionID, vector)
+			if err != nil {
+				return nil, err
 			}
 			if undominated == 1 {
 				storedHeads[revisionID] = struct{}{}
@@ -576,10 +611,11 @@ func validatePersistentRecordHeads(ctx context.Context, query schemaQueryer) err
 func validatePersistentRecordVectorIndex(ctx context.Context, query schemaQueryer) error {
 	rows, err := query.QueryContext(ctx, `
 		SELECT i.record_id, i.vector_hash, i.revision_id,
-		       r.record_id, r.vector_json
+		       r.record_id, length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END
 		FROM record_vector_index i
 		LEFT JOIN record_revisions r ON r.revision_id = i.revision_id
-		ORDER BY i.record_id, i.vector_hash, i.revision_id`)
+		ORDER BY i.record_id, i.vector_hash, i.revision_id`, maxVectorBytes)
 	if err != nil {
 		return invalidPersistentState("read record vector index")
 	}
@@ -587,9 +623,10 @@ func validatePersistentRecordVectorIndex(ctx context.Context, query schemaQuerye
 		var recordID, revisionID string
 		var vectorHash, vectorBody []byte
 		var revisionRecord sql.NullString
-		if rows.Scan(&recordID, &vectorHash, &revisionID, &revisionRecord, &vectorBody) != nil ||
+		var vectorLength sql.NullInt64
+		if rows.Scan(&recordID, &vectorHash, &revisionID, &revisionRecord, &vectorLength, &vectorBody) != nil ||
 			validateUUID(recordID) != nil || validateUUID(revisionID) != nil || len(vectorHash) != 32 || !revisionRecord.Valid || revisionRecord.String != recordID ||
-			vectorBody == nil {
+			!boundedOptionalBytes(vectorLength, vectorBody, maxVectorBytes) || !vectorLength.Valid {
 			rows.Close()
 			return invalidPersistentState("invalid record vector index")
 		}
@@ -706,13 +743,20 @@ func decodeUint64Error(value []byte) error {
 
 func validatePersistentMarkers(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor uint64, latestChanges map[string]validatedMarkerChange) error {
 	rows, err := query.QueryContext(ctx, `
-		SELECT m.record_id, m.witness_revision_id, m.frontier_json,
+		SELECT m.record_id, m.witness_revision_id,
+		       length(m.frontier_json),
+		       CASE WHEN length(m.frontier_json) BETWEEN 1 AND ? THEN m.frontier_json END,
 		       m.collection_witness_authenticator, m.barrier_cursor,
-		       m.marker_json, m.change_cursor, m.received_at_ms,
-		       r.record_id, r.vector_json, r.collection_witness_authenticator
+		       length(m.marker_json),
+		       CASE WHEN length(m.marker_json) BETWEEN 1 AND ? THEN m.marker_json END,
+		       m.change_cursor, m.received_at_ms,
+		       r.record_id, length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
+		       length(r.collection_witness_authenticator),
+		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END
 		FROM collection_markers m
 		LEFT JOIN record_revisions r ON r.revision_id = m.witness_revision_id
-		ORDER BY m.record_id`)
+		ORDER BY m.record_id`, maxVectorBytes, maxBodyBytes, maxVectorBytes)
 	if err != nil {
 		return invalidPersistentState("read marker rows")
 	}
@@ -723,9 +767,14 @@ func validatePersistentMarkers(ctx context.Context, query schemaQueryer, devices
 		var frontierBody, authenticator, barrierBytes, body, changeBytes []byte
 		var witnessRecordID sql.NullString
 		var witnessVector, witnessAuthenticator []byte
+		var frontierLength, bodyLength int64
+		var witnessVectorLength, witnessAuthenticatorLength sql.NullInt64
 		var receivedAt int64
-		if rows.Scan(&recordID, &witnessID, &frontierBody, &authenticator, &barrierBytes, &body, &changeBytes, &receivedAt,
-			&witnessRecordID, &witnessVector, &witnessAuthenticator) != nil || len(authenticator) != 32 {
+		if rows.Scan(&recordID, &witnessID, &frontierLength, &frontierBody, &authenticator, &barrierBytes, &bodyLength, &body, &changeBytes, &receivedAt,
+			&witnessRecordID, &witnessVectorLength, &witnessVector, &witnessAuthenticatorLength, &witnessAuthenticator) != nil ||
+			!boundedRequiredBytes(frontierLength, frontierBody, maxVectorBytes) || len(authenticator) != 32 ||
+			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) || !boundedOptionalBytes(witnessVectorLength, witnessVector, maxVectorBytes) ||
+			!boundedOptionalBytes(witnessAuthenticatorLength, witnessAuthenticator, 32) || witnessAuthenticatorLength.Valid && witnessAuthenticatorLength.Int64 != 32 {
 			return invalidPersistentState("invalid marker row")
 		}
 		latestChange, hasLatestChange := latestChanges[recordID]
@@ -762,7 +811,9 @@ func validatePersistentMarkers(ctx context.Context, query schemaQueryer, devices
 func validatePersistentEnrollmentGrants(ctx context.Context, query schemaQueryer) error {
 	rows, err := query.QueryContext(ctx, `
 		SELECT g.grant_hash, g.boot_id, g.expires_at_ms,
-		       g.consumed_enrollment_id, e.enrollment_id
+		       length(g.consumed_enrollment_id),
+		       CASE WHEN length(g.consumed_enrollment_id) = 36 THEN g.consumed_enrollment_id END,
+		       e.enrollment_id
 		FROM enrollment_grants g
 		LEFT JOIN enrollments e ON e.enrollment_id = g.consumed_enrollment_id
 		ORDER BY g.grant_hash`)
@@ -774,7 +825,9 @@ func validatePersistentEnrollmentGrants(ctx context.Context, query schemaQueryer
 		var grantHash, bootID []byte
 		var expiresAt int64
 		var consumedID, matchedID sql.NullString
-		if rows.Scan(&grantHash, &bootID, &expiresAt, &consumedID, &matchedID) != nil || len(grantHash) != 32 || len(bootID) != 16 ||
+		var consumedLength sql.NullInt64
+		if rows.Scan(&grantHash, &bootID, &expiresAt, &consumedLength, &consumedID, &matchedID) != nil || len(grantHash) != 32 || len(bootID) != 16 ||
+			!boundedOptionalText(consumedLength, consumedID, maxUUIDBytes) || consumedLength.Valid && consumedLength.Int64 != maxUUIDBytes ||
 			validateTimestamp(formatTimestamp(expiresAt)) != nil || consumedID.Valid != matchedID.Valid || consumedID.Valid && consumedID.String != matchedID.String {
 			return invalidPersistentState("invalid enrollment grant")
 		}
@@ -787,12 +840,17 @@ func validatePersistentEnrollmentGrants(ctx context.Context, query schemaQueryer
 
 func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverCursor uint64) (map[string]validatedMarkerChange, error) {
 	rows, err := query.QueryContext(ctx, `
-		SELECT c.cursor, c.kind, c.received_at_ms, c.record_revision_id,
-		       c.collection_marker_record_id, c.collection_marker_json,
+		SELECT c.cursor, c.kind, c.received_at_ms,
+		       length(c.record_revision_id),
+		       CASE WHEN length(c.record_revision_id) = 36 THEN c.record_revision_id END,
+		       length(c.collection_marker_record_id),
+		       CASE WHEN length(c.collection_marker_record_id) = 36 THEN c.collection_marker_record_id END,
+		       length(c.collection_marker_json),
+		       CASE WHEN length(c.collection_marker_json) BETWEEN 1 AND ? THEN c.collection_marker_json END,
 		       r.retained
 		FROM changes c LEFT JOIN record_revisions r
 		  ON r.revision_id = c.record_revision_id
-		ORDER BY c.cursor`)
+		ORDER BY c.cursor`, maxBodyBytes)
 	if err != nil {
 		return nil, invalidPersistentState("read change rows")
 	}
@@ -804,8 +862,12 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 		var kind string
 		var receivedAt int64
 		var revisionID, markerID sql.NullString
+		var revisionIDLength, markerIDLength, markerBodyLength sql.NullInt64
 		var revisionRetained sql.NullInt64
-		if rows.Scan(&cursorBytes, &kind, &receivedAt, &revisionID, &markerID, &markerBody, &revisionRetained) != nil {
+		if rows.Scan(&cursorBytes, &kind, &receivedAt, &revisionIDLength, &revisionID, &markerIDLength, &markerID, &markerBodyLength, &markerBody, &revisionRetained) != nil ||
+			!boundedOptionalText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength.Valid && revisionIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalText(markerIDLength, markerID, maxUUIDBytes) || markerIDLength.Valid && markerIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalBytes(markerBodyLength, markerBody, maxBodyBytes) {
 			return nil, invalidPersistentState("invalid change row")
 		}
 		cursor, err := DecodeUint64(cursorBytes)
@@ -846,21 +908,28 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, serverC
 
 func validatePersistentReceipts(ctx context.Context, query schemaQueryer, identity Identity, devices map[string]validatedDeviceRow) error {
 	rows, err := query.QueryContext(ctx, `
-		SELECT device_id, operation, request_id, request_fingerprint,
-		       response_status, response_json, created_at_ms, created_uptime_ms
-		FROM operation_receipts ORDER BY receipt_sequence`)
+		SELECT device_id, length(operation),
+		       CASE WHEN length(operation) BETWEEN 1 AND ? THEN operation END,
+		       request_id, request_fingerprint, response_status,
+		       length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END,
+		       created_at_ms, created_uptime_ms
+		FROM operation_receipts ORDER BY receipt_sequence`, maxOperationBytes, maxBodyBytes)
 	if err != nil {
 		return invalidPersistentState("read operation receipts")
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var deviceID, operation, requestID string
+		var deviceID, requestID string
+		var operation sql.NullString
 		var fingerprint, body, uptimeBytes []byte
+		var operationLength, bodyLength int64
 		var status int
 		var createdAt int64
-		if rows.Scan(&deviceID, &operation, &requestID, &fingerprint, &status, &body, &createdAt, &uptimeBytes) != nil ||
+		if rows.Scan(&deviceID, &operationLength, &operation, &requestID, &fingerprint, &status, &bodyLength, &body, &createdAt, &uptimeBytes) != nil ||
 			validateUUID(deviceID) != nil || validateUUID(requestID) != nil || len(fingerprint) != 32 || !deviceExists(devices, deviceID) ||
-			validateTimestamp(formatTimestamp(createdAt)) != nil || validateStoredOperationResponse(operation, status, body, identity) != nil {
+			!boundedRequiredText(operationLength, operation, maxOperationBytes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
+			validateTimestamp(formatTimestamp(createdAt)) != nil || validateStoredOperationResponse(operation.String, status, body, identity) != nil {
 			return invalidPersistentState("invalid operation receipt")
 		}
 		if _, err := DecodeUint64(uptimeBytes); err != nil {
@@ -876,11 +945,12 @@ func validatePersistentReceipts(ctx context.Context, query schemaQueryer, identi
 func validatePersistentReceiptRetention(ctx context.Context, query schemaQueryer) error {
 	rows, err := query.QueryContext(ctx, `
 		SELECT q.device_id, q.receipt_class, q.receipt_sequence,
-		       q.created_uptime_ms, r.device_id, r.operation,
+		       q.created_uptime_ms, r.device_id, length(r.operation),
+		       CASE WHEN length(r.operation) BETWEEN 1 AND ? THEN r.operation END,
 		       r.created_uptime_ms
 		FROM operation_receipt_retention q
 		LEFT JOIN operation_receipts r ON r.receipt_sequence = q.receipt_sequence
-		ORDER BY q.device_id, q.receipt_class, q.receipt_sequence`)
+		ORDER BY q.device_id, q.receipt_class, q.receipt_sequence`, maxOperationBytes)
 	if err != nil {
 		return invalidPersistentState("read operation receipt retention")
 	}
@@ -889,9 +959,10 @@ func validatePersistentReceiptRetention(ctx context.Context, query schemaQueryer
 		var sequence int64
 		var uptimeBytes, receiptUptime []byte
 		var receiptDevice, operation sql.NullString
-		if rows.Scan(&deviceID, &receiptClass, &sequence, &uptimeBytes, &receiptDevice, &operation, &receiptUptime) != nil ||
+		var operationLength sql.NullInt64
+		if rows.Scan(&deviceID, &receiptClass, &sequence, &uptimeBytes, &receiptDevice, &operationLength, &operation, &receiptUptime) != nil ||
 			validateUUID(deviceID) != nil || sequence <= 0 || decodeUint64Error(uptimeBytes) != nil || !receiptDevice.Valid || receiptDevice.String != deviceID ||
-			!operation.Valid || !bytes.Equal(uptimeBytes, receiptUptime) || receiptClass != "sync" && receiptClass != "other" ||
+			!boundedOptionalText(operationLength, operation, maxOperationBytes) || !operationLength.Valid || !bytes.Equal(uptimeBytes, receiptUptime) || receiptClass != "sync" && receiptClass != "other" ||
 			receiptClass == "sync" != (operation.String == "sync") {
 			rows.Close()
 			return invalidPersistentState("invalid operation receipt retention")
@@ -918,20 +989,26 @@ func deviceExists(devices map[string]validatedDeviceRow, deviceID string) bool {
 }
 
 func validatePersistentEnrollmentsAndRotations(ctx context.Context, query schemaQueryer, identity Identity, devices map[string]validatedDeviceRow) error {
+	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	enrollmentRows, err := query.QueryContext(ctx, `
-		SELECT enrollment_id, device_id, token_hash, scopes_json,
-		       request_fingerprint, response_json, created_status
-		FROM enrollments ORDER BY enrollment_id`)
+		SELECT enrollment_id, device_id, token_hash, length(scopes_json),
+		       CASE WHEN length(scopes_json) = ? THEN scopes_json END,
+		       request_fingerprint, length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END,
+		       created_status
+		FROM enrollments ORDER BY enrollment_id`, len(wantScopes), maxBodyBytes)
 	if err != nil {
 		return invalidPersistentState("read enrollment rows")
 	}
-	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	for enrollmentRows.Next() {
-		var enrollmentID, deviceID, scopesJSON string
+		var enrollmentID, deviceID string
+		var scopesJSON sql.NullString
 		var tokenHash, fingerprint, body []byte
+		var scopesLength, bodyLength int64
 		var status int
-		if enrollmentRows.Scan(&enrollmentID, &deviceID, &tokenHash, &scopesJSON, &fingerprint, &body, &status) != nil ||
-			validateUUID(enrollmentID) != nil || !deviceExists(devices, deviceID) || len(tokenHash) != 32 || len(fingerprint) != 32 || scopesJSON != string(wantScopes) ||
+		if enrollmentRows.Scan(&enrollmentID, &deviceID, &tokenHash, &scopesLength, &scopesJSON, &fingerprint, &bodyLength, &body, &status) != nil ||
+			validateUUID(enrollmentID) != nil || !deviceExists(devices, deviceID) || len(tokenHash) != 32 || len(fingerprint) != 32 ||
+			!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
 			status != http.StatusCreated || validateStoredEnrollmentResponse(body, identity, deviceID) != nil {
 			enrollmentRows.Close()
 			return invalidPersistentState("invalid enrollment row")
@@ -943,19 +1020,23 @@ func validatePersistentEnrollmentsAndRotations(ctx context.Context, query schema
 
 	rotationRows, err := query.QueryContext(ctx, `
 		SELECT rotation_id, device_id, old_token_hash, new_token_hash,
-		       request_fingerprint, response_json, created_at_ms
-		FROM token_rotations ORDER BY rotation_id`)
+		       request_fingerprint, length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END,
+		       created_at_ms
+		FROM token_rotations ORDER BY rotation_id`, maxBodyBytes)
 	if err != nil {
 		return invalidPersistentState("read rotation rows")
 	}
 	for rotationRows.Next() {
 		var rotationID, deviceID string
 		var oldHash, newHash, fingerprint, body []byte
+		var bodyLength int64
 		var createdAt int64
 		var response device
-		if rotationRows.Scan(&rotationID, &deviceID, &oldHash, &newHash, &fingerprint, &body, &createdAt) != nil ||
+		if rotationRows.Scan(&rotationID, &deviceID, &oldHash, &newHash, &fingerprint, &bodyLength, &body, &createdAt) != nil ||
 			validateUUID(rotationID) != nil || !deviceExists(devices, deviceID) || len(oldHash) != 32 || len(newHash) != 32 || len(fingerprint) != 32 ||
-			validateTimestamp(formatTimestamp(createdAt)) != nil || decodeStoredCanonical(body, &response) != nil || validateDevice(response) != nil || response.DeviceID != deviceID {
+			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) || validateTimestamp(formatTimestamp(createdAt)) != nil ||
+			decodeStoredCanonical(body, &response) != nil || validateDevice(response) != nil || response.DeviceID != deviceID {
 			rotationRows.Close()
 			return invalidPersistentState("invalid token rotation row")
 		}
@@ -966,19 +1047,24 @@ func validatePersistentEnrollmentsAndRotations(ctx context.Context, query schema
 
 	selfRows, err := query.QueryContext(ctx, `
 		SELECT device_id, request_id, body_fingerprint, pre_revocation_token_hash,
-		       response_status, response_headers_json, response_json
-		FROM self_revocation_receipts ORDER BY device_id`)
+		       response_status, length(response_headers_json),
+		       CASE WHEN length(response_headers_json) BETWEEN 1 AND ? THEN response_headers_json END,
+		       length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
+		FROM self_revocation_receipts ORDER BY device_id`, maxBodyBytes, maxBodyBytes)
 	if err != nil {
 		return invalidPersistentState("read self-revocation receipts")
 	}
 	for selfRows.Next() {
 		var deviceID, requestID string
 		var fingerprint, tokenHash, headersBody, body []byte
+		var headersLength, bodyLength int64
 		var status int
 		var headers []api.Header
 		var response device
-		if selfRows.Scan(&deviceID, &requestID, &fingerprint, &tokenHash, &status, &headersBody, &body) != nil ||
+		if selfRows.Scan(&deviceID, &requestID, &fingerprint, &tokenHash, &status, &headersLength, &headersBody, &bodyLength, &body) != nil ||
 			validateUUID(requestID) != nil || len(fingerprint) != 32 || len(tokenHash) != 32 || !devices[deviceID].revoked || status != http.StatusOK ||
+			!boundedRequiredBytes(headersLength, headersBody, maxBodyBytes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
 			json.Unmarshal(headersBody, &headers) != nil || !slices.Equal(headers, api.V1ResponseHeaders(requestID, len(body))) ||
 			decodeStoredCanonical(body, &response) != nil || validateDevice(response) != nil || response.DeviceID != deviceID || response.Status != "revoked" {
 			selfRows.Close()
@@ -1042,7 +1128,7 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			rows.Close()
 			return invalidPersistentState("inconsistent snapshot row")
 		}
-		if createBodyLength < 0 || createBodyLength > metadataBytes || createBodyLength > snapshotMetadataLimit {
+		if createBodyLength <= 0 || createBodyLength > metadataBytes || createBodyLength > maxBodyBytes {
 			rows.Close()
 			return invalidPersistentState("snapshot create response exceeds declared metadata")
 		}
@@ -1076,8 +1162,8 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 
 	createRows, err := query.QueryContext(ctx, `
 		SELECT snapshot_id, length(create_response_json),
-		       CASE WHEN length(create_response_json) <= ? THEN create_response_json END
-		FROM snapshots ORDER BY snapshot_id`, snapshotMetadataLimit)
+		       CASE WHEN length(create_response_json) BETWEEN 1 AND ? THEN create_response_json END
+		FROM snapshots ORDER BY snapshot_id`, maxBodyBytes)
 	if err != nil {
 		return invalidPersistentState("read snapshot create responses")
 	}
@@ -1091,7 +1177,7 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			return invalidPersistentState("invalid snapshot create response")
 		}
 		snapshot := snapshots[snapshotID]
-		if snapshot == nil || bodyLength != snapshot.createBodyLength || int64(len(body)) != bodyLength {
+		if snapshot == nil || bodyLength != snapshot.createBodyLength || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
 			createRows.Close()
 			return invalidPersistentState("snapshot create response exceeds declared metadata")
 		}
@@ -1128,7 +1214,7 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			pageRows.Close()
 			return invalidPersistentState("invalid snapshot page")
 		}
-		if bodyLength < 0 || bodyLength > snapshot.metadataBytes || bodyLength > snapshotMetadataLimit {
+		if bodyLength <= 0 || bodyLength > snapshot.metadataBytes || bodyLength > maxBodyBytes {
 			pageRows.Close()
 			return invalidPersistentState("snapshot page response exceeds declared metadata")
 		}
@@ -1147,8 +1233,8 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 
 	pageBodyRows, err := query.QueryContext(ctx, `
 		SELECT snapshot_id, page_index, length(response_json),
-		       CASE WHEN length(response_json) <= ? THEN response_json END
-		FROM snapshot_pages ORDER BY snapshot_id, page_index`, snapshotMetadataLimit)
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
+		FROM snapshot_pages ORDER BY snapshot_id, page_index`, maxBodyBytes)
 	if err != nil {
 		return invalidPersistentState("read snapshot page responses")
 	}
@@ -1162,7 +1248,8 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			return invalidPersistentState("invalid snapshot page response")
 		}
 		snapshot := snapshots[snapshotID]
-		if snapshot == nil || index < 0 || index >= int64(len(snapshot.pages)) || snapshot.pageBodyLengths[index] != bodyLength || int64(len(body)) != bodyLength {
+		if snapshot == nil || index < 0 || index >= int64(len(snapshot.pages)) || snapshot.pageBodyLengths[index] != bodyLength ||
+			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
 			pageBodyRows.Close()
 			return invalidPersistentState("snapshot page response exceeds declared metadata")
 		}
@@ -1253,12 +1340,14 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 	refRows, err := query.QueryContext(ctx, `
 		SELECT s.snapshot_id, s.revision_id, s.content_hash,
 		       r.revision_id, r.record_id, r.author_device_id,
-		       r.author_counter, r.vector_json, o.content_hash
+		       r.author_counter, length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
+		       o.content_hash
 		FROM snapshot_revision_refs s
 		LEFT JOIN record_revisions r
 		  ON r.revision_id = s.revision_id AND r.content_hash = s.content_hash
 		LEFT JOIN revision_objects o ON o.content_hash = s.content_hash
-		ORDER BY s.snapshot_id, s.revision_id`)
+		ORDER BY s.snapshot_id, s.revision_id`, maxVectorBytes)
 	if err != nil {
 		return invalidPersistentState("read snapshot refs")
 	}
@@ -1266,7 +1355,8 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		var snapshotID, revisionID string
 		var hashBytes, counterBytes, vectorBody, objectHash []byte
 		var matchingRevision, recordID, authorID sql.NullString
-		if refRows.Scan(&snapshotID, &revisionID, &hashBytes, &matchingRevision, &recordID, &authorID, &counterBytes, &vectorBody, &objectHash) != nil {
+		var vectorLength sql.NullInt64
+		if refRows.Scan(&snapshotID, &revisionID, &hashBytes, &matchingRevision, &recordID, &authorID, &counterBytes, &vectorLength, &vectorBody, &objectHash) != nil {
 			refRows.Close()
 			return invalidPersistentState("invalid snapshot reference")
 		}
@@ -1275,7 +1365,7 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		var entries []vectorEntry
 		if snapshot == nil || validateUUID(revisionID) != nil || len(hashBytes) != 32 || !matchingRevision.Valid || matchingRevision.String != revisionID ||
 			!recordID.Valid || validateUUID(recordID.String) != nil || !authorID.Valid || validateUUID(authorID.String) != nil || counterErr != nil ||
-			json.Unmarshal(vectorBody, &entries) != nil || !bytes.Equal(objectHash, hashBytes) {
+			!boundedOptionalBytes(vectorLength, vectorBody, maxVectorBytes) || !vectorLength.Valid || json.Unmarshal(vectorBody, &entries) != nil || !bytes.Equal(objectHash, hashBytes) {
 			refRows.Close()
 			return invalidPersistentState("invalid snapshot reference")
 		}

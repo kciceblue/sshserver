@@ -212,7 +212,12 @@ func (store *Store) authenticate(ctx context.Context, transaction *sql.Tx, autho
 		return deviceAuth{}, api.NewError("unauthorized", false)
 	}
 	defer clear(token)
-	rows, err := transaction.QueryContext(ctx, "SELECT device_id, token_hash, scopes_json, revoked_at_ms IS NOT NULL FROM devices ORDER BY device_id LIMIT 65")
+	wantScopes, _ := json.Marshal(auth.FixedScopes())
+	rows, err := transaction.QueryContext(ctx, `
+		SELECT device_id, token_hash, length(scopes_json),
+		       CASE WHEN length(scopes_json) = ? THEN scopes_json END,
+		       revoked_at_ms IS NOT NULL
+		FROM devices ORDER BY device_id LIMIT 65`, len(wantScopes))
 	if err != nil {
 		return deviceAuth{}, api.NewError("internal_error", true)
 	}
@@ -221,10 +226,13 @@ func (store *Store) authenticate(ctx context.Context, transaction *sql.Tx, autho
 	rowCount := 0
 	for rows.Next() {
 		rowCount++
-		var deviceID, scopesJSON string
+		var deviceID string
+		var scopesJSON sql.NullString
+		var scopesLength int64
 		var storedBytes []byte
 		var revoked bool
-		if err := rows.Scan(&deviceID, &storedBytes, &scopesJSON, &revoked); err != nil || len(storedBytes) != 32 {
+		if err := rows.Scan(&deviceID, &storedBytes, &scopesLength, &scopesJSON, &revoked); err != nil || len(storedBytes) != 32 ||
+			!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) {
 			return deviceAuth{}, api.NewError("internal_error", true)
 		}
 		computed, err := auth.DeviceTokenHash(store.identity.InstanceID, store.identity.VaultID, deviceID, token)
@@ -235,7 +243,7 @@ func (store *Store) authenticate(ctx context.Context, transaction *sql.Tx, autho
 		copy(stored[:], storedBytes)
 		if auth.VerifyHash(stored, computed) {
 			var scopes []string
-			if json.Unmarshal([]byte(scopesJSON), &scopes) != nil || auth.ValidateScopes(scopes) != nil {
+			if json.Unmarshal([]byte(scopesJSON.String), &scopes) != nil || auth.ValidateScopes(scopes) != nil {
 				return deviceAuth{}, api.NewError("internal_error", true)
 			}
 			candidate := deviceAuth{DeviceID: deviceID, Hash: stored, Scopes: scopes, Revoked: revoked}
@@ -285,16 +293,19 @@ func requestFingerprint(store *Store, label, deviceID string, body []byte) ([32]
 
 func (store *Store) lookupReceipt(ctx context.Context, transaction *sql.Tx, deviceID, operation, requestID string, fingerprint [32]byte) (api.Response, bool, *api.Error) {
 	var storedFingerprint, body []byte
+	var bodyLength int64
 	var status int
 	err := transaction.QueryRowContext(ctx, `
-		SELECT request_fingerprint, response_status, response_json
+		SELECT request_fingerprint, response_status, length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
 		FROM operation_receipts WHERE device_id = ? AND operation = ? AND request_id = ?`,
-		deviceID, operation, requestID,
-	).Scan(&storedFingerprint, &status, &body)
+		maxBodyBytes, deviceID, operation, requestID,
+	).Scan(&storedFingerprint, &status, &bodyLength, &body)
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.Response{}, false, nil
 	}
-	if err != nil || len(storedFingerprint) != 32 || validateStoredOperationResponse(operation, status, body, store.identity) != nil {
+	if err != nil || len(storedFingerprint) != 32 || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
+		validateStoredOperationResponse(operation, status, body, store.identity) != nil {
 		return api.Response{}, false, api.NewError("internal_error", true)
 	}
 	var stored [32]byte

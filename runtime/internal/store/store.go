@@ -179,19 +179,23 @@ func (store *Store) DeviceCredential(ctx context.Context, deviceID string) (hash
 		return hash, nil, fmt.Errorf("device ID: %w", err)
 	}
 	var hashBytes []byte
-	var scopesJSON string
+	wantScopes, _ := json.Marshal(auth.FixedScopes())
+	var scopesJSON sql.NullString
+	var scopesLength int64
 	if err := store.db.QueryRowContext(
 		ctx,
-		"SELECT token_hash, scopes_json FROM devices WHERE device_id = ?",
-		deviceID,
-	).Scan(&hashBytes, &scopesJSON); err != nil {
+		`SELECT token_hash, length(scopes_json),
+		        CASE WHEN length(scopes_json) = ? THEN scopes_json END
+		 FROM devices WHERE device_id = ?`,
+		len(wantScopes), deviceID,
+	).Scan(&hashBytes, &scopesLength, &scopesJSON); err != nil {
 		return hash, nil, err
 	}
-	if len(hashBytes) != len(hash) {
-		return hash, nil, errors.New("stored token hash has invalid length")
+	if len(hashBytes) != len(hash) || !boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) {
+		return hash, nil, errors.New("stored device credential is invalid")
 	}
 	copy(hash[:], hashBytes)
-	if err := json.Unmarshal([]byte(scopesJSON), &scopes); err != nil {
+	if err := json.Unmarshal([]byte(scopesJSON.String), &scopes); err != nil {
 		return hash, nil, fmt.Errorf("decode stored scopes: %w", err)
 	}
 	if err := auth.ValidateScopes(scopes); err != nil {

@@ -29,12 +29,17 @@ func (store *Store) handleGetEnvelope(ctx context.Context, call api.Request) (ap
 		return api.Response{}, protocolErr
 	}
 	var generationBytes, body []byte
-	if err := transaction.QueryRowContext(ctx, "SELECT generation, envelope_json FROM vault_envelope WHERE singleton = 1").Scan(&generationBytes, &body); errors.Is(err, sql.ErrNoRows) {
+	var bodyLength int64
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT generation, length(envelope_json),
+		       CASE WHEN length(envelope_json) BETWEEN 1 AND ? THEN envelope_json END
+		FROM vault_envelope WHERE singleton = 1`, maxBodyBytes,
+	).Scan(&generationBytes, &bodyLength, &body); errors.Is(err, sql.ErrNoRows) {
 		if runtimeGeneration != 0 {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		return api.Response{}, api.NewError("envelope_missing", false)
-	} else if err != nil {
+	} else if err != nil || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	storedGeneration, err := DecodeUint64(generationBytes)

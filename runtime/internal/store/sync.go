@@ -127,7 +127,12 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		var storedObject []byte
-		if err := transaction.QueryRowContext(ctx, "SELECT revision_json FROM revision_objects WHERE content_hash = ?", item.contentHash[:]).Scan(&storedObject); err != nil || !bytes.Equal(storedObject, item.canonical) {
+		var storedObjectLength int64
+		if err := transaction.QueryRowContext(ctx, `
+			SELECT length(revision_json),
+			       CASE WHEN length(revision_json) BETWEEN 1 AND ? THEN revision_json END
+			FROM revision_objects WHERE content_hash = ?`, maxBodyBytes, item.contentHash[:],
+		).Scan(&storedObjectLength, &storedObject); err != nil || !boundedRequiredBytes(storedObjectLength, storedObject, maxBodyBytes) || !bytes.Equal(storedObject, item.canonical) {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		nextAssignedCursor++
@@ -280,10 +285,11 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 
 func classifyRevisionFrontier(ctx context.Context, transaction *sql.Tx, recordID string, candidate map[string]uint64) (bool, []string, *api.Error) {
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT r.revision_id, r.vector_json
+		SELECT r.revision_id, length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END
 		FROM record_heads h JOIN record_revisions r ON r.revision_id = h.revision_id
 		WHERE h.record_id = ?
-		ORDER BY h.revision_id LIMIT 33`, recordID)
+		ORDER BY h.revision_id LIMIT 33`, maxVectorBytes, recordID)
 	if err != nil {
 		return false, nil, api.NewError("internal_error", true)
 	}
@@ -295,8 +301,9 @@ func classifyRevisionFrontier(ctx context.Context, transaction *sql.Tx, recordID
 		count++
 		var revisionID string
 		var vectorBody []byte
+		var vectorLength int64
 		var entries []vectorEntry
-		if rows.Scan(&revisionID, &vectorBody) != nil || json.Unmarshal(vectorBody, &entries) != nil {
+		if rows.Scan(&revisionID, &vectorLength, &vectorBody) != nil || !boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || json.Unmarshal(vectorBody, &entries) != nil {
 			return false, nil, api.NewError("internal_error", true)
 		}
 		vector, err := validateVector(entries)
@@ -404,11 +411,12 @@ func validateEqualVectorEquivocation(ctx context.Context, transaction *sql.Tx, r
 		}
 	}
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT r.revision_id, r.vector_json
+		SELECT r.revision_id, length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END
 		FROM record_vector_index i
 		JOIN record_revisions r ON r.revision_id = i.revision_id
 		WHERE i.record_id = ? AND i.vector_hash = ?
-		ORDER BY i.revision_id`, recordID, vectorHash[:])
+		ORDER BY i.revision_id`, maxVectorBytes, recordID, vectorHash[:])
 	if err != nil {
 		return api.NewError("internal_error", true)
 	}
@@ -416,7 +424,8 @@ func validateEqualVectorEquivocation(ctx context.Context, transaction *sql.Tx, r
 	for rows.Next() {
 		var existingID string
 		var vectorJSON []byte
-		if err := rows.Scan(&existingID, &vectorJSON); err != nil {
+		var vectorLength int64
+		if err := rows.Scan(&existingID, &vectorLength, &vectorJSON); err != nil || !boundedRequiredBytes(vectorLength, vectorJSON, maxVectorBytes) {
 			return api.NewError("internal_error", true)
 		}
 		var entries []vectorEntry
@@ -479,10 +488,15 @@ func validateVectorRegistry(ctx context.Context, transaction *sql.Tx, authorDevi
 
 func validateRecordCausality(ctx context.Context, transaction *sql.Tx, recordID, revisionID string, candidate map[string]uint64, pending []pendingRevision) *api.Error {
 	var markerVectorJSON []byte
-	err := transaction.QueryRowContext(ctx, "SELECT frontier_json FROM collection_markers WHERE record_id = ?", recordID).Scan(&markerVectorJSON)
+	var markerVectorLength int64
+	err := transaction.QueryRowContext(ctx, `
+		SELECT length(frontier_json),
+		       CASE WHEN length(frontier_json) BETWEEN 1 AND ? THEN frontier_json END
+		FROM collection_markers WHERE record_id = ?`, maxVectorBytes, recordID,
+	).Scan(&markerVectorLength, &markerVectorJSON)
 	if err == nil {
 		var entries []vectorEntry
-		if json.Unmarshal(markerVectorJSON, &entries) != nil {
+		if !boundedRequiredBytes(markerVectorLength, markerVectorJSON, maxVectorBytes) || json.Unmarshal(markerVectorJSON, &entries) != nil {
 			return api.NewError("internal_error", true)
 		}
 		frontier, validateErr := validateVector(entries)
@@ -496,9 +510,10 @@ func validateRecordCausality(ctx context.Context, transaction *sql.Tx, recordID,
 		return api.NewError("internal_error", true)
 	}
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT r.revision_id, r.vector_json
+		SELECT r.revision_id, length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END
 		FROM record_heads h JOIN record_revisions r ON r.revision_id = h.revision_id
-		WHERE h.record_id = ? ORDER BY h.revision_id`, recordID)
+		WHERE h.record_id = ? ORDER BY h.revision_id`, maxVectorBytes, recordID)
 	if err != nil {
 		return api.NewError("internal_error", true)
 	}
@@ -517,7 +532,8 @@ func validateRecordCausality(ctx context.Context, transaction *sql.Tx, recordID,
 	for rows.Next() {
 		var existingID string
 		var vectorJSON []byte
-		if err := rows.Scan(&existingID, &vectorJSON); err != nil {
+		var vectorLength int64
+		if err := rows.Scan(&existingID, &vectorLength, &vectorJSON); err != nil || !boundedRequiredBytes(vectorLength, vectorJSON, maxVectorBytes) {
 			return api.NewError("internal_error", true)
 		}
 		var entries []vectorEntry
@@ -570,9 +586,14 @@ func vectorsEqual(left, right map[string]uint64) bool {
 func loadChanges(ctx context.Context, transaction *sql.Tx, afterCursor uint64) ([]change, uint64, bool, *api.Error) {
 	after := EncodeUint64(afterCursor)
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT cursor, kind, received_at_ms, record_revision_id,
-		       collection_marker_record_id, collection_marker_json
-		FROM changes WHERE cursor > ? ORDER BY cursor LIMIT ?`, after[:], maxChanges+1)
+		SELECT cursor, kind, received_at_ms,
+		       length(record_revision_id),
+		       CASE WHEN length(record_revision_id) = 36 THEN record_revision_id END,
+		       length(collection_marker_record_id),
+		       CASE WHEN length(collection_marker_record_id) = 36 THEN collection_marker_record_id END,
+		       length(collection_marker_json),
+		       CASE WHEN length(collection_marker_json) BETWEEN 1 AND ? THEN collection_marker_json END
+		FROM changes WHERE cursor > ? ORDER BY cursor LIMIT ?`, maxBodyBytes, after[:], maxChanges+1)
 	if err != nil {
 		return nil, 0, false, api.NewError("internal_error", true)
 	}
@@ -587,7 +608,12 @@ func loadChanges(ctx context.Context, transaction *sql.Tx, afterCursor uint64) (
 	stored := make([]storedChange, 0, maxChanges+1)
 	for rows.Next() {
 		var item storedChange
-		if err := rows.Scan(&item.cursorBytes, &item.kind, &item.receivedAt, &item.revisionID, &item.markerRecordID, &item.markerBody); err != nil {
+		var revisionIDLength, markerIDLength, markerBodyLength sql.NullInt64
+		if err := rows.Scan(&item.cursorBytes, &item.kind, &item.receivedAt,
+			&revisionIDLength, &item.revisionID, &markerIDLength, &item.markerRecordID, &markerBodyLength, &item.markerBody); err != nil ||
+			!boundedOptionalText(revisionIDLength, item.revisionID, maxUUIDBytes) || revisionIDLength.Valid && revisionIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalText(markerIDLength, item.markerRecordID, maxUUIDBytes) || markerIDLength.Valid && markerIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalBytes(markerBodyLength, item.markerBody, maxBodyBytes) {
 			return nil, 0, false, api.NewError("internal_error", true)
 		}
 		stored = append(stored, item)
@@ -614,11 +640,14 @@ func loadChanges(ctx context.Context, transaction *sql.Tx, afterCursor uint64) (
 		switch storedItem.kind {
 		case "record_revision":
 			var body, hashBytes []byte
+			var bodyLength int64
 			if !storedItem.revisionID.Valid || transaction.QueryRowContext(ctx, `
-				SELECT o.revision_json, r.content_hash
+				SELECT length(o.revision_json),
+				       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END,
+				       r.content_hash
 				FROM record_revisions r JOIN revision_objects o USING (content_hash)
-				WHERE r.revision_id = ? AND r.retained = 1`, storedItem.revisionID.String,
-			).Scan(&body, &hashBytes) != nil || len(hashBytes) != 32 {
+				WHERE r.revision_id = ? AND r.retained = 1`, maxBodyBytes, storedItem.revisionID.String,
+			).Scan(&bodyLength, &body, &hashBytes) != nil || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) || len(hashBytes) != 32 {
 				return nil, 0, false, api.NewError("internal_error", true)
 			}
 			var revision recordRevision

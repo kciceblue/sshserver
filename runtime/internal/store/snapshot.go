@@ -66,16 +66,18 @@ func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) 
 	var storedFingerprint, storedResponse []byte
 	var storedSnapshotID, storedOwner string
 	var storedCutBytes, storedGenerationBytes []byte
-	var storedExpiresAt int64
+	var storedExpiresAt, storedResponseLength int64
 	err := transaction.QueryRowContext(ctx, `
 		SELECT snapshot_id, owner_device_id, request_fingerprint, cut_cursor,
-		       envelope_generation, expires_at_ms, create_response_json FROM snapshots
-		WHERE owner_device_id = ? AND request_id = ?`, authenticated.DeviceID, call.RequestID,
-	).Scan(&storedSnapshotID, &storedOwner, &storedFingerprint, &storedCutBytes, &storedGenerationBytes, &storedExpiresAt, &storedResponse)
+		       envelope_generation, expires_at_ms, length(create_response_json),
+		       CASE WHEN length(create_response_json) BETWEEN 1 AND ? THEN create_response_json END
+		FROM snapshots
+		WHERE owner_device_id = ? AND request_id = ?`, maxBodyBytes, authenticated.DeviceID, call.RequestID,
+	).Scan(&storedSnapshotID, &storedOwner, &storedFingerprint, &storedCutBytes, &storedGenerationBytes, &storedExpiresAt, &storedResponseLength, &storedResponse)
 	if err == nil {
 		storedCut, cutErr := DecodeUint64(storedCutBytes)
 		storedGeneration, generationErr := DecodeUint64(storedGenerationBytes)
-		if len(storedFingerprint) != 32 || cutErr != nil || generationErr != nil ||
+		if len(storedFingerprint) != 32 || cutErr != nil || generationErr != nil || !boundedRequiredBytes(storedResponseLength, storedResponse, maxBodyBytes) ||
 			validateStoredSnapshotCreateResponse(storedResponse, store.identity, storedSnapshotID, storedOwner, storedCut, storedGeneration, storedExpiresAt) != nil {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
@@ -117,9 +119,14 @@ func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) 
 		return api.Response{}, protocolErr
 	}
 	var envelopeBody []byte
-	if err := transaction.QueryRowContext(ctx, "SELECT envelope_json FROM vault_envelope WHERE singleton = 1").Scan(&envelopeBody); errors.Is(err, sql.ErrNoRows) {
+	var envelopeLength int64
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT length(envelope_json),
+		       CASE WHEN length(envelope_json) BETWEEN 1 AND ? THEN envelope_json END
+		FROM vault_envelope WHERE singleton = 1`, maxBodyBytes,
+	).Scan(&envelopeLength, &envelopeBody); errors.Is(err, sql.ErrNoRows) {
 		return api.Response{}, api.NewError("envelope_missing", false)
-	} else if err != nil {
+	} else if err != nil || !boundedRequiredBytes(envelopeLength, envelopeBody, maxBodyBytes) {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	var envelope vaultEnvelope
@@ -261,12 +268,15 @@ func (store *Store) handleSnapshotPage(ctx context.Context, call api.Request, sn
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	var descriptorBody []byte
+	var descriptorLength int64
 	if err := transaction.QueryRowContext(ctx, `
-		SELECT response_json FROM snapshot_pages
-		WHERE snapshot_id = ? AND page_token = ?`, snapshotID, request.PageToken,
-	).Scan(&descriptorBody); errors.Is(err, sql.ErrNoRows) {
+		SELECT length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
+		FROM snapshot_pages
+		WHERE snapshot_id = ? AND page_token = ?`, maxBodyBytes, snapshotID, request.PageToken,
+	).Scan(&descriptorLength, &descriptorBody); errors.Is(err, sql.ErrNoRows) {
 		return api.Response{}, api.NewError("invalid_request", false)
-	} else if err != nil {
+	} else if err != nil || !boundedRequiredBytes(descriptorLength, descriptorBody, maxBodyBytes) {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	var descriptor snapshotPageDescriptor
@@ -276,12 +286,16 @@ func (store *Store) handleSnapshotPage(ctx context.Context, call api.Request, sn
 	revisions := make([]recordRevision, 0, len(descriptor.RevisionIDs))
 	for _, revisionID := range descriptor.RevisionIDs {
 		var revisionBody, storedHashBytes, referencedHashBytes []byte
+		var revisionLength int64
 		if err := transaction.QueryRowContext(ctx, `
-			SELECT o.revision_json, o.content_hash, s.content_hash
+			SELECT length(o.revision_json),
+			       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END,
+			       o.content_hash, s.content_hash
 			FROM snapshot_revision_refs s
 			JOIN revision_objects o USING (content_hash)
-			WHERE s.snapshot_id = ? AND s.revision_id = ?`, snapshotID, revisionID,
-		).Scan(&revisionBody, &storedHashBytes, &referencedHashBytes); err != nil || len(storedHashBytes) != 32 || len(referencedHashBytes) != 32 {
+			WHERE s.snapshot_id = ? AND s.revision_id = ?`, maxBodyBytes, snapshotID, revisionID,
+		).Scan(&revisionLength, &revisionBody, &storedHashBytes, &referencedHashBytes); err != nil ||
+			!boundedRequiredBytes(revisionLength, revisionBody, maxBodyBytes) || len(storedHashBytes) != 32 || len(referencedHashBytes) != 32 {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		var storedHash, referencedHash [32]byte
@@ -499,11 +513,12 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 	}
 
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT r.record_id, r.revision_id, r.content_hash, o.revision_json
+		SELECT r.record_id, r.revision_id, r.content_hash, length(o.revision_json),
+		       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END
 		FROM record_heads h
 		JOIN record_revisions r ON r.revision_id = h.revision_id
 		JOIN revision_objects o USING (content_hash)
-		ORDER BY h.record_id, h.revision_id`)
+		ORDER BY h.record_id, h.revision_id`, maxBodyBytes)
 	if err != nil {
 		return nil, nil, api.NewError("internal_error", true)
 	}
@@ -526,8 +541,10 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 	for rows.Next() {
 		var recordID, revisionID string
 		var hashBytes, body []byte
+		var bodyLength int64
 		var revision recordRevision
-		if rows.Scan(&recordID, &revisionID, &hashBytes, &body) != nil || validateUUID(recordID) != nil || validateUUID(revisionID) != nil || len(hashBytes) != 32 ||
+		if rows.Scan(&recordID, &revisionID, &hashBytes, &bodyLength, &body) != nil || validateUUID(recordID) != nil || validateUUID(revisionID) != nil || len(hashBytes) != 32 ||
+			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
 			previousRecordID != "" && (recordID < previousRecordID || recordID == previousRecordID && revisionID <= previousRevisionID) ||
 			decodeStoredCanonical(body, &revision) != nil || revision.RecordID != recordID || revision.RevisionID != revisionID {
 			rows.Close()
@@ -577,7 +594,10 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 		return nil, nil, protocolErr
 	}
 
-	markerRows, err := transaction.QueryContext(ctx, "SELECT marker_json FROM collection_markers ORDER BY record_id")
+	markerRows, err := transaction.QueryContext(ctx, `
+		SELECT length(marker_json),
+		       CASE WHEN length(marker_json) BETWEEN 1 AND ? THEN marker_json END
+		FROM collection_markers ORDER BY record_id`, maxBodyBytes)
 	if err != nil {
 		return nil, nil, api.NewError("internal_error", true)
 	}
@@ -596,7 +616,8 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 	}
 	for markerRows.Next() {
 		var body []byte
-		if markerRows.Scan(&body) != nil {
+		var bodyLength int64
+		if markerRows.Scan(&bodyLength, &body) != nil || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
 			markerRows.Close()
 			return nil, nil, api.NewError("internal_error", true)
 		}

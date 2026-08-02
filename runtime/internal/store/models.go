@@ -352,7 +352,7 @@ func validateUUID(value string) error {
 }
 
 func validateVector(vector []vectorEntry) (map[string]uint64, error) {
-	if len(vector) == 0 || len(vector) > 64 {
+	if len(vector) == 0 || len(vector) > maxVectorEntries {
 		return nil, errors.New("vector size is invalid")
 	}
 	values := make(map[string]uint64, len(vector))

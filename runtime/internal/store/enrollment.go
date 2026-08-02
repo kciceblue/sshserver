@@ -195,7 +195,8 @@ func (store *Store) lookupGrant(ctx context.Context, transaction *sql.Tx, presen
 		return nil, api.NewError("grant_expired", false)
 	}
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT grant_hash, expires_at_ms, consumed_enrollment_id
+		SELECT grant_hash, expires_at_ms, length(consumed_enrollment_id),
+		       CASE WHEN length(consumed_enrollment_id) = 36 THEN consumed_enrollment_id END
 		FROM enrollment_grants WHERE boot_id = ? ORDER BY grant_hash`, bootID[:])
 	if err != nil {
 		return nil, api.NewError("internal_error", true)
@@ -206,8 +207,10 @@ func (store *Store) lookupGrant(ctx context.Context, transaction *sql.Tx, presen
 	for rows.Next() {
 		var hashBytes []byte
 		var expiresAt int64
+		var consumedLength sql.NullInt64
 		var candidateConsumed sql.NullString
-		if err := rows.Scan(&hashBytes, &expiresAt, &candidateConsumed); err != nil || len(hashBytes) != 32 {
+		if err := rows.Scan(&hashBytes, &expiresAt, &consumedLength, &candidateConsumed); err != nil || len(hashBytes) != 32 ||
+			!boundedOptionalText(consumedLength, candidateConsumed, maxUUIDBytes) || consumedLength.Valid && consumedLength.Int64 != maxUUIDBytes {
 			return nil, api.NewError("internal_error", true)
 		}
 		var candidate [32]byte
@@ -242,26 +245,34 @@ func (store *Store) lookupGrant(ctx context.Context, transaction *sql.Tx, presen
 }
 
 func (store *Store) lookupEnrollment(ctx context.Context, transaction *sql.Tx, enrollmentID string, request enrollmentRequest, tokenHash, fingerprint [32]byte) ([]byte, bool, *api.Error) {
-	var deviceID, scopesJSON string
+	wantScopes, _ := json.Marshal(auth.FixedScopes())
+	var deviceID string
+	var scopesJSON sql.NullString
 	var storedToken, storedFingerprint, response []byte
+	var scopesLength, responseLength int64
 	var createdStatus int
 	err := transaction.QueryRowContext(ctx, `
-		SELECT device_id, token_hash, scopes_json, request_fingerprint, response_json, created_status
-		FROM enrollments WHERE enrollment_id = ?`, enrollmentID,
-	).Scan(&deviceID, &storedToken, &scopesJSON, &storedFingerprint, &response, &createdStatus)
+		SELECT device_id, token_hash, length(scopes_json),
+		       CASE WHEN length(scopes_json) = ? THEN scopes_json END,
+		       request_fingerprint, length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END,
+		       created_status
+		FROM enrollments WHERE enrollment_id = ?`, len(wantScopes), maxBodyBytes, enrollmentID,
+	).Scan(&deviceID, &storedToken, &scopesLength, &scopesJSON, &storedFingerprint, &responseLength, &response, &createdStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
-	if err != nil || len(storedToken) != 32 || len(storedFingerprint) != 32 || createdStatus != http.StatusCreated ||
+	if err != nil || len(storedToken) != 32 || len(storedFingerprint) != 32 ||
+		!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) ||
+		!boundedRequiredBytes(responseLength, response, maxBodyBytes) || createdStatus != http.StatusCreated ||
 		validateStoredEnrollmentResponse(response, store.identity, deviceID) != nil {
 		return nil, false, api.NewError("internal_error", true)
 	}
 	var recordedToken, recordedFingerprint [32]byte
 	copy(recordedToken[:], storedToken)
 	copy(recordedFingerprint[:], storedFingerprint)
-	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	exact := enrollmentID == request.EnrollmentID &&
-		deviceID == request.DeviceID && scopesJSON == string(wantScopes) &&
+		deviceID == request.DeviceID && scopesJSON.String == string(wantScopes) &&
 		auth.VerifyHash(recordedToken, tokenHash) && auth.VerifyHash(recordedFingerprint, fingerprint)
 	if !exact {
 		return nil, false, api.NewError("enrollment_replay_mismatch", false)
