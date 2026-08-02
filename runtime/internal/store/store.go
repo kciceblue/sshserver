@@ -98,29 +98,44 @@ func (store *Store) Close() error {
 }
 
 func (store *Store) Ready(ctx context.Context) error {
-	version, err := validateSchemaState(ctx, store.db)
+	transaction, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
+		return fmt.Errorf("database readiness: begin consistent read: %w", err)
+	}
+	defer transaction.Rollback()
+	if err := validateReadinessSnapshot(ctx, transaction, store.identity); err != nil {
 		return fmt.Errorf("database readiness: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("database readiness: commit consistent read: %w", err)
+	}
+	return nil
+}
+
+func validateReadinessSnapshot(ctx context.Context, query schemaQueryer, identity Identity) error {
+	version, err := validateSchemaState(ctx, query)
+	if err != nil {
+		return err
 	}
 	if version != SchemaVersion {
-		return fmt.Errorf("database readiness: %w", ErrUnexpectedSchema)
+		return ErrUnexpectedSchema
 	}
-	if err := validateIdentity(ctx, store.db, store.identity); err != nil {
-		return fmt.Errorf("database readiness: %w", err)
+	if err := validateIdentity(ctx, query, identity); err != nil {
+		return err
 	}
-	serverCursor, envelopeGeneration, secretGeneration, err := validatePersistentRuntime(ctx, store.db)
+	serverCursor, envelopeGeneration, secretGeneration, err := validatePersistentRuntime(ctx, query)
 	if err != nil {
-		return fmt.Errorf("database readiness: %w", err)
+		return err
 	}
 	// The device registry is capped at 64 rows by the V1 protocol, so this is a
 	// bounded health sentinel. Full revision, receipt, and snapshot graph
 	// validation runs once during Open; repeating those unbounded scans on the
 	// unauthenticated health endpoint would make vault size a health-check DoS.
-	if err := validateReadinessDevices(ctx, store.db, serverCursor); err != nil {
-		return fmt.Errorf("database readiness: %w", err)
+	if err := validateReadinessDevices(ctx, query, serverCursor); err != nil {
+		return err
 	}
-	if err := validatePersistentEnvelope(ctx, store.db, store.identity, envelopeGeneration, secretGeneration); err != nil {
-		return fmt.Errorf("database readiness: %w", err)
+	if err := validatePersistentEnvelope(ctx, query, identity, envelopeGeneration, secretGeneration); err != nil {
+		return err
 	}
 	return nil
 }

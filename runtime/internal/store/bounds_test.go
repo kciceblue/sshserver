@@ -39,6 +39,20 @@ type boundedPersistenceSeed struct {
 	selfRevocation api.Request
 }
 
+type readinessInterleaveQueryer struct {
+	schemaQueryer
+	beforeDeviceQuery func()
+	fired             bool
+}
+
+func (query *readinessInterleaveQueryer) QueryContext(ctx context.Context, statement string, arguments ...any) (*sql.Rows, error) {
+	if !query.fired && strings.Contains(statement, "FROM devices d LEFT JOIN device_sync_state") {
+		query.fired = true
+		query.beforeDeviceQuery()
+	}
+	return query.schemaQueryer.QueryContext(ctx, statement, arguments...)
+}
+
 func seedBoundedPersistence(t *testing.T, options boundedSeedOptions) boundedPersistenceSeed {
 	t.Helper()
 	opened, path := openDataPlane(t)
@@ -451,6 +465,86 @@ func TestOversizedDeviceScopesFailClosedOnDirectReads(t *testing.T) {
 	}
 	if _, _, err := seed.opened.DeviceCredential(context.Background(), seed.deviceID); err == nil {
 		t.Fatal("direct device credential accepted oversized scopes")
+	}
+}
+
+func TestReadinessUsesOneSnapshotAcrossConcurrentEnvelopeCommit(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	var fixture struct {
+		BaseMode         putEnvelopeRequest `json:"base_mode"`
+		PassphraseRewrap putEnvelopeRequest `json:"passphrase_rewrap"`
+	}
+	loadFixture(t, "vault-envelope.json", &fixture)
+
+	writer, err := sql.Open("sqlite3", "file:"+seed.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+	if _, err := writer.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		t.Fatal(err)
+	}
+	setEnvelope := func(request putEnvelopeRequest) {
+		t.Helper()
+		generation, err := parseUint64(request.NewGeneration)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded := EncodeUint64(generation)
+		body, err := marshalJSON(request.Envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transaction, err := writer.BeginTx(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec("UPDATE vault_envelope SET generation = ?, envelope_json = ? WHERE singleton = 1", encoded[:], body); err != nil {
+			transaction.Rollback()
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec("UPDATE runtime_state SET envelope_generation = ? WHERE singleton = 1", encoded[:]); err != nil {
+			transaction.Rollback()
+			t.Fatal(err)
+		}
+		if err := transaction.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := context.Background()
+	autocommit := &readinessInterleaveQueryer{
+		schemaQueryer: seed.opened.db,
+		beforeDeviceQuery: func() {
+			setEnvelope(fixture.PassphraseRewrap)
+		},
+	}
+	if err := validateReadinessSnapshot(ctx, autocommit, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !autocommit.fired {
+		t.Fatalf("autocommit readiness did not reproduce a stale snapshot: fired=%v error=%v", autocommit.fired, err)
+	}
+
+	setEnvelope(fixture.BaseMode)
+	readTransaction, err := seed.opened.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &readinessInterleaveQueryer{
+		schemaQueryer: readTransaction,
+		beforeDeviceQuery: func() {
+			setEnvelope(fixture.PassphraseRewrap)
+		},
+	}
+	if err := validateReadinessSnapshot(ctx, snapshot, testIdentity); err != nil || !snapshot.fired {
+		readTransaction.Rollback()
+		t.Fatalf("transactional readiness left one snapshot: fired=%v error=%v", snapshot.fired, err)
+	}
+	if err := readTransaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.opened.Ready(ctx); err != nil {
+		t.Fatalf("readiness rejected the valid post-commit state: %v", err)
 	}
 }
 
