@@ -320,41 +320,115 @@ func validatePersistentEnvelope(ctx context.Context, query schemaQueryer, identi
 	return nil
 }
 
-func validatePersistentEnvelopeHistory(ctx context.Context, query schemaQueryer, serverCursor, runtimeGeneration uint64) ([]uint64, error) {
-	// This runtime only activates from the no-envelope generation-zero state.
-	// V1 then deletes only collected record_revision changes, so envelope-change
-	// ordinals are permanent generations and their cursors reconstruct the exact
-	// generation visible at any snapshot cut. A future recovery activation must
-	// persist explicit baseline provenance instead of synthesizing change rows.
+func validatePersistentChangeOrigins(ctx context.Context, query schemaQueryer, serverCursor, runtimeEnvelopeGeneration uint64, snapshotCuts []uint64) (map[uint64]uint64, error) {
+	// Every assigned cursor has one permanent kind origin. Collection removes
+	// only the replayable record_revision change row, never its origin, so a
+	// later metadata event cannot be relocated onto that freed cursor. This
+	// runtime activates from the no-envelope generation-zero state; future
+	// recovery activation must persist explicit baseline envelope provenance.
+	if len(snapshotCuts) > 8 {
+		return nil, invalidPersistentState("too many snapshot cuts")
+	}
+	generationsAtCut := make(map[uint64]uint64, len(snapshotCuts))
+	for _, cut := range snapshotCuts {
+		if cut > serverCursor {
+			return nil, invalidPersistentState("snapshot cut exceeds server cursor")
+		}
+		generationsAtCut[cut] = 0
+	}
+	// Check the reverse ownership direction before streaming origins. In
+	// particular, a corrupt durable owner at server_cursor+1 must not survive
+	// preflight and then collide with the cursor assigned by an envelope PUT.
+	// Ack, floor, barrier, and snapshot-cut cursors are references rather than
+	// owners and intentionally do not participate in this projection.
+	var orphanChange, orphanDurableOwner int
+	if err := query.QueryRowContext(ctx, `
+		WITH durable_owners(cursor, kind) AS (
+			SELECT change_cursor, 'record_revision' FROM record_revisions
+			UNION ALL
+			SELECT created_cursor, 'device_changed' FROM device_origins
+			WHERE created_cursor IS NOT NULL
+			UNION ALL
+			SELECT created_cursor, 'device_changed' FROM enrollments
+			UNION ALL
+			SELECT change_cursor, 'collection_marker' FROM collection_markers
+		)
+		SELECT
+			EXISTS (
+				SELECT 1 FROM changes c
+				LEFT JOIN change_origins o
+				  ON o.cursor = c.cursor AND o.kind = c.kind
+				WHERE o.cursor IS NULL
+			),
+			EXISTS (
+				SELECT 1 FROM durable_owners d
+				LEFT JOIN change_origins o
+				  ON o.cursor = d.cursor AND o.kind = d.kind
+				WHERE o.cursor IS NULL
+			)`,
+	).Scan(&orphanChange, &orphanDurableOwner); err != nil || orphanChange != 0 || orphanDurableOwner != 0 {
+		return nil, invalidPersistentState("durable change owner does not match origin")
+	}
 	rows, err := query.QueryContext(ctx, `
-		SELECT cursor FROM changes
-		WHERE kind = 'envelope_changed'
-		ORDER BY cursor`)
+		SELECT o.cursor, o.kind, o.envelope_generation,
+		       c.kind, r.revision_id
+		FROM change_origins o
+		LEFT JOIN changes c ON c.cursor = o.cursor
+		LEFT JOIN record_revisions r ON r.change_cursor = o.cursor
+		ORDER BY o.cursor`)
 	if err != nil {
-		return nil, invalidPersistentState("read envelope change history")
+		return nil, invalidPersistentState("read change origins")
 	}
 	defer rows.Close()
-	changeCursors := make([]uint64, 0)
 	previous := uint64(0)
+	envelopeGeneration := uint64(0)
 	for rows.Next() {
-		var cursorBytes []byte
-		if rows.Scan(&cursorBytes) != nil {
-			return nil, invalidPersistentState("invalid envelope change history")
+		var cursorBytes, generationBytes []byte
+		var kind string
+		var changeKind, revisionID sql.NullString
+		if rows.Scan(&cursorBytes, &kind, &generationBytes, &changeKind, &revisionID) != nil {
+			return nil, invalidPersistentState("invalid change origin")
 		}
-		cursor, err := DecodeUint64(cursorBytes)
-		if err != nil || cursor == 0 || cursor <= previous || cursor > serverCursor {
-			return nil, invalidPersistentState("invalid envelope change history")
+		cursor, cursorErr := DecodeUint64(cursorBytes)
+		if cursorErr != nil || cursor == 0 || previous == math.MaxUint64 || cursor != previous+1 || cursor > serverCursor {
+			return nil, invalidPersistentState("change origins are not contiguous")
 		}
-		changeCursors = append(changeCursors, cursor)
+		switch kind {
+		case "record_revision":
+			if generationBytes != nil || !revisionID.Valid || changeKind.Valid && changeKind.String != kind {
+				return nil, invalidPersistentState("change origin does not match durable owner")
+			}
+		case "collection_marker", "device_changed":
+			if generationBytes != nil || revisionID.Valid || !changeKind.Valid || changeKind.String != kind {
+				return nil, invalidPersistentState("change origin does not match durable owner")
+			}
+		case "envelope_changed":
+			generation, generationErr := DecodeUint64(generationBytes)
+			if generationErr != nil || envelopeGeneration == math.MaxUint64 || generation != envelopeGeneration+1 || revisionID.Valid ||
+				!changeKind.Valid || changeKind.String != kind {
+				return nil, invalidPersistentState("invalid envelope change origin")
+			}
+			envelopeGeneration = generation
+			for cut := range generationsAtCut {
+				if cursor <= cut {
+					generationsAtCut[cut] = generation
+				}
+			}
+		default:
+			return nil, invalidPersistentState("invalid change origin kind")
+		}
 		previous = cursor
 	}
 	if rows.Err() != nil || rows.Close() != nil {
-		return nil, invalidPersistentState("read envelope change history")
+		return nil, invalidPersistentState("read change origins")
 	}
-	if uint64(len(changeCursors)) != runtimeGeneration {
+	if previous != serverCursor {
+		return nil, invalidPersistentState("change origins do not reach server cursor")
+	}
+	if envelopeGeneration != runtimeEnvelopeGeneration {
 		return nil, invalidPersistentState("envelope generation does not match accepted history")
 	}
-	return changeCursors, nil
+	return generationsAtCut, nil
 }
 
 func validatePersistentRevisionObjects(ctx context.Context, query schemaQueryer) error {
@@ -499,12 +573,13 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		       r.change_cursor, r.collected_generation, r.retained, r.undominated,
 		       length(o.revision_json),
 		       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END,
-		       c.cursor
+		       c.cursor, p.kind
 		FROM record_revisions r
 		LEFT JOIN revision_objects o USING (content_hash)
 		LEFT JOIN changes c
 		  ON c.cursor = r.change_cursor AND c.kind = 'record_revision'
 		 AND c.record_revision_id = r.revision_id
+		LEFT JOIN change_origins p ON p.cursor = r.change_cursor
 		ORDER BY r.record_id, r.change_cursor`, maxVectorBytes, maxBodyBytes)
 	if err != nil {
 		return nil, invalidPersistentState("read revision rows")
@@ -559,15 +634,19 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		var vectorLength int64
 		var witnessLength sql.NullInt64
 		var objectLength sql.NullInt64
+		var originKind sql.NullString
 		var receivedAt int64
 		var tombstone, retained, undominated int
-		if rows.Scan(&revisionID, &recordID, &authorID, &counterBytes, &vectorLength, &vectorBody, &witnessLength, &witness, &tombstone, &hashBytes, &receivedAt, &uptimeBytes, &cursorBytes, &collectedBytes, &retained, &undominated, &objectLength, &objectBody, &matchingChange) != nil ||
+		if rows.Scan(&revisionID, &recordID, &authorID, &counterBytes, &vectorLength, &vectorBody, &witnessLength, &witness, &tombstone, &hashBytes, &receivedAt, &uptimeBytes, &cursorBytes, &collectedBytes, &retained, &undominated, &objectLength, &objectBody, &matchingChange, &originKind) != nil ||
 			validateUUID(revisionID) != nil || validateUUID(recordID) != nil || validateUUID(authorID) != nil || len(hashBytes) != 32 ||
 			!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || !boundedOptionalBytes(witnessLength, witness, 32) || witnessLength.Valid && witnessLength.Int64 != 32 ||
 			tombstone < 0 || tombstone > 1 || retained < 0 || retained > 1 || undominated < 0 || undominated > 1 ||
 			retained == 0 && undominated != 0 ||
 			validateTimestamp(formatTimestamp(receivedAt)) != nil {
 			return nil, invalidPersistentState("invalid revision row")
+		}
+		if !originKind.Valid || originKind.String != "record_revision" {
+			return nil, invalidPersistentState("revision does not match durable change origin")
 		}
 		counter, counterErr := DecodeUint64(counterBytes)
 		uptime, uptimeErr := DecodeUint64(uptimeBytes)
@@ -982,9 +1061,10 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, devices
 		       CASE WHEN length(c.device_changed_id) = 36 THEN c.device_changed_id END,
 		       length(c.device_change_kind),
 		       CASE WHEN length(c.device_change_kind) BETWEEN 1 AND 8 THEN c.device_change_kind END,
-		       r.retained
+		       r.retained, p.kind
 		FROM changes c LEFT JOIN record_revisions r
 		  ON r.revision_id = c.record_revision_id
+		LEFT JOIN change_origins p ON p.cursor = c.cursor
 		ORDER BY c.cursor`, maxBodyBytes)
 	if err != nil {
 		return nil, invalidPersistentState("read change rows")
@@ -1002,13 +1082,14 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, devices
 		var revisionID, markerID, changedDeviceID, deviceChangeKind sql.NullString
 		var revisionIDLength, markerIDLength, markerBodyLength, changedDeviceIDLength, deviceChangeKindLength sql.NullInt64
 		var revisionRetained sql.NullInt64
+		var originKind sql.NullString
 		if rows.Scan(
 			&cursorBytes, &kind, &receivedAt,
 			&revisionIDLength, &revisionID, &markerIDLength, &markerID,
 			&markerBodyLength, &markerBody,
 			&changedDeviceIDLength, &changedDeviceID,
 			&deviceChangeKindLength, &deviceChangeKind,
-			&revisionRetained,
+			&revisionRetained, &originKind,
 		) != nil ||
 			!boundedOptionalText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength.Valid && revisionIDLength.Int64 != maxUUIDBytes ||
 			!boundedOptionalText(markerIDLength, markerID, maxUUIDBytes) || markerIDLength.Valid && markerIDLength.Int64 != maxUUIDBytes ||
@@ -1016,6 +1097,9 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, devices
 			!boundedOptionalText(changedDeviceIDLength, changedDeviceID, maxUUIDBytes) || changedDeviceIDLength.Valid && changedDeviceIDLength.Int64 != maxUUIDBytes ||
 			!boundedOptionalText(deviceChangeKindLength, deviceChangeKind, 8) {
 			return nil, invalidPersistentState("invalid change row")
+		}
+		if !originKind.Valid || originKind.String != kind {
+			return nil, invalidPersistentState("change row does not match durable origin")
 		}
 		cursor, err := DecodeUint64(cursorBytes)
 		if err != nil || cursor == 0 || cursor <= previous || cursor > serverCursor || validateTimestamp(formatTimestamp(receivedAt)) != nil {
@@ -1306,11 +1390,8 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		orderedRevisionIDs   []string
 		validationAccount    snapshotMetadataAccounting
 	}
-	envelopeChangeCursors, err := validatePersistentEnvelopeHistory(ctx, query, serverCursor, envelopeGeneration)
-	if err != nil {
-		return err
-	}
 	snapshots := make(map[string]*validatedSnapshot)
+	snapshotCuts := make([]uint64, 0, 8)
 	ownerCounts := make(map[string]int)
 	declaredMetadata := int64(0)
 	rows, err := query.QueryContext(ctx, `
@@ -1339,17 +1420,6 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			cut > serverCursor || snapshotCollectionGeneration > collectionGeneration || owner.createdCursor != 0 && owner.createdCursor > cut {
 			rows.Close()
 			return invalidPersistentState("inconsistent snapshot row")
-		}
-		generationAtCut := uint64(0)
-		for _, changeCursor := range envelopeChangeCursors {
-			if changeCursor > cut {
-				break
-			}
-			generationAtCut++
-		}
-		if generation != generationAtCut {
-			rows.Close()
-			return invalidPersistentState("snapshot envelope generation does not match cut")
 		}
 		if createBodyLength <= 0 || createBodyLength > metadataBytes || createBodyLength > maxBodyBytes {
 			rows.Close()
@@ -1380,9 +1450,19 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			sourceCounters:     make(map[string]uint64),
 			markerBodies:       make(map[string][]byte), validationAccount: validationAccount,
 		}
+		snapshotCuts = append(snapshotCuts, cut)
 	}
 	if rows.Err() != nil || rows.Close() != nil {
 		return invalidPersistentState("read snapshots")
+	}
+	generationsAtCut, err := validatePersistentChangeOrigins(ctx, query, serverCursor, envelopeGeneration, snapshotCuts)
+	if err != nil {
+		return err
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.envelopeGeneration != generationsAtCut[snapshot.cutCursor] {
+			return invalidPersistentState("snapshot envelope generation does not match cut")
+		}
 	}
 
 	createRows, err := query.QueryContext(ctx, `

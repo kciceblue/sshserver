@@ -159,7 +159,7 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 	if _, err := transaction.ExecContext(ctx, "UPDATE enrollment_grants SET consumed_enrollment_id = ? WHERE grant_hash = ?", request.EnrollmentID, grantHash[:]); err != nil {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
-	if protocolErr := insertChange(ctx, transaction, newCursor, "device_changed", "", "", request.DeviceID, "enrolled", call.Now); protocolErr != nil {
+	if protocolErr := insertChange(ctx, transaction, newCursor, "device_changed", "", "", request.DeviceID, "enrolled", 0, call.Now); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	if protocolErr := setServerCursor(ctx, transaction, newCursor); protocolErr != nil {

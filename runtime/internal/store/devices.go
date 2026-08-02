@@ -270,7 +270,7 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 	}
-	if protocolErr := insertChange(ctx, transaction, newCursor, "device_changed", "", "", targetDeviceID, "revoked", changeTime); protocolErr != nil {
+	if protocolErr := insertChange(ctx, transaction, newCursor, "device_changed", "", "", targetDeviceID, "revoked", 0, changeTime); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	checkpoint, protocolErr := store.storeReceipt(ctx, transaction, authenticated.DeviceID, operation, call.RequestID, fingerprint, response, call.Now)

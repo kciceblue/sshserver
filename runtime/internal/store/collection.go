@@ -600,6 +600,9 @@ func writeCollectionMarker(ctx context.Context, transaction *sql.Tx, witness col
 }
 
 func insertMarkerChange(ctx context.Context, transaction *sql.Tx, cursor uint64, recordID string, markerBody []byte, now time.Time) *api.Error {
+	if protocolErr := insertChangeOrigin(ctx, transaction, cursor, "collection_marker", 0); protocolErr != nil {
+		return protocolErr
+	}
 	encoded := EncodeUint64(cursor)
 	if _, err := transaction.ExecContext(ctx, `
 		INSERT INTO changes (

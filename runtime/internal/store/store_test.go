@@ -352,6 +352,11 @@ func TestOpenMigratesReviewedTask21SchemaWithoutChangingIdentityOrCredentials(t 
 	}
 	defer transaction.Rollback()
 	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO change_origins (cursor, kind)
+		VALUES (?, 'device_changed')`, one[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
 		INSERT INTO changes (
 			cursor, kind, received_at_ms, device_changed_id, device_change_kind
 		) VALUES (?, 'device_changed', ?, ?, 'revoked')`, one[:], revokedAt, preRevokedDeviceID); err != nil {

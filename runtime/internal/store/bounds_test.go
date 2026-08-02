@@ -159,6 +159,12 @@ func seedBoundedPersistence(t *testing.T, options boundedSeedOptions) boundedPer
 			t.Fatal(err)
 		}
 		if _, err := opened.db.Exec(`
+			INSERT INTO change_origins (cursor, kind)
+			VALUES (?, 'collection_marker')`, changeCursor[:]); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		if _, err := opened.db.Exec(`
 			INSERT INTO changes (cursor, kind, received_at_ms, collection_marker_record_id, collection_marker_json)
 			VALUES (?, 'collection_marker', ?, ?, ?)`, changeCursor[:], protocolFixtureTime.UnixMilli(), seed.recordID, markerBody,
 		); err != nil {
@@ -466,6 +472,9 @@ func TestDeviceRevocationProvenanceFailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer transaction.Rollback()
+		if _, err := transaction.Exec("INSERT INTO change_origins (cursor, kind) VALUES (?, 'device_changed')", three[:]); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := transaction.Exec("UPDATE changes SET cursor = ? WHERE device_changed_id = ? AND device_change_kind = 'revoked'", three[:], deviceID); err != nil {
 			t.Fatal(err)
 		}
@@ -473,6 +482,9 @@ func TestDeviceRevocationProvenanceFailsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := transaction.Exec("UPDATE changes SET cursor = ? WHERE device_changed_id = ? AND device_change_kind = 'revoked'", one[:], deviceID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec("DELETE FROM change_origins WHERE cursor = ?", three[:]); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := transaction.Exec("UPDATE device_origins SET created_cursor = ? WHERE device_id = ?", two[:], deviceID); err != nil {
@@ -801,12 +813,23 @@ func TestReadinessUsesOneSnapshotAcrossConcurrentEnvelopeCommit(t *testing.T) {
 				transaction.Rollback()
 				t.Fatal(err)
 			}
+			if _, err := transaction.Exec("DELETE FROM change_origins WHERE cursor = ? AND kind = 'envelope_changed'", changeCursor[:]); err != nil {
+				transaction.Rollback()
+				t.Fatal(err)
+			}
 			serverCursor := EncodeUint64(3)
 			if _, err := transaction.Exec("UPDATE runtime_state SET server_cursor = ? WHERE singleton = 1", serverCursor[:]); err != nil {
 				transaction.Rollback()
 				t.Fatal(err)
 			}
 		case 2:
+			encodedGeneration := EncodeUint64(2)
+			if _, err := transaction.Exec(`
+				INSERT INTO change_origins (cursor, kind, envelope_generation)
+				VALUES (?, 'envelope_changed', ?)`, changeCursor[:], encodedGeneration[:]); err != nil {
+				transaction.Rollback()
+				t.Fatal(err)
+			}
 			if _, err := transaction.Exec(`
 				INSERT INTO changes (cursor, kind, received_at_ms)
 				VALUES (?, 'envelope_changed', ?)`, changeCursor[:], protocolFixtureTime.Add(time.Second).UnixMilli()); err != nil {
@@ -945,6 +968,226 @@ func TestEnvelopePutRejectsPresentGenerationZeroWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestEnvelopePutValidatesPermanentHistoryBeforeMutation(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	collectBoundedSeedRevision(t, seed)
+	two := EncodeUint64(2)
+	four := EncodeUint64(4)
+	if _, err := seed.opened.db.Exec("DELETE FROM changes WHERE cursor = ? AND kind = 'envelope_changed'", two[:]); err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		BaseMode         putEnvelopeRequest `json:"base_mode"`
+		PassphraseRewrap putEnvelopeRequest `json:"passphrase_rewrap"`
+	}
+	loadFixture(t, "vault-envelope.json", &fixture)
+	expectedBody, err := marshalJSON(fixture.BaseMode.Envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBody, err := marshalJSON(fixture.PassphraseRewrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := "e8300000-0000-4000-8000-000000000001"
+	expectInternalError(t, seed.opened, api.Request{
+		Method: "PUT", Path: "/v1/vault-envelope", RequestID: requestID,
+		Authorization: authorization(seed.token), Body: requestBody, Now: protocolFixtureTime.Add(4 * time.Second),
+	})
+	var runtimeGenerationBytes, serverCursorBytes, rowGenerationBytes, retainedBody []byte
+	var newOriginCount, newChangeCount, newReceiptCount int
+	if err := seed.opened.db.QueryRow(`
+		SELECT r.envelope_generation, r.server_cursor, v.generation, v.envelope_json,
+		       (SELECT count(*) FROM change_origins WHERE kind = 'envelope_changed' AND envelope_generation = ?),
+		       (SELECT count(*) FROM changes WHERE cursor = ?),
+		       (SELECT count(*) FROM operation_receipts WHERE operation = 'vault-envelope' AND request_id = ?)
+		FROM runtime_state r JOIN vault_envelope v ON v.singleton = r.singleton
+		WHERE r.singleton = 1`, two[:], four[:], requestID).Scan(
+		&runtimeGenerationBytes, &serverCursorBytes, &rowGenerationBytes, &retainedBody,
+		&newOriginCount, &newChangeCount, &newReceiptCount,
+	); err != nil {
+		t.Fatal(err)
+	}
+	runtimeGeneration, runtimeErr := DecodeUint64(runtimeGenerationBytes)
+	serverCursor, cursorErr := DecodeUint64(serverCursorBytes)
+	rowGeneration, rowErr := DecodeUint64(rowGenerationBytes)
+	var retained vaultEnvelope
+	bodyErr := decodeStoredCanonical(retainedBody, &retained)
+	if runtimeErr != nil || cursorErr != nil || rowErr != nil || bodyErr != nil || runtimeGeneration != 1 || rowGeneration != 1 || serverCursor != 3 ||
+		retained.EnvelopeGeneration != "1" || !slices.Equal(retainedBody, expectedBody) || newOriginCount != 0 || newChangeCount != 0 || newReceiptCount != 0 {
+		t.Fatalf("history-corrupt PUT mutated state: runtime=%d row=%d cursor=%d body_generation=%q origins=%d changes=%d receipts=%d",
+			runtimeGeneration, rowGeneration, serverCursor, retained.EnvelopeGeneration, newOriginCount, newChangeCount, newReceiptCount)
+	}
+}
+
+func TestEnvelopePutRejectsFutureOrphanCursorWithoutMutation(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	collectBoundedSeedRevision(t, seed)
+	one := EncodeUint64(1)
+	two := EncodeUint64(2)
+	four := EncodeUint64(4)
+	zero := EncodeUint64(0)
+	futureRevision := boundedNextRevision(seed, "e8310000-0000-4000-8000-000000000001")
+	vectorBody, err := json.Marshal(futureRevision.VersionVector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := marshalJSON(futureRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentHash := sha256.Sum256(canonical)
+	witness, err := decodeBase64(*futureRevision.CollectionWitnessAuthenticator, 32, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.opened.db.Exec(`
+		INSERT INTO record_revisions (
+			revision_id, record_id, author_device_id, author_counter,
+			vector_json, collection_witness_authenticator, tombstone,
+			content_hash, received_at_ms, accepted_uptime_ms,
+			change_cursor, collected_generation, retained, undominated
+		) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, 0)`,
+		futureRevision.RevisionID, futureRevision.RecordID, futureRevision.AuthorDeviceID,
+		two[:], vectorBody, witness, contentHash[:], protocolFixtureTime.Add(3*time.Second).UnixMilli(),
+		zero[:], four[:], one[:],
+	); err != nil {
+		t.Fatal(err)
+	}
+	type putState struct {
+		runtime, envelope                                                       string
+		origins, envelopeOrigins, changes, envelopeChanges, receipts, retention int
+	}
+	capture := func() putState {
+		t.Helper()
+		var serverCursor, floor, envelopeGeneration, secretGeneration, collectionGeneration, uptime, bootID, rowGeneration, body []byte
+		var scanAfter string
+		var state putState
+		if err := seed.opened.db.QueryRow(`
+			SELECT r.server_cursor, r.cursor_floor, r.envelope_generation,
+			       r.instance_secret_generation, r.collection_generation,
+			       r.accumulated_uptime_ms, r.active_boot_id,
+			       r.collection_scan_after_record_id, v.generation, v.envelope_json,
+			       (SELECT count(*) FROM change_origins),
+			       (SELECT count(*) FROM change_origins WHERE kind = 'envelope_changed'),
+			       (SELECT count(*) FROM changes),
+			       (SELECT count(*) FROM changes WHERE kind = 'envelope_changed'),
+			       (SELECT count(*) FROM operation_receipts),
+			       (SELECT count(*) FROM operation_receipt_retention)
+			FROM runtime_state r JOIN vault_envelope v ON v.singleton = r.singleton
+			WHERE r.singleton = 1`).Scan(
+			&serverCursor, &floor, &envelopeGeneration, &secretGeneration, &collectionGeneration,
+			&uptime, &bootID, &scanAfter, &rowGeneration, &body,
+			&state.origins, &state.envelopeOrigins, &state.changes, &state.envelopeChanges,
+			&state.receipts, &state.retention,
+		); err != nil {
+			t.Fatal(err)
+		}
+		state.runtime = fmt.Sprintf("%x|%x|%x|%x|%x|%x|%x|%s", serverCursor, floor, envelopeGeneration, secretGeneration, collectionGeneration, uptime, bootID, scanAfter)
+		state.envelope = fmt.Sprintf("%x|%x", rowGeneration, body)
+		return state
+	}
+	before := capture()
+	var fixture struct {
+		PassphraseRewrap putEnvelopeRequest `json:"passphrase_rewrap"`
+	}
+	loadFixture(t, "vault-envelope.json", &fixture)
+	requestBody, err := marshalJSON(fixture.PassphraseRewrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := "e8310000-0000-4000-8000-000000000002"
+	expectInternalError(t, seed.opened, api.Request{
+		Method: "PUT", Path: "/v1/vault-envelope", RequestID: requestID,
+		Authorization: authorization(seed.token), Body: requestBody, Now: protocolFixtureTime.Add(4 * time.Second),
+	})
+	after := capture()
+	if before != after {
+		t.Fatalf("future-owner PUT mutated state: before=%+v after=%+v", before, after)
+	}
+	var cursorBytes, collectedBytes []byte
+	var retained, originCount, changeCount, receiptCount int
+	if err := seed.opened.db.QueryRow(`
+		SELECT r.change_cursor, r.collected_generation, r.retained,
+		       (SELECT count(*) FROM change_origins WHERE cursor = ?),
+		       (SELECT count(*) FROM changes WHERE cursor = ?),
+		       (SELECT count(*) FROM operation_receipts WHERE operation = 'vault-envelope' AND request_id = ?)
+		FROM record_revisions r WHERE r.revision_id = ?`,
+		four[:], four[:], requestID, futureRevision.RevisionID,
+	).Scan(&cursorBytes, &collectedBytes, &retained, &originCount, &changeCount, &receiptCount); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cursorBytes, four[:]) || !slices.Equal(collectedBytes, one[:]) || retained != 0 || originCount != 0 || changeCount != 0 || receiptCount != 0 {
+		t.Fatalf("future owner changed: cursor=%x generation=%x retained=%d origins=%d changes=%d receipts=%d",
+			cursorBytes, collectedBytes, retained, originCount, changeCount, receiptCount)
+	}
+}
+
+func TestEnvelopeChangeCannotReuseCollectedRevisionCursor(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	collectBoundedSeedRevision(t, seed)
+	if _, err := seed.opened.db.Exec("PRAGMA foreign_keys = OFF"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = seed.opened.db.Exec("PRAGMA foreign_keys = ON") })
+	two := EncodeUint64(2)
+	three := EncodeUint64(3)
+	if _, err := seed.opened.db.Exec("DELETE FROM changes WHERE cursor = ? AND kind = 'envelope_changed'", two[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.opened.db.Exec(`
+		INSERT INTO changes (cursor, kind, received_at_ms)
+		VALUES (?, 'envelope_changed', ?)`, three[:], protocolFixtureTime.Add(time.Second).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.opened.db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePersistentState(context.Background(), seed.opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "change row does not match durable origin") {
+		t.Fatalf("collected-cursor envelope substitution error=%v", err)
+	}
+}
+
+func TestEnvelopeHistoryStreamsAcrossBoundedSnapshotCuts(t *testing.T) {
+	opened, _ := openDataPlane(t)
+	defer opened.Close()
+	const historyCount = 2048
+	transaction, err := opened.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	for generation := uint64(1); generation <= historyCount; generation++ {
+		encoded := EncodeUint64(generation)
+		if _, err := transaction.Exec(`
+			INSERT INTO change_origins (cursor, kind, envelope_generation)
+			VALUES (?, 'envelope_changed', ?)`, encoded[:], encoded[:]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec(`
+			INSERT INTO changes (cursor, kind, received_at_ms)
+			VALUES (?, 'envelope_changed', ?)`, encoded[:], protocolFixtureTime.UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	cuts := []uint64{0, 1, 17, 511, 1024, 1537, historyCount}
+	generations, err := validatePersistentChangeOrigins(context.Background(), opened.db, historyCount, historyCount, cuts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cut := range cuts {
+		if generations[cut] != cut {
+			t.Fatalf("generation at cut %d = %d", cut, generations[cut])
+		}
+	}
+}
+
 func TestExactEnrollmentReplayBypassesNewAttemptRateLimit(t *testing.T) {
 	seed := seedBoundedPersistence(t, boundedSeedOptions{})
 	defer seed.opened.Close()
@@ -1002,13 +1245,7 @@ func TestStartupRejectsRetainedChangeGap(t *testing.T) {
 func TestSnapshotReferenceAcceptedAfterCutFailsClosed(t *testing.T) {
 	seed := seedBoundedPersistence(t, boundedSeedOptions{})
 	defer seed.opened.Close()
-	four := EncodeUint64(4)
-	if _, err := seed.opened.db.Exec("UPDATE record_revisions SET change_cursor = ? WHERE revision_id = ?", four[:], seed.revisionID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := seed.opened.db.Exec("UPDATE runtime_state SET server_cursor = ? WHERE singleton = 1", four[:]); err != nil {
-		t.Fatal(err)
-	}
+	rewriteSnapshotCutCursor(t, seed.opened, seed.snapshot.SnapshotID, 2)
 	ctx := context.Background()
 	serverCursor, envelopeGeneration, _, collectionGeneration, err := validatePersistentRuntime(ctx, seed.opened.db)
 	if err != nil {
@@ -1076,7 +1313,7 @@ func TestEnvelopeHistoryBelowCollectionFloorRemainsRequired(t *testing.T) {
 	if _, err := seed.opened.db.Exec("DELETE FROM changes WHERE cursor = ? AND kind = 'envelope_changed'", two[:]); err != nil {
 		t.Fatal(err)
 	}
-	if err := validatePersistentState(context.Background(), seed.opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "envelope generation does not match accepted history") {
+	if err := validatePersistentState(context.Background(), seed.opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid envelope change origin") {
 		t.Fatalf("collected-floor envelope history error=%v", err)
 	}
 }
@@ -1818,6 +2055,7 @@ func TestStartupRejectsPermanentVectorIndexEqualVectorDuplicate(t *testing.T) {
 			}},
 			{"INSERT INTO record_vector_index (record_id, vector_hash, revision_id) VALUES (?, ?, ?)", []any{recordID, vectorHash[:], revision.RevisionID}},
 			{"INSERT INTO collection_candidates (record_id, accepted_uptime_ms, revision_id) VALUES (?, ?, ?)", []any{recordID, zero[:], revision.RevisionID}},
+			{"INSERT INTO change_origins (cursor, kind) VALUES (?, 'record_revision')", []any{cursor[:]}},
 			{"INSERT INTO changes (cursor, kind, received_at_ms, record_revision_id) VALUES (?, 'record_revision', ?, ?)", []any{cursor[:], protocolFixtureTime.UnixMilli(), revision.RevisionID}},
 		} {
 			if _, err := transaction.Exec(statement.query, statement.args...); err != nil {
@@ -1909,6 +2147,10 @@ func TestHistoricalFrontierRejectsCollectedThirtyThirdSiblingBeforeResolution(t 
 			transaction.Rollback()
 			t.Fatal(err)
 		}
+		if _, err := transaction.Exec("INSERT INTO change_origins (cursor, kind) VALUES (?, 'record_revision')", cursor[:]); err != nil {
+			transaction.Rollback()
+			t.Fatal(err)
+		}
 		vectorHash := sha256.Sum256(vectorBody)
 		if _, err := transaction.Exec("INSERT INTO record_vector_index (record_id, vector_hash, revision_id) VALUES (?, ?, ?)", recordID, vectorHash[:], revisionID); err != nil {
 			transaction.Rollback()
@@ -1955,6 +2197,7 @@ func TestHistoricalFrontierRejectsCollectedThirtyThirdSiblingBeforeResolution(t 
 		{"INSERT INTO record_heads (record_id, revision_id) VALUES (?, ?)", []any{recordID, resolutionID}},
 		{"INSERT INTO collection_records (record_id, barrier_cursor) VALUES (?, ?)", []any{recordID, cursor34[:]}},
 		{"INSERT INTO collection_candidates (record_id, accepted_uptime_ms, revision_id) VALUES (?, ?, ?)", []any{recordID, zero[:], resolutionID}},
+		{"INSERT INTO change_origins (cursor, kind) VALUES (?, 'record_revision')", []any{cursor34[:]}},
 		{"INSERT INTO changes (cursor, kind, received_at_ms, record_revision_id) VALUES (?, 'record_revision', ?, ?)", []any{cursor34[:], protocolFixtureTime.UnixMilli(), resolutionID}},
 	} {
 		if _, err := transaction.Exec(statement.query, statement.args...); err != nil {

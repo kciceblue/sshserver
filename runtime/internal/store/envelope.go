@@ -90,6 +90,9 @@ func (store *Store) handlePutEnvelope(ctx context.Context, call api.Request) (ap
 	if err := validatePersistentEnvelope(ctx, transaction, store.identity, storedGeneration, secretGeneration); err != nil {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
+	if _, err := validatePersistentChangeOrigins(ctx, transaction, cursor, storedGeneration, nil); err != nil {
+		return api.Response{}, api.NewError("internal_error", true)
+	}
 	if expected != storedGeneration {
 		return api.Response{}, api.NewError("generation_conflict", true)
 	}
@@ -127,7 +130,7 @@ func (store *Store) handlePutEnvelope(ctx context.Context, call api.Request) (ap
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	newCursor := cursor + 1
-	if protocolErr := insertChange(ctx, transaction, newCursor, "envelope_changed", "", "", "", "", call.Now); protocolErr != nil {
+	if protocolErr := insertChange(ctx, transaction, newCursor, "envelope_changed", "", "", "", "", newGeneration, call.Now); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
 	response := api.Response{Status: http.StatusOK, Body: responseBody}

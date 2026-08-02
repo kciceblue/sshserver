@@ -1672,6 +1672,12 @@ func TestReconstructedFrontierRejectsTheThirtyThirdMemberImmediately(t *testing.
 			t.Fatal(err)
 		}
 		if _, err := transaction.Exec(`
+			INSERT INTO change_origins (cursor, kind)
+			VALUES (?, 'record_revision')`, cursor[:]); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		if _, err := transaction.Exec(`
 			INSERT INTO changes (cursor, kind, received_at_ms, record_revision_id)
 			VALUES (?, 'record_revision', ?, ?)`, cursor[:], protocolFixtureTime.UnixMilli(), revisionID,
 		); err != nil {

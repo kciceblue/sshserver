@@ -197,7 +197,7 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 			ON CONFLICT(record_id) DO UPDATE SET barrier_cursor = excluded.barrier_cursor`, item.revision.RecordID, encodedCursor[:]); err != nil {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
-		if protocolErr := insertChange(ctx, transaction, nextAssignedCursor, "record_revision", item.revision.RevisionID, "", "", "", call.Now); protocolErr != nil {
+		if protocolErr := insertChange(ctx, transaction, nextAssignedCursor, "record_revision", item.revision.RevisionID, "", "", "", 0, call.Now); protocolErr != nil {
 			return api.Response{}, protocolErr
 		}
 	}

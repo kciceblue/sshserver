@@ -141,6 +141,14 @@ const createCollectionMarkersV1 = `CREATE TABLE collection_markers (
 			received_at_ms INTEGER NOT NULL
 		) STRICT`
 
+const createChangeOriginsV1 = `CREATE TABLE change_origins (
+			cursor BLOB PRIMARY KEY CHECK (length(cursor) = 8),
+			kind TEXT NOT NULL CHECK (kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed')),
+			envelope_generation BLOB UNIQUE CHECK (envelope_generation IS NULL OR length(envelope_generation) = 8),
+			UNIQUE (cursor, kind),
+			CHECK ((kind = 'envelope_changed') = (envelope_generation IS NOT NULL))
+		) STRICT`
+
 const createChangesV1 = `CREATE TABLE changes (
 			cursor BLOB PRIMARY KEY CHECK (length(cursor) = 8),
 			kind TEXT NOT NULL CHECK (kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed')),
@@ -155,7 +163,8 @@ const createChangesV1 = `CREATE TABLE changes (
 			CHECK ((kind = 'collection_marker') = (collection_marker_json IS NOT NULL)),
 			CHECK ((kind = 'device_changed') = (device_changed_id IS NOT NULL)),
 			CHECK ((kind = 'device_changed') = (device_change_kind IS NOT NULL)),
-			CHECK (device_changed_id IS NULL OR length(device_changed_id) = 36)
+			CHECK (device_changed_id IS NULL OR length(device_changed_id) = 36),
+			FOREIGN KEY (cursor, kind) REFERENCES change_origins(cursor, kind)
 		) STRICT`
 
 const createOperationReceiptsV1 = `CREATE TABLE operation_receipts (
@@ -229,6 +238,7 @@ const createSnapshotRevisionRefsV1 = `CREATE TABLE snapshot_revision_refs (
 		) STRICT`
 
 var fullSchemaTables = map[string]string{
+	"change_origins":              createChangeOriginsV1,
 	"changes":                     createChangesV1,
 	"collection_candidates":       createCollectionCandidatesV1,
 	"collection_markers":          createCollectionMarkersV1,
@@ -374,6 +384,7 @@ func createSchemaV1(ctx context.Context, transaction *sql.Tx) error {
 		createCollectionRecordsV1,
 		createCollectionCandidatesV1,
 		createCollectionMarkersV1,
+		createChangeOriginsV1,
 		createChangesV1,
 		createOperationReceiptsV1,
 		createOperationReceiptRetentionV1,
@@ -406,6 +417,7 @@ func migrateLegacySchemaV1(ctx context.Context, transaction *sql.Tx) error {
 		createCollectionRecordsV1,
 		createCollectionCandidatesV1,
 		createCollectionMarkersV1,
+		createChangeOriginsV1,
 		createChangesV1,
 		createOperationReceiptsV1,
 		createOperationReceiptRetentionV1,

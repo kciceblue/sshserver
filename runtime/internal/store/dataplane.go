@@ -504,7 +504,25 @@ func setServerCursor(ctx context.Context, transaction *sql.Tx, value uint64) *ap
 	return nil
 }
 
-func insertChange(ctx context.Context, transaction *sql.Tx, cursor uint64, kind, revisionID, markerRecordID, deviceID, deviceChangeKind string, now time.Time) *api.Error {
+func insertChangeOrigin(ctx context.Context, transaction *sql.Tx, cursor uint64, kind string, envelopeGeneration uint64) *api.Error {
+	encodedCursor := EncodeUint64(cursor)
+	var encodedGeneration any
+	if envelopeGeneration != 0 {
+		generation := EncodeUint64(envelopeGeneration)
+		encodedGeneration = generation[:]
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO change_origins (cursor, kind, envelope_generation)
+		VALUES (?, ?, ?)`, encodedCursor[:], kind, encodedGeneration); err != nil {
+		return api.NewError("internal_error", true)
+	}
+	return nil
+}
+
+func insertChange(ctx context.Context, transaction *sql.Tx, cursor uint64, kind, revisionID, markerRecordID, deviceID, deviceChangeKind string, envelopeGeneration uint64, now time.Time) *api.Error {
+	if protocolErr := insertChangeOrigin(ctx, transaction, cursor, kind, envelopeGeneration); protocolErr != nil {
+		return protocolErr
+	}
 	encoded := EncodeUint64(cursor)
 	var revision, marker, changedDevice, deviceEvent any
 	if revisionID != "" {
