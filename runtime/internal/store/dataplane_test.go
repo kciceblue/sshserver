@@ -1506,6 +1506,80 @@ func TestReconstructedFrontierRejectsTheThirtyThirdMemberImmediately(t *testing.
 	}
 }
 
+func TestReconstructedFrontierUsesAcceptanceOrder(t *testing.T) {
+	opened, path := openDataPlane(t)
+	const recordID = "d8000000-0000-4000-8000-000000000001"
+	tokens := make([][]byte, 33)
+	deviceIDs := make([]string, 33)
+	for index := range deviceIDs {
+		deviceIDs[index] = fmt.Sprintf("d4000000-0000-4000-8000-%012x", index+1)
+		tokens[index] = tokenWithByte(byte(index + 40))
+		enrollDevice(
+			t, opened, protocolFixtureTime.Add(time.Duration(index)*2*time.Minute),
+			fmt.Sprintf("d9000000-0000-4000-8000-%012x", index+1),
+			deviceIDs[index],
+			fmt.Sprintf("da000000-0000-4000-8000-%012x", index+1),
+			tokens[index],
+		)
+	}
+	syncBaseTime := protocolFixtureTime.Add(70 * time.Minute)
+	makeRevision := func(revisionID, authorID, authorCounter string, vector []vectorEntry) recordRevision {
+		return recordRevision{
+			RecordID: recordID, RevisionID: revisionID, AuthorDeviceID: authorID,
+			AuthorCounter: authorCounter, VersionVector: vector,
+			PayloadSchema: "1", CryptoSuite: cryptoSuite,
+			Nonce:      base64.RawURLEncoding.EncodeToString(make([]byte, 24)),
+			Ciphertext: base64.RawURLEncoding.EncodeToString(make([]byte, 16)),
+		}
+	}
+	for index := 0; index < 2; index++ {
+		revision := makeRevision(
+			fmt.Sprintf("d5000000-0000-4000-8000-%012x", index+1),
+			deviceIDs[index], "1",
+			[]vectorEntry{{DeviceID: deviceIDs[index], Counter: "1"}},
+		)
+		syncMutation(
+			t, opened, deviceIDs[index], tokens[index],
+			fmt.Sprintf("db000000-0000-4000-8000-%012x", index+1),
+			revision, syncBaseTime.Add(time.Duration(index+1)*time.Millisecond),
+		)
+	}
+	resolution := makeRevision(
+		"d7000000-0000-4000-8000-000000000001", deviceIDs[0], "2",
+		[]vectorEntry{
+			{DeviceID: deviceIDs[0], Counter: "2"},
+			{DeviceID: deviceIDs[1], Counter: "1"},
+		},
+	)
+	syncMutation(
+		t, opened, deviceIDs[0], tokens[0],
+		"db000000-0000-4000-8000-000000000003",
+		resolution, syncBaseTime.Add(3*time.Millisecond),
+	)
+	for index := 2; index < len(deviceIDs); index++ {
+		revision := makeRevision(
+			fmt.Sprintf("d6000000-0000-4000-8000-%012x", index-1),
+			deviceIDs[index], "1",
+			[]vectorEntry{{DeviceID: deviceIDs[index], Counter: "1"}},
+		)
+		syncMutation(
+			t, opened, deviceIDs[index], tokens[index],
+			fmt.Sprintf("dc000000-0000-4000-8000-%012x", index-1),
+			revision, syncBaseTime.Add(time.Duration(index+2)*time.Millisecond),
+		)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), path, testIdentity)
+	if err != nil {
+		t.Fatalf("valid acceptance-order frontier failed to reopen: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOperationReceiptRetentionClassesAreIndependent(t *testing.T) {
 	opened, _ := openDataPlane(t)
 	defer opened.Close()

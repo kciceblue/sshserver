@@ -362,6 +362,10 @@ func validatePersistentObjectReferences(ctx context.Context, query schemaQueryer
 }
 
 func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor uint64) (map[string]uint64, error) {
+	// change_cursor is a unique fixed-width big-endian value. Replaying each
+	// record in cursor order reproduces its admission-time frontier, so the
+	// 32-sibling cap is sound even when a later resolution sorts after older
+	// revision UUIDs.
 	rows, err := query.QueryContext(ctx, `
 		SELECT r.revision_id, r.record_id, r.author_device_id, r.author_counter,
 		       r.vector_json, r.collection_witness_authenticator, r.tombstone,
@@ -373,7 +377,7 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		LEFT JOIN changes c
 		  ON c.cursor = r.change_cursor AND c.kind = 'record_revision'
 		 AND c.record_revision_id = r.revision_id
-		ORDER BY r.record_id, r.revision_id`)
+		ORDER BY r.record_id, r.change_cursor`)
 	if err != nil {
 		return nil, invalidPersistentState("read revision rows")
 	}
