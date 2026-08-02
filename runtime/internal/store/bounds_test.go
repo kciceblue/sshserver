@@ -559,6 +559,30 @@ func TestExactEnrollmentReplayBypassesNewAttemptRateLimit(t *testing.T) {
 	}
 }
 
+func TestRetainedEnrollmentDeviceConflictBypassesNewAttemptRateLimit(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	now := protocolFixtureTime.Add(time.Minute)
+	grant := createGrant(t, seed.opened, now)
+	defer clear(grant.Grant)
+	body, _ := marshalJSON(enrollmentRequest{
+		ProtocolVersion: "1",
+		EnrollmentID:    "e8000000-0000-4000-8000-000000000001",
+		DeviceID:        seed.deviceID,
+		DeviceToken:     base64.RawURLEncoding.EncodeToString(tokenWithByte(0xe8)),
+		Scopes:          auth.FixedScopes(),
+	})
+	call := api.Request{
+		Method: "POST", Path: "/v1/enrollments", RequestID: "e8000000-0000-4000-8000-000000000002",
+		Authorization: "JAT-Enrollment " + base64.RawURLEncoding.EncodeToString(grant.Grant), Body: body, Now: now,
+	}
+	for attempt := 1; attempt <= 6; attempt++ {
+		if _, protocolErr := seed.opened.HandleAPI(context.Background(), call); protocolErr == nil || protocolErr.Code != "enrollment_replay_mismatch" {
+			t.Fatalf("retained device conflict attempt %d error=%v", attempt, protocolErr)
+		}
+	}
+}
+
 func TestStartupRejectsRetainedChangeGap(t *testing.T) {
 	seed := seedBoundedPersistence(t, boundedSeedOptions{})
 	two := EncodeUint64(2)

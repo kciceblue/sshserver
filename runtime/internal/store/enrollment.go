@@ -76,10 +76,6 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 		return api.Response{Status: http.StatusOK, Body: response}, nil
 	}
 
-	if protocolErr := store.admitEnrollmentAttempt(call.Now); protocolErr != nil {
-		return api.Response{}, protocolErr
-	}
-
 	var enrollmentForDevice string
 	err = transaction.QueryRowContext(ctx, "SELECT enrollment_id FROM enrollments WHERE device_id = ?", request.DeviceID).Scan(&enrollmentForDevice)
 	if err == nil {
@@ -95,6 +91,9 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return api.Response{}, api.NewError("internal_error", true)
+	}
+	if protocolErr := store.admitEnrollmentAttempt(call.Now); protocolErr != nil {
+		return api.Response{}, protocolErr
 	}
 	var deviceCount, activeCount int
 	if err := transaction.QueryRowContext(ctx, `
