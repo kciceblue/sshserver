@@ -1188,6 +1188,161 @@ func TestEnvelopeHistoryStreamsAcrossBoundedSnapshotCuts(t *testing.T) {
 	}
 }
 
+func TestChangeOriginScanBoundsFieldsBeforeLoading(t *testing.T) {
+	const oversizedBytes = maxBodyBytes + 1
+	oversizedSuffix := strings.Repeat("x", oversizedBytes)
+	oversizedKind := "envelope_changed\x00" + oversizedSuffix
+	oversizedRevisionID := "e8330000-0000-4000-8000-000000000001\x00" + oversizedSuffix
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *sql.DB)
+	}{
+		{
+			name: "origin and change cursor",
+			mutate: func(t *testing.T, database *sql.DB) {
+				two := EncodeUint64(2)
+				if _, err := database.Exec("UPDATE changes SET cursor = zeroblob(?) WHERE cursor = ?", oversizedBytes, two[:]); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := database.Exec("UPDATE change_origins SET cursor = zeroblob(?) WHERE cursor = ?", oversizedBytes, two[:]); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "NUL-suffixed origin and change kind",
+			mutate: func(t *testing.T, database *sql.DB) {
+				two := EncodeUint64(2)
+				if _, err := database.Exec("UPDATE changes SET kind = ? WHERE cursor = ?", oversizedKind, two[:]); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := database.Exec("UPDATE change_origins SET kind = ? WHERE cursor = ?", oversizedKind, two[:]); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "envelope generation",
+			mutate: func(t *testing.T, database *sql.DB) {
+				if _, err := database.Exec("UPDATE change_origins SET envelope_generation = zeroblob(?) WHERE kind = 'envelope_changed'", oversizedBytes); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "NUL-suffixed joined revision ID",
+			mutate: func(t *testing.T, database *sql.DB) {
+				three := EncodeUint64(3)
+				if _, err := database.Exec("UPDATE record_revisions SET revision_id = ? WHERE change_cursor = ?", oversizedRevisionID, three[:]); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			seed := seedBoundedPersistence(t, boundedSeedOptions{})
+			defer seed.opened.Close()
+			if _, err := seed.opened.db.Exec("PRAGMA foreign_keys = OFF"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := seed.opened.db.Exec("PRAGMA ignore_check_constraints = ON"); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, seed.opened.db)
+			if _, err := seed.opened.db.Exec("PRAGMA ignore_check_constraints = OFF"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := seed.opened.db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := validatePersistentChangeOrigins(context.Background(), seed.opened.db, 3, 1, []uint64{3}); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid change origin") {
+				t.Fatalf("oversized %s error=%v", test.name, err)
+			}
+		})
+	}
+}
+
+func TestOversizedEnvelopeOriginGenerationFailsClosedAtStartup(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	if _, err := seed.opened.db.Exec("PRAGMA ignore_check_constraints = ON"); err != nil {
+		seed.opened.Close()
+		t.Fatal(err)
+	}
+	if _, err := seed.opened.db.Exec("UPDATE change_origins SET envelope_generation = zeroblob(?) WHERE kind = 'envelope_changed'", maxBodyBytes+1); err != nil {
+		seed.opened.Close()
+		t.Fatal(err)
+	}
+	if err := seed.opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), seed.path, testIdentity)
+	if reopened != nil {
+		reopened.Close()
+	}
+	if !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid change origin") {
+		t.Fatalf("oversized envelope origin startup error=%v", err)
+	}
+}
+
+func TestEnvelopePutBoundsPermanentOriginBeforeMutation(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	if _, err := seed.opened.db.Exec("PRAGMA ignore_check_constraints = ON"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.opened.db.Exec("UPDATE change_origins SET envelope_generation = zeroblob(?) WHERE kind = 'envelope_changed'", maxBodyBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.opened.db.Exec("PRAGMA ignore_check_constraints = OFF"); err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		BaseMode         putEnvelopeRequest `json:"base_mode"`
+		PassphraseRewrap putEnvelopeRequest `json:"passphrase_rewrap"`
+	}
+	loadFixture(t, "vault-envelope.json", &fixture)
+	expectedBody, err := marshalJSON(fixture.BaseMode.Envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBody, err := marshalJSON(fixture.PassphraseRewrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := "e8320000-0000-4000-8000-000000000001"
+	expectInternalError(t, seed.opened, api.Request{
+		Method: "PUT", Path: "/v1/vault-envelope", RequestID: requestID,
+		Authorization: authorization(seed.token), Body: requestBody, Now: protocolFixtureTime.Add(4 * time.Second),
+	})
+	two := EncodeUint64(2)
+	four := EncodeUint64(4)
+	var runtimeGenerationBytes, serverCursorBytes, rowGenerationBytes, retainedBody []byte
+	var originLength int64
+	var newOriginCount, newChangeCount, newReceiptCount int
+	if err := seed.opened.db.QueryRow(`
+		SELECT r.envelope_generation, r.server_cursor, v.generation, v.envelope_json,
+		       (SELECT length(envelope_generation) FROM change_origins WHERE kind = 'envelope_changed'),
+		       (SELECT count(*) FROM change_origins WHERE kind = 'envelope_changed' AND envelope_generation = ?),
+		       (SELECT count(*) FROM changes WHERE cursor = ?),
+		       (SELECT count(*) FROM operation_receipts WHERE operation = 'vault-envelope' AND request_id = ?)
+		FROM runtime_state r JOIN vault_envelope v ON v.singleton = r.singleton
+		WHERE r.singleton = 1`, two[:], four[:], requestID).Scan(
+		&runtimeGenerationBytes, &serverCursorBytes, &rowGenerationBytes, &retainedBody,
+		&originLength, &newOriginCount, &newChangeCount, &newReceiptCount,
+	); err != nil {
+		t.Fatal(err)
+	}
+	runtimeGeneration, runtimeErr := DecodeUint64(runtimeGenerationBytes)
+	serverCursor, cursorErr := DecodeUint64(serverCursorBytes)
+	rowGeneration, rowErr := DecodeUint64(rowGenerationBytes)
+	if runtimeErr != nil || cursorErr != nil || rowErr != nil || runtimeGeneration != 1 || rowGeneration != 1 || serverCursor != 3 ||
+		originLength != maxBodyBytes+1 || !slices.Equal(retainedBody, expectedBody) || newOriginCount != 0 || newChangeCount != 0 || newReceiptCount != 0 {
+		t.Fatalf("oversized-origin PUT mutated state: runtime=%d row=%d cursor=%d origin_length=%d origins=%d changes=%d receipts=%d",
+			runtimeGeneration, rowGeneration, serverCursor, originLength, newOriginCount, newChangeCount, newReceiptCount)
+	}
+}
+
 func TestExactEnrollmentReplayBypassesNewAttemptRateLimit(t *testing.T) {
 	seed := seedBoundedPersistence(t, boundedSeedOptions{})
 	defer seed.opened.Close()

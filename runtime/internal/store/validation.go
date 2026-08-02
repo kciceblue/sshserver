@@ -370,8 +370,24 @@ func validatePersistentChangeOrigins(ctx context.Context, query schemaQueryer, s
 		return nil, invalidPersistentState("durable change owner does not match origin")
 	}
 	rows, err := query.QueryContext(ctx, `
-		SELECT o.cursor, o.kind, o.envelope_generation,
-		       c.kind, r.revision_id
+		SELECT octet_length(o.cursor),
+		       CASE WHEN typeof(o.cursor) = 'blob' AND octet_length(o.cursor) = 8
+		            THEN o.cursor END,
+		       CASE WHEN typeof(o.kind) = 'text' AND o.kind IN (
+		            'record_revision', 'collection_marker',
+		            'envelope_changed', 'device_changed'
+		       ) THEN o.kind END,
+		       octet_length(o.envelope_generation),
+		       CASE WHEN typeof(o.envelope_generation) = 'blob'
+		                  AND octet_length(o.envelope_generation) = 8
+		            THEN o.envelope_generation END,
+		       CASE WHEN c.cursor IS NULL THEN 0
+		            WHEN typeof(c.kind) = 'text' AND c.kind = o.kind THEN 1
+		            ELSE -1 END,
+		       CASE WHEN r.change_cursor IS NULL THEN 0
+		            WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = 36 THEN 1
+		            ELSE -1 END
 		FROM change_origins o
 		LEFT JOIN changes c ON c.cursor = o.cursor
 		LEFT JOIN record_revisions r ON r.change_cursor = o.cursor
@@ -384,28 +400,36 @@ func validatePersistentChangeOrigins(ctx context.Context, query schemaQueryer, s
 	envelopeGeneration := uint64(0)
 	for rows.Next() {
 		var cursorBytes, generationBytes []byte
-		var kind string
-		var changeKind, revisionID sql.NullString
-		if rows.Scan(&cursorBytes, &kind, &generationBytes, &changeKind, &revisionID) != nil {
+		var cursorLength int64
+		var generationLength sql.NullInt64
+		var kind sql.NullString
+		var changeState, revisionState int
+		if rows.Scan(
+			&cursorLength, &cursorBytes, &kind,
+			&generationLength, &generationBytes, &changeState, &revisionState,
+		) != nil ||
+			cursorLength != 8 || len(cursorBytes) != 8 || !kind.Valid ||
+			generationLength.Valid && (generationLength.Int64 != 8 || len(generationBytes) != 8) ||
+			!generationLength.Valid && generationBytes != nil ||
+			changeState < 0 || changeState > 1 || revisionState < 0 || revisionState > 1 {
 			return nil, invalidPersistentState("invalid change origin")
 		}
 		cursor, cursorErr := DecodeUint64(cursorBytes)
 		if cursorErr != nil || cursor == 0 || previous == math.MaxUint64 || cursor != previous+1 || cursor > serverCursor {
 			return nil, invalidPersistentState("change origins are not contiguous")
 		}
-		switch kind {
+		switch kind.String {
 		case "record_revision":
-			if generationBytes != nil || !revisionID.Valid || changeKind.Valid && changeKind.String != kind {
+			if generationBytes != nil || revisionState != 1 {
 				return nil, invalidPersistentState("change origin does not match durable owner")
 			}
 		case "collection_marker", "device_changed":
-			if generationBytes != nil || revisionID.Valid || !changeKind.Valid || changeKind.String != kind {
+			if generationBytes != nil || revisionState != 0 || changeState != 1 {
 				return nil, invalidPersistentState("change origin does not match durable owner")
 			}
 		case "envelope_changed":
 			generation, generationErr := DecodeUint64(generationBytes)
-			if generationErr != nil || envelopeGeneration == math.MaxUint64 || generation != envelopeGeneration+1 || revisionID.Valid ||
-				!changeKind.Valid || changeKind.String != kind {
+			if generationErr != nil || envelopeGeneration == math.MaxUint64 || generation != envelopeGeneration+1 || revisionState != 0 || changeState != 1 {
 				return nil, invalidPersistentState("invalid envelope change origin")
 			}
 			envelopeGeneration = generation
