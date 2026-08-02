@@ -619,6 +619,9 @@ func validatePersistentRecordVectorIndex(ctx context.Context, query schemaQuerye
 	if err != nil {
 		return invalidPersistentState("read record vector index")
 	}
+	var previousRecordID string
+	var previousVectorHash [32]byte
+	havePrevious := false
 	for rows.Next() {
 		var recordID, revisionID string
 		var vectorHash, vectorBody []byte
@@ -635,6 +638,13 @@ func validatePersistentRecordVectorIndex(ctx context.Context, query schemaQuerye
 			rows.Close()
 			return invalidPersistentState("record vector index hash mismatch")
 		}
+		if havePrevious && recordID == previousRecordID && bytes.Equal(vectorHash, previousVectorHash[:]) {
+			rows.Close()
+			return invalidPersistentState("duplicate record vector index")
+		}
+		previousRecordID = recordID
+		copy(previousVectorHash[:], vectorHash)
+		havePrevious = true
 	}
 	if rows.Err() != nil || rows.Close() != nil {
 		return invalidPersistentState("read record vector index")

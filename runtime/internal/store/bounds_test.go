@@ -760,6 +760,105 @@ func TestStartupRejectsSixtyFifthDeviceAtSentinel(t *testing.T) {
 	}
 }
 
+func TestStartupRejectsPermanentVectorIndexEqualVectorDuplicate(t *testing.T) {
+	opened, path := openDataPlane(t)
+	deviceA := "e7000000-0000-4000-8000-000000000001"
+	deviceB := "e7000000-0000-4000-8000-000000000004"
+	enrollDevice(t, opened, protocolFixtureTime,
+		"e7000000-0000-4000-8000-000000000002", deviceA,
+		"e7000000-0000-4000-8000-000000000003", tokenWithByte(0xe7))
+	enrollDevice(t, opened, protocolFixtureTime,
+		"e7000000-0000-4000-8000-000000000005", deviceB,
+		"e7000000-0000-4000-8000-000000000006", tokenWithByte(0xe8))
+
+	recordID := "e7000000-0000-4000-8000-000000000007"
+	revisions := []recordRevision{
+		{
+			RecordID: recordID, RevisionID: "e7000000-0000-4000-8000-000000000008", AuthorDeviceID: deviceA,
+			AuthorCounter: "1", VersionVector: []vectorEntry{{DeviceID: deviceA, Counter: "1"}, {DeviceID: deviceB, Counter: "1"}},
+			PayloadSchema: "1", CryptoSuite: cryptoSuite, Nonce: base64.RawURLEncoding.EncodeToString(make([]byte, 24)), Ciphertext: base64.RawURLEncoding.EncodeToString(make([]byte, 16)),
+		},
+		{
+			RecordID: recordID, RevisionID: "e7000000-0000-4000-8000-000000000009", AuthorDeviceID: deviceA,
+			AuthorCounter: "2", VersionVector: []vectorEntry{{DeviceID: deviceA, Counter: "2"}, {DeviceID: deviceB, Counter: "1"}},
+			PayloadSchema: "1", CryptoSuite: cryptoSuite, Nonce: base64.RawURLEncoding.EncodeToString(make([]byte, 24)), Ciphertext: base64.RawURLEncoding.EncodeToString(make([]byte, 16)),
+		},
+		{
+			RecordID: recordID, RevisionID: "e7000000-0000-4000-8000-00000000000a", AuthorDeviceID: deviceB,
+			AuthorCounter: "1", VersionVector: []vectorEntry{{DeviceID: deviceA, Counter: "1"}, {DeviceID: deviceB, Counter: "1"}},
+			PayloadSchema: "1", CryptoSuite: cryptoSuite, Nonce: base64.RawURLEncoding.EncodeToString(make([]byte, 24)), Ciphertext: base64.RawURLEncoding.EncodeToString(make([]byte, 16)),
+		},
+	}
+	transaction, err := opened.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := EncodeUint64(0)
+	for index, revision := range revisions {
+		body, _ := marshalJSON(revision)
+		contentHash := sha256.Sum256(body)
+		vectorBody, _ := json.Marshal(revision.VersionVector)
+		vectorHash := sha256.Sum256(vectorBody)
+		authorCounter, _ := parseUint64(revision.AuthorCounter)
+		counter := EncodeUint64(authorCounter)
+		cursor := EncodeUint64(uint64(index + 3))
+		undominated := index == 1
+		for _, statement := range []struct {
+			query string
+			args  []any
+		}{
+			{"INSERT INTO revision_objects (content_hash, revision_json) VALUES (?, ?)", []any{contentHash[:], body}},
+			{`INSERT INTO record_revisions (
+				revision_id, record_id, author_device_id, author_counter, vector_json,
+				collection_witness_authenticator, tombstone, content_hash, received_at_ms,
+				accepted_uptime_ms, change_cursor, retained, undominated
+			) VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, 1, ?)`, []any{
+				revision.RevisionID, recordID, revision.AuthorDeviceID, counter[:], vectorBody,
+				contentHash[:], protocolFixtureTime.UnixMilli(), zero[:], cursor[:], boolToInt(undominated),
+			}},
+			{"INSERT INTO record_vector_index (record_id, vector_hash, revision_id) VALUES (?, ?, ?)", []any{recordID, vectorHash[:], revision.RevisionID}},
+			{"INSERT INTO collection_candidates (record_id, accepted_uptime_ms, revision_id) VALUES (?, ?, ?)", []any{recordID, zero[:], revision.RevisionID}},
+			{"INSERT INTO changes (cursor, kind, received_at_ms, record_revision_id) VALUES (?, 'record_revision', ?, ?)", []any{cursor[:], protocolFixtureTime.UnixMilli(), revision.RevisionID}},
+		} {
+			if _, err := transaction.Exec(statement.query, statement.args...); err != nil {
+				transaction.Rollback()
+				t.Fatal(err)
+			}
+		}
+	}
+	one := EncodeUint64(1)
+	two := EncodeUint64(2)
+	five := EncodeUint64(5)
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{"UPDATE devices SET max_author_counter = ? WHERE device_id = ?", []any{two[:], deviceA}},
+		{"UPDATE devices SET max_author_counter = ? WHERE device_id = ?", []any{one[:], deviceB}},
+		{"INSERT INTO record_heads (record_id, revision_id) VALUES (?, ?)", []any{recordID, revisions[1].RevisionID}},
+		{"INSERT INTO collection_records (record_id, barrier_cursor) VALUES (?, ?)", []any{recordID, five[:]}},
+		{"UPDATE runtime_state SET server_cursor = ? WHERE singleton = 1", []any{five[:]}},
+	} {
+		if _, err := transaction.Exec(statement.query, statement.args...); err != nil {
+			transaction.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), path, testIdentity)
+	if reopened != nil {
+		reopened.Close()
+	}
+	if !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "duplicate record vector index") {
+		t.Fatalf("equal-vector duplicate startup error=%v", err)
+	}
+}
+
 func TestHistoricalFrontierRejectsCollectedThirtyThirdSiblingBeforeResolution(t *testing.T) {
 	opened, path := openDataPlane(t)
 	transaction, err := opened.db.Begin()
