@@ -1123,6 +1123,7 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		references         []snapshotRevisionReference
 		referenceRecordIDs map[string]string
 		sourceCounters     map[string]uint64
+		markerBodies       map[string][]byte
 		orderedRevisionIDs []string
 		validationAccount  snapshotMetadataAccounting
 	}
@@ -1178,7 +1179,8 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			ownerID: ownerID, requestID: requestID, cutCursor: cut, envelopeGeneration: generation,
 			expiresAt: expiresAt, metadataBytes: metadataBytes, createBodyLength: createBodyLength,
 			referenceRecordIDs: make(map[string]string),
-			sourceCounters:     make(map[string]uint64), validationAccount: validationAccount,
+			sourceCounters:     make(map[string]uint64),
+			markerBodies:       make(map[string][]byte), validationAccount: validationAccount,
 		}
 	}
 	if rows.Err() != nil || rows.Close() != nil {
@@ -1362,6 +1364,11 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 				if barrier > snapshot.cutCursor {
 					return invalidPersistentState("snapshot marker barrier exceeds cut")
 				}
+				markerBody, err := marshalJSON(marker)
+				if err != nil {
+					return invalidPersistentState("invalid snapshot marker")
+				}
+				snapshot.markerBodies[marker.RecordID] = markerBody
 				for deviceID, counter := range frontier {
 					maximum, exists := snapshot.sourceCounters[deviceID]
 					if !exists || counter > maximum {
@@ -1442,6 +1449,201 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 	}
 	if refRows.Err() != nil || refRows.Close() != nil {
 		return invalidPersistentState("read snapshot refs")
+	}
+	type snapshotCutFrontierItem struct {
+		id     string
+		vector map[string]uint64
+	}
+	for _, snapshot := range snapshots {
+		encodedCut := EncodeUint64(snapshot.cutCursor)
+		referencesByRecord := make(map[string]map[string]struct{})
+		for revisionID, recordID := range snapshot.referenceRecordIDs {
+			if referencesByRecord[recordID] == nil {
+				referencesByRecord[recordID] = make(map[string]struct{})
+			}
+			referencesByRecord[recordID][revisionID] = struct{}{}
+		}
+		cutRows, err := query.QueryContext(ctx, `
+			SELECT revision_id, record_id, author_device_id, author_counter,
+			       length(vector_json),
+			       CASE WHEN length(vector_json) BETWEEN 1 AND ? THEN vector_json END,
+			       change_cursor
+			FROM record_revisions
+			WHERE change_cursor <= ?
+			ORDER BY record_id, change_cursor`, maxVectorBytes, encodedCut[:])
+		if err != nil {
+			return invalidPersistentState("read snapshot cut revisions")
+		}
+		authorMaxima := make(map[string]uint64, len(devices))
+		currentRecord := ""
+		var frontier []snapshotCutFrontierItem
+		flushFrontier := func() error {
+			if currentRecord == "" {
+				return nil
+			}
+			references := referencesByRecord[currentRecord]
+			if len(references) == 0 {
+				return nil
+			}
+			heads := make(map[string]struct{}, len(frontier))
+			for _, item := range frontier {
+				heads[item.id] = struct{}{}
+			}
+			for revisionID := range references {
+				if _, exists := heads[revisionID]; !exists {
+					return invalidPersistentState("snapshot reference was dominated at cut")
+				}
+			}
+			delete(referencesByRecord, currentRecord)
+			return nil
+		}
+		for cutRows.Next() {
+			var revisionID, recordID, authorID string
+			var counterBytes, vectorBody, cursorBytes []byte
+			var vectorLength int64
+			if cutRows.Scan(&revisionID, &recordID, &authorID, &counterBytes, &vectorLength, &vectorBody, &cursorBytes) != nil ||
+				validateUUID(revisionID) != nil || validateUUID(recordID) != nil || validateUUID(authorID) != nil ||
+				!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) {
+				cutRows.Close()
+				return invalidPersistentState("invalid snapshot cut revision")
+			}
+			counter, counterErr := DecodeUint64(counterBytes)
+			cursor, cursorErr := DecodeUint64(cursorBytes)
+			var entries []vectorEntry
+			if counterErr != nil || cursorErr != nil || cursor == 0 || cursor > snapshot.cutCursor || json.Unmarshal(vectorBody, &entries) != nil {
+				cutRows.Close()
+				return invalidPersistentState("invalid snapshot cut revision")
+			}
+			vector, vectorErr := validateVector(entries)
+			if _, exists := devices[authorID]; !exists || vectorErr != nil || vector[authorID] != counter {
+				cutRows.Close()
+				return invalidPersistentState("invalid snapshot cut revision vector")
+			}
+			if currentRecord != recordID {
+				if err := flushFrontier(); err != nil {
+					cutRows.Close()
+					return err
+				}
+				currentRecord = recordID
+				frontier = nil
+			}
+			dominated := false
+			next := frontier[:0]
+			for _, existing := range frontier {
+				if vectorsEqual(existing.vector, vector) {
+					cutRows.Close()
+					return invalidPersistentState("equal-vector revision equivocation at snapshot cut")
+				}
+				if vectorDominates(existing.vector, vector) {
+					dominated = true
+				}
+				if !vectorDominates(vector, existing.vector) {
+					next = append(next, existing)
+				}
+			}
+			if !dominated {
+				next = append(next, snapshotCutFrontierItem{id: revisionID, vector: vector})
+				if len(next) > 32 {
+					cutRows.Close()
+					return invalidPersistentState("snapshot cut has too many undominated revisions")
+				}
+			}
+			frontier = next
+			if counter > authorMaxima[authorID] {
+				authorMaxima[authorID] = counter
+			}
+		}
+		if cutRows.Err() != nil {
+			cutRows.Close()
+			return invalidPersistentState("read snapshot cut revisions")
+		}
+		if err := flushFrontier(); err != nil {
+			cutRows.Close()
+			return err
+		}
+		if cutRows.Close() != nil {
+			return invalidPersistentState("read snapshot cut revisions")
+		}
+		if len(referencesByRecord) != 0 {
+			return invalidPersistentState("snapshot reference was not accepted at cut")
+		}
+		for deviceID, counter := range snapshot.sourceCounters {
+			if _, exists := devices[deviceID]; !exists || counter != authorMaxima[deviceID] {
+				return invalidPersistentState("snapshot source counter does not match cut")
+			}
+		}
+		for deviceID, counter := range authorMaxima {
+			if counter != 0 {
+				if sourceCounter, exists := snapshot.sourceCounters[deviceID]; !exists || sourceCounter != counter {
+					return invalidPersistentState("snapshot source registry omits cut author")
+				}
+			}
+		}
+
+		remainingMarkers := make(map[string][]byte, len(snapshot.markerBodies))
+		for recordID, body := range snapshot.markerBodies {
+			remainingMarkers[recordID] = body
+		}
+		markerRows, err := query.QueryContext(ctx, `
+			SELECT collection_marker_record_id, cursor, length(collection_marker_json),
+			       CASE WHEN length(collection_marker_json) BETWEEN 1 AND ? THEN collection_marker_json END
+			FROM changes
+			WHERE kind = 'collection_marker' AND cursor <= ?
+			ORDER BY collection_marker_record_id, cursor`, maxBodyBytes, encodedCut[:])
+		if err != nil {
+			return invalidPersistentState("read snapshot cut markers")
+		}
+		currentMarkerRecord := ""
+		var latestMarkerBody []byte
+		flushMarker := func() error {
+			if currentMarkerRecord == "" {
+				return nil
+			}
+			descriptorBody, exists := remainingMarkers[currentMarkerRecord]
+			if !exists || !bytes.Equal(descriptorBody, latestMarkerBody) {
+				return invalidPersistentState("snapshot marker does not match cut")
+			}
+			delete(remainingMarkers, currentMarkerRecord)
+			return nil
+		}
+		for markerRows.Next() {
+			var recordID string
+			var cursorBytes, body []byte
+			var bodyLength int64
+			if markerRows.Scan(&recordID, &cursorBytes, &bodyLength, &body) != nil || validateUUID(recordID) != nil ||
+				!boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
+				markerRows.Close()
+				return invalidPersistentState("invalid snapshot cut marker")
+			}
+			cursor, cursorErr := DecodeUint64(cursorBytes)
+			marker, markerErr := decodeStoredCollectionMarker(body)
+			if cursorErr != nil || cursor == 0 || cursor > snapshot.cutCursor || markerErr != nil || marker.RecordID != recordID {
+				markerRows.Close()
+				return invalidPersistentState("invalid snapshot cut marker")
+			}
+			if currentMarkerRecord != recordID {
+				if err := flushMarker(); err != nil {
+					markerRows.Close()
+					return err
+				}
+				currentMarkerRecord = recordID
+			}
+			latestMarkerBody = append(latestMarkerBody[:0], body...)
+		}
+		if markerRows.Err() != nil {
+			markerRows.Close()
+			return invalidPersistentState("read snapshot cut markers")
+		}
+		if err := flushMarker(); err != nil {
+			markerRows.Close()
+			return err
+		}
+		if markerRows.Close() != nil {
+			return invalidPersistentState("read snapshot cut markers")
+		}
+		if len(remainingMarkers) != 0 {
+			return invalidPersistentState("snapshot marker does not match cut")
+		}
 	}
 	var totalMetadata int64
 	for snapshotID, snapshot := range snapshots {

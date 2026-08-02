@@ -684,6 +684,80 @@ func TestOlderSnapshotAllowsLaterDeviceEnrollment(t *testing.T) {
 	}
 }
 
+func TestHistoricalSnapshotSourceCounterMustMatchCut(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	revision := boundedNextRevision(seed, "ec000000-0000-4000-8000-000000000001")
+	response, protocolErr := seed.opened.HandleAPI(context.Background(), boundedSyncCall(
+		seed, "ec000000-0000-4000-8000-000000000002", "0", []recordRevision{revision},
+	))
+	if protocolErr != nil || response.Status != http.StatusOK {
+		t.Fatalf("advance author counter: response=%+v error=%v", response, protocolErr)
+	}
+	rewriteSnapshotPageDescriptor(t, seed.opened, seed.snapshot.SnapshotID,
+		func(descriptor snapshotPageDescriptor) bool { return len(descriptor.SourceDevices) != 0 },
+		func(descriptor *snapshotPageDescriptor) {
+			for index := range descriptor.SourceDevices {
+				if descriptor.SourceDevices[index].DeviceID == seed.deviceID {
+					descriptor.SourceDevices[index].MaxAuthorCounter = "2"
+					return
+				}
+			}
+			t.Fatal("snapshot source device not found")
+		})
+	if err := validateSnapshotsAtCurrentState(t, seed.opened); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot source counter does not match cut") {
+		t.Fatalf("historical snapshot source counter error=%v", err)
+	}
+}
+
+func TestSnapshotMarkerMustMatchLatestAtCut(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{marker: true})
+	defer seed.opened.Close()
+	deviceID := "ed000000-0000-4000-8000-000000000002"
+	token := tokenWithByte(0xed)
+	enrollDevice(t, seed.opened, protocolFixtureTime.Add(3*time.Second),
+		"ed000000-0000-4000-8000-000000000001", deviceID,
+		"ed000000-0000-4000-8000-000000000003", token)
+	snapshot := createBoundedSnapshot(t, seed.opened, deviceID, token,
+		"ed000000-0000-4000-8000-000000000004", protocolFixtureTime.Add(4*time.Second))
+	rewriteSnapshotCutCursor(t, seed.opened, snapshot.SnapshotID, 3)
+	if err := validateSnapshotsAtCurrentState(t, seed.opened); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot marker does not match cut") {
+		t.Fatalf("post-cut snapshot marker error=%v", err)
+	}
+}
+
+func TestSnapshotReferenceMustBeUndominatedAtCut(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	revision := boundedNextRevision(seed, "ee000000-0000-4000-8000-000000000001")
+	response, protocolErr := seed.opened.HandleAPI(context.Background(), boundedSyncCall(
+		seed, "ee000000-0000-4000-8000-000000000002", "0", []recordRevision{revision},
+	))
+	var sync syncResponse
+	if protocolErr != nil || response.Status != http.StatusOK || json.Unmarshal(response.Body, &sync) != nil {
+		t.Fatalf("advance snapshot frontier: response=%+v error=%v", response, protocolErr)
+	}
+	cut, err := parseUint64(sync.ServerCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewriteSnapshotPageDescriptor(t, seed.opened, seed.snapshot.SnapshotID,
+		func(descriptor snapshotPageDescriptor) bool { return len(descriptor.SourceDevices) != 0 },
+		func(descriptor *snapshotPageDescriptor) {
+			for index := range descriptor.SourceDevices {
+				if descriptor.SourceDevices[index].DeviceID == seed.deviceID {
+					descriptor.SourceDevices[index].MaxAuthorCounter = "2"
+					return
+				}
+			}
+			t.Fatal("snapshot source device not found")
+		})
+	rewriteSnapshotCutCursor(t, seed.opened, seed.snapshot.SnapshotID, cut)
+	if err := validateSnapshotsAtCurrentState(t, seed.opened); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot reference was dominated at cut") {
+		t.Fatalf("dominated snapshot reference error=%v", err)
+	}
+}
+
 func createBoundedSnapshot(t *testing.T, opened *Store, deviceID string, token []byte, requestID string, now time.Time) snapshotCreateResponse {
 	t.Helper()
 	body, _ := marshalJSON(snapshotCreateRequest{
@@ -746,6 +820,38 @@ func rewriteSnapshotPageDescriptor(t *testing.T, opened *Store, snapshotID strin
 		t.Fatal(err)
 	}
 	if _, err := transaction.Exec("UPDATE snapshots SET metadata_bytes = metadata_bytes - ? + ? WHERE snapshot_id = ?", len(matchedBody), len(rewrittenBody), snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rewriteSnapshotCutCursor(t *testing.T, opened *Store, snapshotID string, cut uint64) {
+	t.Helper()
+	var retainedCreate []byte
+	if err := opened.db.QueryRow("SELECT create_response_json FROM snapshots WHERE snapshot_id = ?", snapshotID).Scan(&retainedCreate); err != nil {
+		t.Fatal(err)
+	}
+	var create snapshotCreateResponse
+	if err := json.Unmarshal(retainedCreate, &create); err != nil {
+		t.Fatal(err)
+	}
+	create.CutCursor = encodeUint64Text(cut)
+	rewrittenCreate, err := marshalJSON(create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedCut := EncodeUint64(cut)
+	transaction, err := opened.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	if _, err := transaction.Exec(`
+		UPDATE snapshots
+		SET cut_cursor = ?, create_response_json = ?, metadata_bytes = metadata_bytes - ? + ?
+		WHERE snapshot_id = ?`, encodedCut[:], rewrittenCreate, len(retainedCreate), len(rewrittenCreate), snapshotID); err != nil {
 		t.Fatal(err)
 	}
 	if err := transaction.Commit(); err != nil {
