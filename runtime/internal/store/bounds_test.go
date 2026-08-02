@@ -626,6 +626,147 @@ func TestSnapshotReferenceAcceptedAfterCutFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSnapshotMarkerBarrierBeyondCutFailsClosed(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{marker: true})
+	defer seed.opened.Close()
+	deviceID := "e9000000-0000-4000-8000-000000000002"
+	token := tokenWithByte(0xe9)
+	enrollDevice(t, seed.opened, protocolFixtureTime.Add(3*time.Second),
+		"e9000000-0000-4000-8000-000000000001", deviceID,
+		"e9000000-0000-4000-8000-000000000003", token)
+	snapshot := createBoundedSnapshot(t, seed.opened, deviceID, token,
+		"e9000000-0000-4000-8000-000000000004", protocolFixtureTime.Add(4*time.Second))
+	cut, _ := parseUint64(snapshot.CutCursor)
+	rewriteSnapshotPageDescriptor(t, seed.opened, snapshot.SnapshotID,
+		func(descriptor snapshotPageDescriptor) bool { return len(descriptor.CollectionMarkers) != 0 },
+		func(descriptor *snapshotPageDescriptor) {
+			descriptor.CollectionMarkers[0].BarrierCursor = encodeUint64Text(cut + 1)
+		})
+	if err := validateSnapshotsAtCurrentState(t, seed.opened); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot marker barrier exceeds cut") {
+		t.Fatalf("post-cut snapshot marker error=%v", err)
+	}
+}
+
+func TestCurrentCutSnapshotRequiresCompleteSourceRegistry(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	deviceID := "ea000000-0000-4000-8000-000000000002"
+	token := tokenWithByte(0xea)
+	enrollDevice(t, seed.opened, protocolFixtureTime.Add(3*time.Second),
+		"ea000000-0000-4000-8000-000000000001", deviceID,
+		"ea000000-0000-4000-8000-000000000003", token)
+	snapshot := createBoundedSnapshot(t, seed.opened, deviceID, token,
+		"ea000000-0000-4000-8000-000000000004", protocolFixtureTime.Add(4*time.Second))
+	rewriteSnapshotPageDescriptor(t, seed.opened, snapshot.SnapshotID,
+		func(descriptor snapshotPageDescriptor) bool { return len(descriptor.SourceDevices) != 0 },
+		func(descriptor *snapshotPageDescriptor) {
+			retained := descriptor.SourceDevices[:0]
+			for _, source := range descriptor.SourceDevices {
+				if source.DeviceID != deviceID {
+					retained = append(retained, source)
+				}
+			}
+			descriptor.SourceDevices = retained
+		})
+	if err := validateSnapshotsAtCurrentState(t, seed.opened); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot source registry does not match current cut") {
+		t.Fatalf("incomplete current-cut source registry error=%v", err)
+	}
+}
+
+func TestOlderSnapshotAllowsLaterDeviceEnrollment(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	enrollDevice(t, seed.opened, protocolFixtureTime.Add(3*time.Second),
+		"eb000000-0000-4000-8000-000000000001", "eb000000-0000-4000-8000-000000000002",
+		"eb000000-0000-4000-8000-000000000003", tokenWithByte(0xeb))
+	if err := validateSnapshotsAtCurrentState(t, seed.opened); err != nil {
+		t.Fatalf("older snapshot rejected after later enrollment: %v", err)
+	}
+}
+
+func createBoundedSnapshot(t *testing.T, opened *Store, deviceID string, token []byte, requestID string, now time.Time) snapshotCreateResponse {
+	t.Helper()
+	body, _ := marshalJSON(snapshotCreateRequest{
+		ProtocolVersion: "1", DeviceID: deviceID, RequestID: requestID,
+		RequiredCapabilities: append([]string(nil), requiredSnapshotCapabilities...),
+	})
+	response, protocolErr := opened.HandleAPI(context.Background(), api.Request{
+		Method: "POST", Path: "/v1/snapshot-reads", RequestID: requestID,
+		Authorization: authorization(token), Body: body, Now: now,
+	})
+	var snapshot snapshotCreateResponse
+	if protocolErr != nil || response.Status != http.StatusCreated || json.Unmarshal(response.Body, &snapshot) != nil {
+		t.Fatalf("create bounded snapshot: response=%+v error=%v", response, protocolErr)
+	}
+	return snapshot
+}
+
+func rewriteSnapshotPageDescriptor(t *testing.T, opened *Store, snapshotID string, matches func(snapshotPageDescriptor) bool, rewrite func(*snapshotPageDescriptor)) {
+	t.Helper()
+	rows, err := opened.db.Query("SELECT page_index, response_json FROM snapshot_pages WHERE snapshot_id = ? ORDER BY page_index", snapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matchedIndex := int64(-1)
+	var matchedBody []byte
+	var descriptor snapshotPageDescriptor
+	for rows.Next() {
+		var index int64
+		var body []byte
+		var candidate snapshotPageDescriptor
+		if rows.Scan(&index, &body) != nil || decodeStoredSnapshotPageDescriptor(body, &candidate) != nil {
+			rows.Close()
+			t.Fatal("read stored snapshot page descriptor")
+		}
+		if matches(candidate) {
+			if matchedIndex >= 0 {
+				rows.Close()
+				t.Fatal("multiple snapshot pages matched rewrite")
+			}
+			matchedIndex, matchedBody, descriptor = index, body, candidate
+		}
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		t.Fatal("read stored snapshot page descriptors")
+	}
+	if matchedIndex < 0 {
+		t.Fatal("snapshot page rewrite target not found")
+	}
+	rewrite(&descriptor)
+	rewrittenBody, err := marshalJSON(descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, err := opened.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Rollback()
+	if _, err := transaction.Exec("UPDATE snapshot_pages SET response_json = ? WHERE snapshot_id = ? AND page_index = ?", rewrittenBody, snapshotID, matchedIndex); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transaction.Exec("UPDATE snapshots SET metadata_bytes = metadata_bytes - ? + ? WHERE snapshot_id = ?", len(matchedBody), len(rewrittenBody), snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func validateSnapshotsAtCurrentState(t *testing.T, opened *Store) error {
+	t.Helper()
+	ctx := context.Background()
+	serverCursor, _, _, err := validatePersistentRuntime(ctx, opened.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devices, err := validatePersistentDevices(ctx, opened.db, serverCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return validatePersistentSnapshots(ctx, opened.db, testIdentity, devices, serverCursor)
+}
+
 func boundedSyncCall(seed boundedPersistenceSeed, requestID, afterCursor string, mutations []recordRevision) api.Request {
 	if mutations == nil {
 		mutations = []recordRevision{}

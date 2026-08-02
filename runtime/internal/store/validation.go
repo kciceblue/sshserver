@@ -1321,6 +1321,20 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 				snapshot.sourceCounters[source.DeviceID] = counter
 			}
 		}
+		// Only a current-cut snapshot can be compared exactly with the live
+		// registry. An older valid cut may predate later enrollments and author
+		// counter advances, which are not copied back into immutable pages.
+		if snapshot.cutCursor == serverCursor {
+			if len(snapshot.sourceCounters) != len(devices) {
+				return invalidPersistentState("snapshot source registry does not match current cut")
+			}
+			for deviceID, device := range devices {
+				counter, exists := snapshot.sourceCounters[deviceID]
+				if !exists || counter != device.maxCounter {
+					return invalidPersistentState("snapshot source registry does not match current cut")
+				}
+			}
+		}
 		phase := -1
 		var previousMarkerID, previousSourceID string
 		for _, page := range snapshot.pages {
@@ -1344,7 +1358,10 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 				if previousMarkerID != "" && previousMarkerID >= marker.RecordID {
 					return invalidPersistentState("snapshot markers are not globally ordered")
 				}
-				frontier, _, _, _ := validateCollectionMarker(marker)
+				frontier, barrier, _, _ := validateCollectionMarker(marker)
+				if barrier > snapshot.cutCursor {
+					return invalidPersistentState("snapshot marker barrier exceeds cut")
+				}
 				for deviceID, counter := range frontier {
 					maximum, exists := snapshot.sourceCounters[deviceID]
 					if !exists || counter > maximum {
