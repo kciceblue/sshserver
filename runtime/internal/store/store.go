@@ -309,6 +309,10 @@ func (store *Store) initialize(ctx context.Context) error {
 		if err := migrateLegacySchemaV1(ctx, transaction); err != nil {
 			return err
 		}
+	} else if kind == schemaPriorFull {
+		if err := migratePriorFullSchemaV1(ctx, transaction); err != nil {
+			return err
+		}
 	}
 
 	if createdSchema {

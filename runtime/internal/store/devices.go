@@ -402,6 +402,59 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 	return &receipt, targetHasReceipt, nil
 }
 
+const tokenRotationKeyProbeSQL = `
+	SELECT octet_length(rotation_id),
+	       CASE WHEN typeof(rotation_id) = 'text'
+	                  AND octet_length(rotation_id) = ? THEN rotation_id END
+	FROM token_rotations
+	WHERE rotation_id >= ? AND rotation_id < ?
+	UNION ALL
+	SELECT octet_length(rotation_id),
+	       CASE WHEN typeof(rotation_id) = 'text'
+	                  AND octet_length(rotation_id) = ? THEN rotation_id END
+	FROM token_rotations
+	WHERE rotation_id >= ? AND rotation_id < ?
+	LIMIT 2`
+
+// preflightTokenRotationKey makes exact rotation-key absence authoritative
+// without scanning unrelated rotation history. Separate primary-key ranges
+// cover TEXT and BLOB forms of the canonical UUID and every byte-suffixed
+// variant because SQLite orders values within each storage class.
+func preflightTokenRotationKey(ctx context.Context, transaction *sql.Tx, rotationID string) (bool, *api.Error) {
+	if validateUUID(rotationID) != nil {
+		return false, api.NewError("internal_error", true)
+	}
+	lowerBytes := []byte(rotationID)
+	upperBytes := append([]byte(nil), lowerBytes...)
+	upperBytes[len(upperBytes)-1]++
+	rows, err := transaction.QueryContext(ctx, tokenRotationKeyProbeSQL,
+		maxUUIDBytes, rotationID, string(upperBytes),
+		maxUUIDBytes, lowerBytes, upperBytes,
+	)
+	if err != nil {
+		return false, api.NewError("internal_error", true)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+		var storedRotationID sql.NullString
+		var rotationIDLength int64
+		if rows.Scan(&rotationIDLength, &storedRotationID) != nil || rotationIDLength != maxUUIDBytes ||
+			!boundedRequiredText(rotationIDLength, storedRotationID, maxUUIDBytes) ||
+			validateUUID(storedRotationID.String) != nil || storedRotationID.String != rotationID {
+			rows.Close()
+			return false, api.NewError("internal_error", true)
+		}
+	}
+	iterationErr := rows.Err()
+	closeErr := rows.Close()
+	if iterationErr != nil || closeErr != nil || count > 1 {
+		return false, api.NewError("internal_error", true)
+	}
+	return count == 1, nil
+}
+
 func (store *Store) handleTokenRotation(ctx context.Context, call api.Request) (api.Response, *api.Error) {
 	var request tokenRotationRequest
 	if err := decodeStrict(call.Body, &request); err != nil || validateUUID(request.RotationID) != nil || validateUUID(request.DeviceID) != nil {
@@ -442,18 +495,26 @@ func (store *Store) handleTokenRotation(ctx context.Context, call api.Request) (
 	} else if authErr.Code == "token_revoked" {
 		return api.Response{}, authErr
 	}
-	var storedDeviceID sql.NullString
-	var oldHashBytes, newHashBytes, storedFingerprint, responseBody []byte
-	var storedDeviceIDLength, responseLength int64
-	err = transaction.QueryRowContext(ctx, `
-		SELECT octet_length(device_id),
-		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
-		       old_token_hash, new_token_hash, request_fingerprint,
-		       length(response_json),
-		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
-		FROM token_rotations WHERE rotation_id = ?`, maxUUIDBytes, maxBodyBytes, request.RotationID,
-	).Scan(&storedDeviceIDLength, &storedDeviceID, &oldHashBytes, &newHashBytes, &storedFingerprint, &responseLength, &responseBody)
-	if err == nil {
+	rotationPresent, protocolErr := preflightTokenRotationKey(ctx, transaction, request.RotationID)
+	if protocolErr != nil {
+		return api.Response{}, protocolErr
+	}
+	var responseBody []byte
+	if rotationPresent {
+		var storedDeviceID sql.NullString
+		var oldHashBytes, newHashBytes, storedFingerprint []byte
+		var storedDeviceIDLength, responseLength int64
+		err = transaction.QueryRowContext(ctx, `
+			SELECT octet_length(device_id),
+			       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
+			       old_token_hash, new_token_hash, request_fingerprint,
+			       length(response_json),
+			       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
+			FROM token_rotations WHERE rotation_id = ?`, maxUUIDBytes, maxBodyBytes, request.RotationID,
+		).Scan(&storedDeviceIDLength, &storedDeviceID, &oldHashBytes, &newHashBytes, &storedFingerprint, &responseLength, &responseBody)
+		if err != nil {
+			return api.Response{}, api.NewError("internal_error", true)
+		}
 		var storedResponse device
 		if storedDeviceIDLength != maxUUIDBytes || !boundedRequiredText(storedDeviceIDLength, storedDeviceID, maxUUIDBytes) || validateUUID(storedDeviceID.String) != nil ||
 			len(oldHashBytes) != 32 || len(newHashBytes) != 32 || len(storedFingerprint) != 32 ||
@@ -489,9 +550,6 @@ func (store *Store) handleTokenRotation(ctx context.Context, call api.Request) (
 			return api.Response{}, api.NewError("request_id_reused", false)
 		}
 		return api.Response{Status: http.StatusOK, Body: responseBody}, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return api.Response{}, api.NewError("internal_error", true)
 	}
 	if authErr != nil {
 		return api.Response{}, authErr

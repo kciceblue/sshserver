@@ -38,6 +38,69 @@ type snapshotRevisionReference struct {
 
 const snapshotMetadataLimit int64 = 64 * 1024 * 1024
 
+const snapshotOwnerKeyProbeSQL = `
+	SELECT octet_length(owner_device_id),
+	       CASE WHEN typeof(owner_device_id) = 'text'
+	                  AND octet_length(owner_device_id) = ? THEN owner_device_id END,
+	       octet_length(request_id),
+	       CASE WHEN typeof(request_id) = 'text'
+	                  AND octet_length(request_id) = ? THEN request_id END
+	FROM snapshots
+	WHERE owner_device_id >= ? AND owner_device_id < ?
+	UNION ALL
+	SELECT octet_length(owner_device_id),
+	       CASE WHEN typeof(owner_device_id) = 'text'
+	                  AND octet_length(owner_device_id) = ? THEN owner_device_id END,
+	       octet_length(request_id),
+	       CASE WHEN typeof(request_id) = 'text'
+	                  AND octet_length(request_id) = ? THEN request_id END
+	FROM snapshots
+	WHERE owner_device_id >= ? AND owner_device_id < ?
+	LIMIT 2`
+
+// preflightSnapshotOwnerKeys makes an exact owner/request miss and the
+// per-owner active-count comparison authoritative without scanning unrelated
+// snapshots. The two covering-index ranges include the canonical TEXT owner,
+// its BLOB equivalent, and every TEXT or BLOB byte-suffixed alias. There can
+// be at most one active snapshot for an owner, so a second candidate is itself
+// corrupt.
+func preflightSnapshotOwnerKeys(ctx context.Context, transaction *sql.Tx, ownerDeviceID, requestID string) *api.Error {
+	if validateUUID(ownerDeviceID) != nil || validateUUID(requestID) != nil {
+		return api.NewError("internal_error", true)
+	}
+	lowerBytes := []byte(ownerDeviceID)
+	upperBytes := append([]byte(nil), lowerBytes...)
+	upperBytes[len(upperBytes)-1]++
+	rows, err := transaction.QueryContext(ctx, snapshotOwnerKeyProbeSQL,
+		maxUUIDBytes, maxUUIDBytes, ownerDeviceID, string(upperBytes),
+		maxUUIDBytes, maxUUIDBytes, lowerBytes, upperBytes,
+	)
+	if err != nil {
+		return api.NewError("internal_error", true)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+		var storedOwner, storedRequestID sql.NullString
+		var storedOwnerLength, storedRequestIDLength int64
+		if rows.Scan(&storedOwnerLength, &storedOwner, &storedRequestIDLength, &storedRequestID) != nil ||
+			storedOwnerLength != maxUUIDBytes || !boundedRequiredText(storedOwnerLength, storedOwner, maxUUIDBytes) ||
+			validateUUID(storedOwner.String) != nil || storedOwner.String != ownerDeviceID ||
+			storedRequestIDLength != maxUUIDBytes || !boundedRequiredText(storedRequestIDLength, storedRequestID, maxUUIDBytes) ||
+			validateUUID(storedRequestID.String) != nil || storedRequestID.String == requestID {
+			rows.Close()
+			return api.NewError("internal_error", true)
+		}
+	}
+	iterationErr := rows.Err()
+	closeErr := rows.Close()
+	if iterationErr != nil || closeErr != nil || count > 1 {
+		return api.NewError("internal_error", true)
+	}
+	return nil
+}
+
 func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) (api.Response, *api.Error) {
 	var request snapshotCreateRequest
 	if err := decodeStrict(call.Body, &request); err != nil || request.ProtocolVersion != "1" ||
@@ -97,6 +160,9 @@ func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) 
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return api.Response{}, api.NewError("internal_error", true)
+	}
+	if protocolErr := preflightSnapshotOwnerKeys(ctx, transaction, authenticated.DeviceID, call.RequestID); protocolErr != nil {
+		return api.Response{}, protocolErr
 	}
 	if protocolErr := store.admitSnapshotAttempt(authenticated.DeviceID, call.Now); protocolErr != nil {
 		return api.Response{}, protocolErr

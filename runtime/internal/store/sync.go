@@ -340,6 +340,93 @@ func validateMutationShapes(deviceID string, revisions []recordRevision) *api.Er
 	return nil
 }
 
+const revisionKeyAliasProbeSQL = `
+	SELECT 1 FROM record_revisions
+	WHERE revision_id >= ? AND revision_id < ?
+	UNION ALL
+	SELECT 1 FROM record_revisions
+	WHERE revision_id >= ? AND revision_id < ?
+	LIMIT 1`
+
+// preflightRevisionKeyAbsence makes an exact revision-ID miss authoritative.
+// SQLite orders storage classes before values, so separate primary-key ranges
+// cover malformed TEXT and BLOB aliases of the canonical UUID without reading
+// unrelated permanent revision history.
+func preflightRevisionKeyAbsence(ctx context.Context, transaction *sql.Tx, revisionID string) *api.Error {
+	if validateUUID(revisionID) != nil {
+		return api.NewError("internal_error", true)
+	}
+	lowerBytes := []byte(revisionID)
+	upperBytes := append([]byte(nil), lowerBytes...)
+	upperBytes[len(upperBytes)-1]++
+	var present int
+	err := transaction.QueryRowContext(ctx, revisionKeyAliasProbeSQL,
+		revisionID, string(upperBytes), lowerBytes, upperBytes,
+	).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return api.NewError("internal_error", true)
+}
+
+const recordKeyAliasProbeSQL = `
+	SELECT 1 FROM record_revisions
+	WHERE record_id > ? AND record_id < ?
+	UNION ALL
+	SELECT 1 FROM record_revisions
+	WHERE record_id >= ? AND record_id < ?
+	UNION ALL
+	SELECT 1 FROM record_vector_index
+	WHERE record_id > ? AND record_id < ?
+	UNION ALL
+	SELECT 1 FROM record_vector_index
+	WHERE record_id >= ? AND record_id < ?
+	UNION ALL
+	SELECT 1 FROM record_heads
+	WHERE record_id > ? AND record_id < ?
+	UNION ALL
+	SELECT 1 FROM record_heads
+	WHERE record_id >= ? AND record_id < ?
+	UNION ALL
+	SELECT 1 FROM collection_candidates
+	WHERE record_id > ? AND record_id < ?
+	UNION ALL
+	SELECT 1 FROM collection_candidates
+	WHERE record_id >= ? AND record_id < ?
+	UNION ALL
+	SELECT 1 FROM collection_records
+	WHERE record_id > ? AND record_id < ?
+	UNION ALL
+	SELECT 1 FROM collection_records
+	WHERE record_id >= ? AND record_id < ?
+	LIMIT 1`
+
+// preflightRecordKeyAliases protects the permanent record identity index and
+// its bounded live/collection projections while allowing any number of
+// canonical history rows for an existing record. Each TEXT range excludes the
+// exact canonical key; each BLOB range includes the wrong-storage-class
+// equivalent and all byte-suffixed aliases.
+func preflightRecordKeyAliases(ctx context.Context, transaction *sql.Tx, recordID string) *api.Error {
+	if validateUUID(recordID) != nil {
+		return api.NewError("internal_error", true)
+	}
+	lowerBytes := []byte(recordID)
+	upperBytes := append([]byte(nil), lowerBytes...)
+	upperBytes[len(upperBytes)-1]++
+	var present int
+	err := transaction.QueryRowContext(ctx, recordKeyAliasProbeSQL,
+		recordID, string(upperBytes), lowerBytes, upperBytes,
+		recordID, string(upperBytes), lowerBytes, upperBytes,
+		recordID, string(upperBytes), lowerBytes, upperBytes,
+		recordID, string(upperBytes), lowerBytes, upperBytes,
+		recordID, string(upperBytes), lowerBytes, upperBytes,
+	).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return api.NewError("internal_error", true)
+}
+
 func (store *Store) validateMutations(ctx context.Context, transaction *sql.Tx, deviceID string, initialCounter uint64, revisions []recordRevision) ([]pendingRevision, int, uint64, *api.Error) {
 	pending := make([]pendingRevision, 0, len(revisions))
 	pendingByRecord := make(map[string][]pendingRevision)
@@ -383,6 +470,12 @@ func (store *Store) validateMutations(ctx context.Context, transaction *sql.Tx, 
 				return nil, 0, 0, api.NewError("revision_equivocation", false)
 			}
 			continue
+		}
+		if protocolErr := preflightRevisionKeyAbsence(ctx, transaction, revision.RevisionID); protocolErr != nil {
+			return nil, 0, 0, protocolErr
+		}
+		if protocolErr := preflightRecordKeyAliases(ctx, transaction, revision.RecordID); protocolErr != nil {
+			return nil, 0, 0, protocolErr
 		}
 		if protocolErr := validateEqualVectorEquivocation(ctx, transaction, revision.RecordID, revision.RevisionID, vectorHash, vector, pendingByRecord[revision.RecordID]); protocolErr != nil {
 			return nil, 0, 0, protocolErr

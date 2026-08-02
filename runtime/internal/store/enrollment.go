@@ -76,16 +76,15 @@ func (store *Store) handleEnrollment(ctx context.Context, call api.Request) (api
 		return api.Response{Status: http.StatusOK, Body: response}, nil
 	}
 
-	var enrollmentForDeviceWitness int
-	err = transaction.QueryRowContext(ctx, "SELECT 1 FROM enrollments WHERE device_id = ?", request.DeviceID).Scan(&enrollmentForDeviceWitness)
-	if err == nil {
+	deviceCollision, protocolErr := preflightEnrollmentDeviceCollision(ctx, transaction, request.DeviceID)
+	if protocolErr != nil {
+		return api.Response{}, protocolErr
+	}
+	if deviceCollision {
 		return api.Response{}, api.NewError("enrollment_replay_mismatch", false)
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return api.Response{}, api.NewError("internal_error", true)
-	}
 	var conflictWitness int
-	err = transaction.QueryRowContext(ctx, "SELECT 1 FROM devices WHERE device_id = ? OR token_hash = ? LIMIT 1", request.DeviceID, tokenHash[:]).Scan(&conflictWitness)
+	err = transaction.QueryRowContext(ctx, "SELECT 1 FROM devices WHERE token_hash = ?", tokenHash[:]).Scan(&conflictWitness)
 	if err == nil {
 		return api.Response{}, api.NewError("enrollment_replay_mismatch", false)
 	}
@@ -190,6 +189,78 @@ func (store *Store) admitEnrollmentAttempt(now time.Time) *api.Error {
 	}
 	store.ephemeral.enrollmentAttempts = append(store.ephemeral.enrollmentAttempts, now)
 	return nil
+}
+
+const enrollmentDeviceCollisionProbeSQL = `
+	SELECT 1, octet_length(device_id),
+	       CASE WHEN typeof(device_id) = 'text'
+	                  AND octet_length(device_id) = ? THEN device_id END
+	FROM enrollments
+	WHERE device_id >= ? AND device_id < ?
+	UNION ALL
+	SELECT 1, octet_length(device_id),
+	       CASE WHEN typeof(device_id) = 'text'
+	                  AND octet_length(device_id) = ? THEN device_id END
+	FROM enrollments
+	WHERE device_id >= ? AND device_id < ?
+	UNION ALL
+	SELECT 2, octet_length(device_id),
+	       CASE WHEN typeof(device_id) = 'text'
+	                  AND octet_length(device_id) = ? THEN device_id END
+	FROM devices
+	WHERE device_id >= ? AND device_id < ?
+	UNION ALL
+	SELECT 2, octet_length(device_id),
+	       CASE WHEN typeof(device_id) = 'text'
+	                  AND octet_length(device_id) = ? THEN device_id END
+	FROM devices
+	WHERE device_id >= ? AND device_id < ?
+	LIMIT 4`
+
+// preflightEnrollmentDeviceCollision makes the device-key absence checks for
+// both the permanent registry and the one-enrollment-per-device witness
+// authoritative. Each pair of indexed ranges covers canonical TEXT and BLOB
+// prefixes without scanning unrelated devices or enrollment history.
+func preflightEnrollmentDeviceCollision(ctx context.Context, transaction *sql.Tx, deviceID string) (bool, *api.Error) {
+	if validateUUID(deviceID) != nil {
+		return false, api.NewError("internal_error", true)
+	}
+	lowerBytes := []byte(deviceID)
+	upperBytes := append([]byte(nil), lowerBytes...)
+	upperBytes[len(upperBytes)-1]++
+	rows, err := transaction.QueryContext(ctx, enrollmentDeviceCollisionProbeSQL,
+		maxUUIDBytes, deviceID, string(upperBytes),
+		maxUUIDBytes, lowerBytes, upperBytes,
+		maxUUIDBytes, deviceID, string(upperBytes),
+		maxUUIDBytes, lowerBytes, upperBytes,
+	)
+	if err != nil {
+		return false, api.NewError("internal_error", true)
+	}
+	defer rows.Close()
+	var seen [3]int
+	for rows.Next() {
+		var source int
+		var storedDeviceID sql.NullString
+		var deviceIDLength int64
+		if rows.Scan(&source, &deviceIDLength, &storedDeviceID) != nil || source < 1 || source > 2 ||
+			deviceIDLength != maxUUIDBytes || !boundedRequiredText(deviceIDLength, storedDeviceID, maxUUIDBytes) ||
+			validateUUID(storedDeviceID.String) != nil || storedDeviceID.String != deviceID {
+			rows.Close()
+			return false, api.NewError("internal_error", true)
+		}
+		seen[source]++
+		if seen[source] > 1 {
+			rows.Close()
+			return false, api.NewError("internal_error", true)
+		}
+	}
+	iterationErr := rows.Err()
+	closeErr := rows.Close()
+	if iterationErr != nil || closeErr != nil {
+		return false, api.NewError("internal_error", true)
+	}
+	return seen[1] == 1 || seen[2] == 1, nil
 }
 
 func (store *Store) lookupGrant(ctx context.Context, transaction *sql.Tx, presented [32]byte, now time.Time) (*string, *api.Error) {

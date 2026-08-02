@@ -104,6 +104,31 @@ const createRecordRevisionsV1 = `CREATE TABLE record_revisions (
 			retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
 			undominated INTEGER NOT NULL CHECK (undominated IN (0, 1)),
 			UNIQUE (author_device_id, author_counter),
+			UNIQUE (record_id, revision_id),
+			CHECK (retained = 1 OR undominated = 0),
+			CHECK ((retained = 0) = (collected_generation IS NOT NULL))
+		) STRICT`
+
+// createRecordRevisionsPriorFullV1 is the exact record_revisions fingerprint
+// created by earlier commits of the still-unreleased full V1 data plane. Keep
+// it byte-for-byte stable so those databases can be identified narrowly and
+// migrated without accepting arbitrary schema variants.
+const createRecordRevisionsPriorFullV1 = `CREATE TABLE record_revisions (
+			revision_id TEXT PRIMARY KEY CHECK (length(revision_id) = 36),
+			record_id TEXT NOT NULL CHECK (length(record_id) = 36),
+			author_device_id TEXT NOT NULL CHECK (length(author_device_id) = 36),
+			author_counter BLOB NOT NULL CHECK (length(author_counter) = 8),
+			vector_json BLOB NOT NULL,
+			collection_witness_authenticator BLOB,
+			tombstone INTEGER NOT NULL CHECK (tombstone IN (0, 1)),
+			content_hash BLOB NOT NULL CHECK (length(content_hash) = 32),
+			received_at_ms INTEGER NOT NULL,
+			accepted_uptime_ms BLOB NOT NULL CHECK (length(accepted_uptime_ms) = 8),
+			change_cursor BLOB NOT NULL UNIQUE CHECK (length(change_cursor) = 8),
+			collected_generation BLOB CHECK (collected_generation IS NULL OR length(collected_generation) = 8),
+			retained INTEGER NOT NULL CHECK (retained IN (0, 1)),
+			undominated INTEGER NOT NULL CHECK (undominated IN (0, 1)),
+			UNIQUE (author_device_id, author_counter),
 			CHECK (retained = 1 OR undominated = 0),
 			CHECK ((retained = 0) = (collected_generation IS NOT NULL))
 		) STRICT`
@@ -271,6 +296,15 @@ var fullSchemaTables = map[string]string{
 	"vault_envelope":              createVaultEnvelopeV1,
 }
 
+var priorFullSchemaTables = func() map[string]string {
+	tables := make(map[string]string, len(fullSchemaTables))
+	for name, statement := range fullSchemaTables {
+		tables[name] = statement
+	}
+	tables["record_revisions"] = createRecordRevisionsPriorFullV1
+	return tables
+}()
+
 var legacySchemaTables = map[string]string{
 	"devices":           createDevicesV1,
 	"instance_metadata": createInstanceMetadataV1,
@@ -281,6 +315,7 @@ type schemaKind int
 const (
 	schemaEmpty schemaKind = iota
 	schemaLegacy
+	schemaPriorFull
 	schemaFull
 )
 
@@ -312,6 +347,9 @@ func inspectSchemaState(ctx context.Context, database schemaQueryer) (schemaKind
 	}
 	if schemaTablesEqual(tables, fullSchemaTables) {
 		return schemaFull, userVersion, nil
+	}
+	if schemaTablesEqual(tables, priorFullSchemaTables) {
+		return schemaPriorFull, userVersion, nil
 	}
 	if schemaTablesEqual(tables, legacySchemaTables) {
 		return schemaLegacy, userVersion, nil
@@ -446,6 +484,34 @@ func migrateLegacySchemaV1(ctx context.Context, transaction *sql.Tx) error {
 		       CASE WHEN revoked_at_ms IS NULL THEN 0 ELSE 1 END
 		FROM devices`); err != nil {
 		return fmt.Errorf("migrate storage schema: record baseline device origins: %w", err)
+	}
+	return nil
+}
+
+func migratePriorFullSchemaV1(ctx context.Context, transaction *sql.Tx) error {
+	if _, err := transaction.ExecContext(ctx,
+		"ALTER TABLE record_revisions RENAME TO record_revisions_prior_full_v1"); err != nil {
+		return fmt.Errorf("migrate prior full V1 schema: preserve record revisions: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, createRecordRevisionsV1); err != nil {
+		return fmt.Errorf("migrate prior full V1 schema: create record revisions: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO record_revisions (
+			revision_id, record_id, author_device_id, author_counter,
+			vector_json, collection_witness_authenticator, tombstone,
+			content_hash, received_at_ms, accepted_uptime_ms,
+			change_cursor, collected_generation, retained, undominated
+		)
+		SELECT revision_id, record_id, author_device_id, author_counter,
+		       vector_json, collection_witness_authenticator, tombstone,
+		       content_hash, received_at_ms, accepted_uptime_ms,
+		       change_cursor, collected_generation, retained, undominated
+		FROM record_revisions_prior_full_v1`); err != nil {
+		return fmt.Errorf("migrate prior full V1 schema: copy record revisions: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, "DROP TABLE record_revisions_prior_full_v1"); err != nil {
+		return fmt.Errorf("migrate prior full V1 schema: remove prior table: %w", err)
 	}
 	return nil
 }
