@@ -794,6 +794,33 @@ func TestReadinessUsesOneSnapshotAcrossConcurrentEnvelopeCommit(t *testing.T) {
 			transaction.Rollback()
 			t.Fatal(err)
 		}
+		changeCursor := EncodeUint64(4)
+		switch generation {
+		case 1:
+			if _, err := transaction.Exec("DELETE FROM changes WHERE cursor = ? AND kind = 'envelope_changed'", changeCursor[:]); err != nil {
+				transaction.Rollback()
+				t.Fatal(err)
+			}
+			serverCursor := EncodeUint64(3)
+			if _, err := transaction.Exec("UPDATE runtime_state SET server_cursor = ? WHERE singleton = 1", serverCursor[:]); err != nil {
+				transaction.Rollback()
+				t.Fatal(err)
+			}
+		case 2:
+			if _, err := transaction.Exec(`
+				INSERT INTO changes (cursor, kind, received_at_ms)
+				VALUES (?, 'envelope_changed', ?)`, changeCursor[:], protocolFixtureTime.Add(time.Second).UnixMilli()); err != nil {
+				transaction.Rollback()
+				t.Fatal(err)
+			}
+			if _, err := transaction.Exec("UPDATE runtime_state SET server_cursor = ? WHERE singleton = 1", changeCursor[:]); err != nil {
+				transaction.Rollback()
+				t.Fatal(err)
+			}
+		default:
+			transaction.Rollback()
+			t.Fatalf("unsupported test envelope generation %d", generation)
+		}
 		if err := transaction.Commit(); err != nil {
 			t.Fatal(err)
 		}
@@ -830,6 +857,91 @@ func TestReadinessUsesOneSnapshotAcrossConcurrentEnvelopeCommit(t *testing.T) {
 	}
 	if err := seed.opened.Ready(ctx); err != nil {
 		t.Fatalf("readiness rejected the valid post-commit state: %v", err)
+	}
+}
+
+func TestPresentEnvelopeGenerationZeroFailsClosed(t *testing.T) {
+	opened, path := openDataPlane(t)
+	var fixture struct {
+		BaseMode putEnvelopeRequest `json:"base_mode"`
+	}
+	loadFixture(t, "vault-envelope.json", &fixture)
+	fixture.BaseMode.Envelope.EnvelopeGeneration = "0"
+	body, err := marshalJSON(fixture.BaseMode.Envelope)
+	if err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	zero := EncodeUint64(0)
+	if _, err := opened.db.Exec(`
+		INSERT INTO vault_envelope (singleton, generation, envelope_json)
+		VALUES (1, ?, ?)`, zero[:], body); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), path, testIdentity)
+	if reopened != nil {
+		reopened.Close()
+	}
+	if !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "inconsistent envelope row") {
+		t.Fatalf("generation-zero envelope startup error=%v", err)
+	}
+}
+
+func TestEnvelopePutRejectsPresentGenerationZeroWithoutMutation(t *testing.T) {
+	opened, _ := openDataPlane(t)
+	defer opened.Close()
+	deviceID := "e8400000-0000-4000-8000-000000000001"
+	token := tokenWithByte(0xe4)
+	enrollDevice(t, opened, protocolFixtureTime,
+		"e8400000-0000-4000-8000-000000000002", deviceID,
+		"e8400000-0000-4000-8000-000000000003", token)
+	var fixture struct {
+		BaseMode putEnvelopeRequest `json:"base_mode"`
+	}
+	loadFixture(t, "vault-envelope.json", &fixture)
+	forbidden := fixture.BaseMode.Envelope
+	forbidden.EnvelopeGeneration = "0"
+	forbiddenBody, err := marshalJSON(forbidden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := EncodeUint64(0)
+	if _, err := opened.db.Exec(`
+		INSERT INTO vault_envelope (singleton, generation, envelope_json)
+		VALUES (1, ?, ?)`, zero[:], forbiddenBody); err != nil {
+		t.Fatal(err)
+	}
+	requestBody, err := marshalJSON(fixture.BaseMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectInternalError(t, opened, api.Request{
+		Method: "PUT", Path: "/v1/vault-envelope", RequestID: "e8400000-0000-4000-8000-000000000004",
+		Authorization: authorization(token), Body: requestBody, Now: protocolFixtureTime.Add(time.Second),
+	})
+	var runtimeGenerationBytes, serverCursorBytes, rowGenerationBytes, retainedBody []byte
+	var envelopeChanges, receipts int
+	if err := opened.db.QueryRow(`
+		SELECT r.envelope_generation, r.server_cursor, v.generation, v.envelope_json,
+		       (SELECT count(*) FROM changes WHERE kind = 'envelope_changed'),
+		       (SELECT count(*) FROM operation_receipts WHERE operation = 'vault-envelope')
+		FROM runtime_state r JOIN vault_envelope v ON v.singleton = r.singleton
+		WHERE r.singleton = 1`).Scan(
+		&runtimeGenerationBytes, &serverCursorBytes, &rowGenerationBytes, &retainedBody,
+		&envelopeChanges, &receipts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	runtimeGeneration, runtimeErr := DecodeUint64(runtimeGenerationBytes)
+	serverCursor, cursorErr := DecodeUint64(serverCursorBytes)
+	rowGeneration, rowErr := DecodeUint64(rowGenerationBytes)
+	if runtimeErr != nil || cursorErr != nil || rowErr != nil || runtimeGeneration != 0 || rowGeneration != 0 || serverCursor != 1 ||
+		envelopeChanges != 0 || receipts != 0 || !slices.Equal(retainedBody, forbiddenBody) {
+		t.Fatalf("generation-zero PUT mutated state: runtime=%d row=%d cursor=%d changes=%d receipts=%d", runtimeGeneration, rowGeneration, serverCursor, envelopeChanges, receipts)
 	}
 }
 
@@ -898,7 +1010,7 @@ func TestSnapshotReferenceAcceptedAfterCutFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	serverCursor, _, _, collectionGeneration, err := validatePersistentRuntime(ctx, seed.opened.db)
+	serverCursor, envelopeGeneration, _, collectionGeneration, err := validatePersistentRuntime(ctx, seed.opened.db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -906,8 +1018,66 @@ func TestSnapshotReferenceAcceptedAfterCutFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, serverCursor, collectionGeneration); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot reference accepted after cut") {
+	if err := validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, serverCursor, envelopeGeneration, collectionGeneration); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot reference accepted after cut") {
 		t.Fatalf("post-cut snapshot reference error=%v", err)
+	}
+}
+
+func TestHistoricalSnapshotEnvelopeGenerationMustMatchCut(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	var fixture struct {
+		PassphraseRewrap putEnvelopeRequest `json:"passphrase_rewrap"`
+	}
+	loadFixture(t, "vault-envelope.json", &fixture)
+	body, err := marshalJSON(fixture.PassphraseRewrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, protocolErr := seed.opened.HandleAPI(context.Background(), api.Request{
+		Method: "PUT", Path: "/v1/vault-envelope", RequestID: "e8500000-0000-4000-8000-000000000001",
+		Authorization: authorization(seed.token), Body: body, Now: protocolFixtureTime.Add(3 * time.Second),
+	})
+	if protocolErr != nil || response.Status != http.StatusOK {
+		t.Fatalf("advance envelope: response=%+v error=%v", response, protocolErr)
+	}
+	var retainedCreate []byte
+	if err := seed.opened.db.QueryRow("SELECT create_response_json FROM snapshots WHERE snapshot_id = ?", seed.snapshot.SnapshotID).Scan(&retainedCreate); err != nil {
+		t.Fatal(err)
+	}
+	var create snapshotCreateResponse
+	if err := json.Unmarshal(retainedCreate, &create); err != nil {
+		t.Fatal(err)
+	}
+	create.EnvelopeGeneration = fixture.PassphraseRewrap.NewGeneration
+	create.Envelope = fixture.PassphraseRewrap.Envelope
+	rewrittenCreate, err := marshalJSON(create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two := EncodeUint64(2)
+	if _, err := seed.opened.db.Exec(`
+		UPDATE snapshots
+		SET envelope_generation = ?, create_response_json = ?,
+		    metadata_bytes = metadata_bytes - ? + ?
+		WHERE snapshot_id = ?`, two[:], rewrittenCreate, len(retainedCreate), len(rewrittenCreate), seed.snapshot.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSnapshotsAtCurrentState(t, seed.opened); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "snapshot envelope generation does not match cut") {
+		t.Fatalf("historical snapshot envelope error=%v", err)
+	}
+}
+
+func TestEnvelopeHistoryBelowCollectionFloorRemainsRequired(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	collectBoundedSeedRevision(t, seed)
+	two := EncodeUint64(2)
+	if _, err := seed.opened.db.Exec("DELETE FROM changes WHERE cursor = ? AND kind = 'envelope_changed'", two[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePersistentState(context.Background(), seed.opened.db, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "envelope generation does not match accepted history") {
+		t.Fatalf("collected-floor envelope history error=%v", err)
 	}
 }
 
@@ -1270,7 +1440,7 @@ func rewriteSnapshotCutCursor(t *testing.T, opened *Store, snapshotID string, cu
 func validateSnapshotsAtCurrentState(t *testing.T, opened *Store) error {
 	t.Helper()
 	ctx := context.Background()
-	serverCursor, _, _, collectionGeneration, err := validatePersistentRuntime(ctx, opened.db)
+	serverCursor, envelopeGeneration, _, collectionGeneration, err := validatePersistentRuntime(ctx, opened.db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1278,7 +1448,7 @@ func validateSnapshotsAtCurrentState(t *testing.T, opened *Store) error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return validatePersistentSnapshots(ctx, opened.db, testIdentity, devices, serverCursor, collectionGeneration)
+	return validatePersistentSnapshots(ctx, opened.db, testIdentity, devices, serverCursor, envelopeGeneration, collectionGeneration)
 }
 
 func boundedSyncCall(seed boundedPersistenceSeed, requestID, afterCursor string, mutations []recordRevision) api.Request {
@@ -1508,20 +1678,20 @@ func TestOversizedRevisionVectorIsGuardedAtEveryStartupJoin(t *testing.T) {
 	tests := []struct {
 		name   string
 		detail string
-		check  func(context.Context, boundedPersistenceSeed, uint64, uint64, map[string]validatedDeviceRow, map[string]validatedMarkerChange) error
+		check  func(context.Context, boundedPersistenceSeed, uint64, uint64, uint64, map[string]validatedDeviceRow, map[string]validatedMarkerChange) error
 	}{
-		{name: "revision replay", detail: "invalid revision row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, collectionGeneration uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
+		{name: "revision replay", detail: "invalid revision row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, _, collectionGeneration uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
 			_, err := validatePersistentRevisions(ctx, seed.opened.db, devices, cursor, collectionGeneration)
 			return err
 		}},
-		{name: "permanent vector index", detail: "invalid record vector index", check: func(ctx context.Context, seed boundedPersistenceSeed, _, _ uint64, _ map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
+		{name: "permanent vector index", detail: "invalid record vector index", check: func(ctx context.Context, seed boundedPersistenceSeed, _, _, _ uint64, _ map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
 			return validatePersistentRecordVectorIndex(ctx, seed.opened.db)
 		}},
-		{name: "marker witness join", detail: "invalid marker row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, _ uint64, devices map[string]validatedDeviceRow, changes map[string]validatedMarkerChange) error {
+		{name: "marker witness join", detail: "invalid marker row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, _, _ uint64, devices map[string]validatedDeviceRow, changes map[string]validatedMarkerChange) error {
 			return validatePersistentMarkers(ctx, seed.opened.db, devices, cursor, changes)
 		}},
-		{name: "snapshot reference join", detail: "invalid snapshot reference", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, collectionGeneration uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
-			return validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, cursor, collectionGeneration)
+		{name: "snapshot reference join", detail: "invalid snapshot reference", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, envelopeGeneration, collectionGeneration uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
+			return validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, cursor, envelopeGeneration, collectionGeneration)
 		}},
 	}
 	for _, test := range tests {
@@ -1532,7 +1702,7 @@ func TestOversizedRevisionVectorIsGuardedAtEveryStartupJoin(t *testing.T) {
 				t.Fatal(err)
 			}
 			ctx := context.Background()
-			cursor, _, _, collectionGeneration, err := validatePersistentRuntime(ctx, seed.opened.db)
+			cursor, envelopeGeneration, _, collectionGeneration, err := validatePersistentRuntime(ctx, seed.opened.db)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1544,7 +1714,7 @@ func TestOversizedRevisionVectorIsGuardedAtEveryStartupJoin(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = test.check(ctx, seed, cursor, collectionGeneration, devices, changes)
+			err = test.check(ctx, seed, cursor, envelopeGeneration, collectionGeneration, devices, changes)
 			if !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), test.detail) {
 				t.Fatalf("guarded vector join error=%v", err)
 			}

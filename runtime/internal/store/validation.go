@@ -96,7 +96,7 @@ func validatePersistentState(ctx context.Context, query schemaQueryer, identity 
 	if err := validatePersistentEnrollmentGrants(ctx, query); err != nil {
 		return err
 	}
-	if err := validatePersistentSnapshots(ctx, query, identity, devices, serverCursor, collectionGeneration); err != nil {
+	if err := validatePersistentSnapshots(ctx, query, identity, devices, serverCursor, envelopeGeneration, collectionGeneration); err != nil {
 		return err
 	}
 	if err := validatePersistentObjectReferences(ctx, query); err != nil {
@@ -318,6 +318,43 @@ func validatePersistentEnvelope(ctx context.Context, query schemaQueryer, identi
 		return invalidPersistentState("inconsistent envelope row")
 	}
 	return nil
+}
+
+func validatePersistentEnvelopeHistory(ctx context.Context, query schemaQueryer, serverCursor, runtimeGeneration uint64) ([]uint64, error) {
+	// This runtime only activates from the no-envelope generation-zero state.
+	// V1 then deletes only collected record_revision changes, so envelope-change
+	// ordinals are permanent generations and their cursors reconstruct the exact
+	// generation visible at any snapshot cut. A future recovery activation must
+	// persist explicit baseline provenance instead of synthesizing change rows.
+	rows, err := query.QueryContext(ctx, `
+		SELECT cursor FROM changes
+		WHERE kind = 'envelope_changed'
+		ORDER BY cursor`)
+	if err != nil {
+		return nil, invalidPersistentState("read envelope change history")
+	}
+	defer rows.Close()
+	changeCursors := make([]uint64, 0)
+	previous := uint64(0)
+	for rows.Next() {
+		var cursorBytes []byte
+		if rows.Scan(&cursorBytes) != nil {
+			return nil, invalidPersistentState("invalid envelope change history")
+		}
+		cursor, err := DecodeUint64(cursorBytes)
+		if err != nil || cursor == 0 || cursor <= previous || cursor > serverCursor {
+			return nil, invalidPersistentState("invalid envelope change history")
+		}
+		changeCursors = append(changeCursors, cursor)
+		previous = cursor
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return nil, invalidPersistentState("read envelope change history")
+	}
+	if uint64(len(changeCursors)) != runtimeGeneration {
+		return nil, invalidPersistentState("envelope generation does not match accepted history")
+	}
+	return changeCursors, nil
 }
 
 func validatePersistentRevisionObjects(ctx context.Context, query schemaQueryer) error {
@@ -1248,7 +1285,7 @@ func validatePersistentEnrollmentsAndRotations(ctx context.Context, query schema
 	return nil
 }
 
-func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, identity Identity, devices map[string]validatedDeviceRow, serverCursor, collectionGeneration uint64) error {
+func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, identity Identity, devices map[string]validatedDeviceRow, serverCursor, envelopeGeneration, collectionGeneration uint64) error {
 	type validatedSnapshot struct {
 		ownerID              string
 		requestID            string
@@ -1268,6 +1305,10 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		markerBodies         map[string][]byte
 		orderedRevisionIDs   []string
 		validationAccount    snapshotMetadataAccounting
+	}
+	envelopeChangeCursors, err := validatePersistentEnvelopeHistory(ctx, query, serverCursor, envelopeGeneration)
+	if err != nil {
+		return err
 	}
 	snapshots := make(map[string]*validatedSnapshot)
 	ownerCounts := make(map[string]int)
@@ -1298,6 +1339,17 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			cut > serverCursor || snapshotCollectionGeneration > collectionGeneration || owner.createdCursor != 0 && owner.createdCursor > cut {
 			rows.Close()
 			return invalidPersistentState("inconsistent snapshot row")
+		}
+		generationAtCut := uint64(0)
+		for _, changeCursor := range envelopeChangeCursors {
+			if changeCursor > cut {
+				break
+			}
+			generationAtCut++
+		}
+		if generation != generationAtCut {
+			rows.Close()
+			return invalidPersistentState("snapshot envelope generation does not match cut")
 		}
 		if createBodyLength <= 0 || createBodyLength > metadataBytes || createBodyLength > maxBodyBytes {
 			rows.Close()

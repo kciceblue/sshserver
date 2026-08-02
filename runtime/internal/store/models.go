@@ -417,6 +417,9 @@ func validateEnvelope(envelope vaultEnvelope, identity Identity) (uint64, uint64
 	if err != nil {
 		return 0, 0, err
 	}
+	if generation == 0 {
+		return 0, 0, errors.New("envelope generation is zero")
+	}
 	secretGeneration, err := parseUint64(envelope.InstanceSecretGeneration)
 	if err != nil {
 		return 0, 0, err

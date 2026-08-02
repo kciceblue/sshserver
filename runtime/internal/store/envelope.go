@@ -87,6 +87,9 @@ func (store *Store) handlePutEnvelope(ctx context.Context, call api.Request) (ap
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
+	if err := validatePersistentEnvelope(ctx, transaction, store.identity, storedGeneration, secretGeneration); err != nil {
+		return api.Response{}, api.NewError("internal_error", true)
+	}
 	if expected != storedGeneration {
 		return api.Response{}, api.NewError("generation_conflict", true)
 	}
