@@ -275,29 +275,50 @@ func loadActiveAcknowledgements(ctx context.Context, transaction *sql.Tx) ([]uin
 }
 
 func loadCollectionRecordBatch(ctx context.Context, transaction *sql.Tx) ([]string, string, *api.Error) {
-	var scanAfter string
-	if err := transaction.QueryRowContext(ctx, "SELECT collection_scan_after_record_id FROM runtime_state WHERE singleton = 1").Scan(&scanAfter); err != nil || scanAfter != "" && validateUUID(scanAfter) != nil {
+	var scanAfter sql.NullString
+	var scanAfterLength int64
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT octet_length(collection_scan_after_record_id),
+		       CASE WHEN typeof(collection_scan_after_record_id) = 'text'
+		                  AND octet_length(collection_scan_after_record_id) IN (0, ?) THEN collection_scan_after_record_id END
+		FROM runtime_state WHERE singleton = 1`, maxUUIDBytes,
+	).Scan(&scanAfterLength, &scanAfter); err != nil || !boundedEmptyOrUUIDText(scanAfterLength, scanAfter) {
 		return nil, "", api.NewError("internal_error", true)
 	}
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT record_id FROM collection_records
-		WHERE record_id > ? ORDER BY record_id LIMIT ?`, scanAfter, collectionRecordBatch)
+		SELECT octet_length(record_id),
+		       CASE WHEN typeof(record_id) = 'text'
+		                  AND octet_length(record_id) = ? THEN record_id END
+		FROM collection_records
+		WHERE record_id > ? ORDER BY record_id LIMIT ?`, maxUUIDBytes, scanAfter.String, collectionRecordBatch)
 	if err != nil {
 		return nil, "", api.NewError("internal_error", true)
 	}
 	defer rows.Close()
 	result := make([]string, 0, collectionRecordBatch)
 	for rows.Next() {
-		var recordID string
-		if rows.Scan(&recordID) != nil || validateUUID(recordID) != nil {
+		var recordID sql.NullString
+		var recordIDLength int64
+		if rows.Scan(&recordIDLength, &recordID) != nil || recordIDLength != maxUUIDBytes ||
+			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || validateUUID(recordID.String) != nil {
 			return nil, "", api.NewError("internal_error", true)
 		}
-		result = append(result, recordID)
+		result = append(result, recordID.String)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, "", api.NewError("internal_error", true)
 	}
-	return result, scanAfter, nil
+	return result, scanAfter.String, nil
+}
+
+func boundedEmptyOrUUIDText(length int64, value sql.NullString) bool {
+	if !value.Valid || int64(len(value.String)) != length {
+		return false
+	}
+	if length == 0 {
+		return value.String == ""
+	}
+	return length == maxUUIDBytes && validateUUID(value.String) == nil
 }
 
 func loadCollectionRecordWork(ctx context.Context, transaction *sql.Tx, recordID string, accumulatedUptimeMS uint64) (uint64, []collectionRevision, []collectionRevision, *api.Error) {
@@ -310,7 +331,13 @@ func loadCollectionRecordWork(ctx context.Context, transaction *sql.Tx, recordID
 		return 0, nil, nil, api.NewError("internal_error", true)
 	}
 	heads, protocolErr := loadCollectionRevisionRows(ctx, transaction, `
-		SELECT r.revision_id, r.record_id, length(r.vector_json),
+		SELECT octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       length(r.vector_json),
 		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
 		       r.content_hash, length(r.collection_witness_authenticator),
 		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
@@ -318,7 +345,7 @@ func loadCollectionRecordWork(ctx context.Context, transaction *sql.Tx, recordID
 		       r.accepted_uptime_ms, r.change_cursor
 		FROM record_heads h JOIN record_revisions r ON r.revision_id = h.revision_id
 		WHERE h.record_id = ?
-		ORDER BY h.revision_id LIMIT 33`, maxVectorBytes, recordID)
+		ORDER BY h.revision_id LIMIT 33`, maxUUIDBytes, maxUUIDBytes, maxVectorBytes, recordID)
 	if protocolErr != nil || len(heads) > 32 {
 		if protocolErr != nil {
 			return 0, nil, nil, protocolErr
@@ -331,7 +358,13 @@ func loadCollectionRecordWork(ctx context.Context, transaction *sql.Tx, recordID
 	}
 	cutoff := EncodeUint64(accumulatedUptimeMS - minimumMS)
 	candidates, protocolErr := loadCollectionRevisionRows(ctx, transaction, `
-		SELECT r.revision_id, r.record_id, length(r.vector_json),
+		SELECT octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       length(r.vector_json),
 		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
 		       r.content_hash, length(r.collection_witness_authenticator),
 		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
@@ -342,7 +375,7 @@ func loadCollectionRecordWork(ctx context.Context, transaction *sql.Tx, recordID
 		  ON r.revision_id = q.revision_id AND r.record_id = q.record_id
 		 AND r.accepted_uptime_ms = q.accepted_uptime_ms
 		WHERE q.record_id = ? AND q.accepted_uptime_ms <= ? AND r.retained = 1
-		ORDER BY q.accepted_uptime_ms, q.revision_id LIMIT ?`, maxVectorBytes, recordID, cutoff[:], collectionCandidateBatch)
+		ORDER BY q.accepted_uptime_ms, q.revision_id LIMIT ?`, maxUUIDBytes, maxUUIDBytes, maxVectorBytes, recordID, cutoff[:], collectionCandidateBatch)
 	if protocolErr != nil {
 		return 0, nil, nil, protocolErr
 	}
@@ -358,15 +391,19 @@ func loadCollectionRevisionRows(ctx context.Context, transaction *sql.Tx, statem
 	var result []collectionRevision
 	for rows.Next() {
 		var revision collectionRevision
+		var revisionID, recordID sql.NullString
 		var vectorBody, acceptedBytes, cursorBytes, contentHash, authenticator []byte
-		var vectorLength int64
+		var revisionIDLength, recordIDLength, vectorLength int64
 		var authenticatorLength sql.NullInt64
-		if rows.Scan(&revision.revisionID, &revision.recordID, &vectorLength, &vectorBody, &contentHash, &authenticatorLength, &authenticator, &revision.tombstone, &acceptedBytes, &cursorBytes) != nil ||
-			validateUUID(revision.revisionID) != nil || validateUUID(revision.recordID) != nil || len(contentHash) != 32 ||
+		if rows.Scan(&revisionIDLength, &revisionID, &recordIDLength, &recordID, &vectorLength, &vectorBody, &contentHash, &authenticatorLength, &authenticator, &revision.tombstone, &acceptedBytes, &cursorBytes) != nil ||
+			revisionIDLength != maxUUIDBytes || !boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil ||
+			recordIDLength != maxUUIDBytes || !boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || validateUUID(recordID.String) != nil || len(contentHash) != 32 ||
 			!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || !boundedOptionalBytes(authenticatorLength, authenticator, 32) ||
 			authenticatorLength.Valid && authenticatorLength.Int64 != 32 {
 			return nil, api.NewError("internal_error", true)
 		}
+		revision.revisionID = revisionID.String
+		revision.recordID = recordID.String
 		copy(revision.contentHash[:], contentHash)
 		if json.Unmarshal(vectorBody, &revision.vectorEntries) != nil {
 			return nil, api.NewError("internal_error", true)
@@ -401,18 +438,24 @@ func deleteUnreferencedRevisionObject(ctx context.Context, transaction *sql.Tx, 
 	if retained == 1 {
 		return nil
 	}
-	rows, err := transaction.QueryContext(ctx, "SELECT snapshot_id FROM snapshots ORDER BY snapshot_id LIMIT 9")
+	rows, err := transaction.QueryContext(ctx, `
+		SELECT octet_length(snapshot_id),
+		       CASE WHEN typeof(snapshot_id) = 'text'
+		                  AND octet_length(snapshot_id) = ? THEN snapshot_id END
+		FROM snapshots ORDER BY snapshot_id LIMIT 9`, maxUUIDBytes)
 	if err != nil {
 		return api.NewError("internal_error", true)
 	}
 	var snapshotIDs []string
 	for rows.Next() {
-		var snapshotID string
-		if rows.Scan(&snapshotID) != nil {
+		var snapshotID sql.NullString
+		var snapshotIDLength int64
+		if rows.Scan(&snapshotIDLength, &snapshotID) != nil || snapshotIDLength != maxUUIDBytes ||
+			!boundedRequiredText(snapshotIDLength, snapshotID, maxUUIDBytes) || validateUUID(snapshotID.String) != nil {
 			rows.Close()
 			return api.NewError("internal_error", true)
 		}
-		snapshotIDs = append(snapshotIDs, snapshotID)
+		snapshotIDs = append(snapshotIDs, snapshotID.String)
 	}
 	if rows.Err() != nil || rows.Close() != nil || len(snapshotIDs) > 8 {
 		return api.NewError("internal_error", true)
@@ -437,22 +480,28 @@ func deleteUnreferencedRevisionObject(ctx context.Context, transaction *sql.Tx, 
 
 func loadCollectionMarker(ctx context.Context, transaction *sql.Tx, recordID string) (storedCollectionMarker, *api.Error) {
 	var marker storedCollectionMarker
+	var witnessRevisionID sql.NullString
 	var frontierBody, authenticator, barrierBytes []byte
-	var frontierLength, bodyLength int64
+	var witnessRevisionIDLength, frontierLength, bodyLength int64
 	err := transaction.QueryRowContext(ctx, `
-		SELECT witness_revision_id, length(frontier_json),
+		SELECT octet_length(witness_revision_id),
+		       CASE WHEN typeof(witness_revision_id) = 'text'
+		                  AND octet_length(witness_revision_id) = ? THEN witness_revision_id END,
+		       length(frontier_json),
 		       CASE WHEN length(frontier_json) BETWEEN 1 AND ? THEN frontier_json END,
 		       collection_witness_authenticator, barrier_cursor, length(marker_json),
 		       CASE WHEN length(marker_json) BETWEEN 1 AND ? THEN marker_json END
-		FROM collection_markers WHERE record_id = ?`, maxVectorBytes, maxBodyBytes, recordID,
-	).Scan(&marker.witnessRevisionID, &frontierLength, &frontierBody, &authenticator, &barrierBytes, &bodyLength, &marker.body)
+		FROM collection_markers WHERE record_id = ?`, maxUUIDBytes, maxVectorBytes, maxBodyBytes, recordID,
+	).Scan(&witnessRevisionIDLength, &witnessRevisionID, &frontierLength, &frontierBody, &authenticator, &barrierBytes, &bodyLength, &marker.body)
 	if errors.Is(err, sql.ErrNoRows) {
 		return marker, nil
 	}
-	if err != nil || !boundedRequiredBytes(frontierLength, frontierBody, maxVectorBytes) || len(authenticator) != 32 ||
+	if err != nil || witnessRevisionIDLength != maxUUIDBytes || !boundedRequiredText(witnessRevisionIDLength, witnessRevisionID, maxUUIDBytes) || validateUUID(witnessRevisionID.String) != nil ||
+		!boundedRequiredBytes(frontierLength, frontierBody, maxVectorBytes) || len(authenticator) != 32 ||
 		!boundedRequiredBytes(bodyLength, marker.body, maxBodyBytes) {
 		return marker, api.NewError("internal_error", true)
 	}
+	marker.witnessRevisionID = witnessRevisionID.String
 	if json.Unmarshal(frontierBody, &marker.frontierEntries) != nil {
 		return marker, api.NewError("internal_error", true)
 	}

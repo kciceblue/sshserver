@@ -218,8 +218,9 @@ func (store *Store) DeviceCredential(ctx context.Context, deviceID string) (hash
 	var scopesLength int64
 	if err := store.db.QueryRowContext(
 		ctx,
-		`SELECT token_hash, length(scopes_json),
-		        CASE WHEN length(scopes_json) = ? THEN scopes_json END
+		`SELECT token_hash, octet_length(scopes_json),
+		        CASE WHEN typeof(scopes_json) = 'text'
+		                   AND octet_length(scopes_json) = ? THEN scopes_json END
 		 FROM devices WHERE device_id = ?`,
 		len(wantScopes), deviceID,
 	).Scan(&hashBytes, &scopesLength, &scopesJSON); err != nil {
@@ -358,18 +359,38 @@ func (store *Store) initialize(ctx context.Context) error {
 }
 
 func validateIdentity(ctx context.Context, database schemaQueryer, expected Identity) error {
-	var stored Identity
-	var protocolMajor, storageSchema string
+	var instanceID, vaultID, protocolMajor, storageSchema sql.NullString
+	var instanceIDLength, vaultIDLength, protocolMajorLength, storageSchemaLength int64
 	if err := database.QueryRowContext(ctx, `
-		SELECT instance_id, vault_id, protocol_major, storage_schema
+		SELECT octet_length(instance_id),
+		       CASE WHEN typeof(instance_id) = 'text'
+		                  AND octet_length(instance_id) = ? THEN instance_id END,
+		       octet_length(vault_id),
+		       CASE WHEN typeof(vault_id) = 'text'
+		                  AND octet_length(vault_id) = ? THEN vault_id END,
+		       octet_length(protocol_major),
+		       CASE WHEN typeof(protocol_major) = 'text'
+		                  AND octet_length(protocol_major) = ? THEN protocol_major END,
+		       octet_length(storage_schema),
+		       CASE WHEN typeof(storage_schema) = 'text'
+		                  AND octet_length(storage_schema) = ? THEN storage_schema END
 		FROM instance_metadata WHERE singleton = 1`,
-	).Scan(&stored.InstanceID, &stored.VaultID, &protocolMajor, &storageSchema); err != nil {
+		maxUUIDBytes, maxUUIDBytes, len("1"), len("1"),
+	).Scan(
+		&instanceIDLength, &instanceID, &vaultIDLength, &vaultID,
+		&protocolMajorLength, &protocolMajor, &storageSchemaLength, &storageSchema,
+	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrIdentityMismatch
 		}
 		return fmt.Errorf("read instance metadata: %w", err)
 	}
-	if stored != expected || protocolMajor != "1" || storageSchema != "1" {
+	if instanceIDLength != maxUUIDBytes || !boundedRequiredText(instanceIDLength, instanceID, maxUUIDBytes) ||
+		vaultIDLength != maxUUIDBytes || !boundedRequiredText(vaultIDLength, vaultID, maxUUIDBytes) ||
+		protocolMajorLength != int64(len("1")) || !boundedRequiredText(protocolMajorLength, protocolMajor, len("1")) ||
+		storageSchemaLength != int64(len("1")) || !boundedRequiredText(storageSchemaLength, storageSchema, len("1")) ||
+		(Identity{InstanceID: instanceID.String, VaultID: vaultID.String}) != expected ||
+		protocolMajor.String != "1" || storageSchema.String != "1" {
 		return ErrIdentityMismatch
 	}
 	return nil

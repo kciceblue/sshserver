@@ -64,21 +64,28 @@ func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) 
 		return api.Response{}, protocolErr
 	}
 	var storedFingerprint, storedResponse []byte
-	var storedSnapshotID, storedOwner string
+	var storedSnapshotID sql.NullString
+	var storedOwner sql.NullString
 	var storedCutBytes, storedGenerationBytes []byte
-	var storedExpiresAt, storedResponseLength int64
+	var storedSnapshotIDLength, storedOwnerLength, storedExpiresAt, storedResponseLength int64
 	err := transaction.QueryRowContext(ctx, `
-		SELECT snapshot_id, owner_device_id, request_fingerprint, cut_cursor,
+		SELECT octet_length(snapshot_id),
+		       CASE WHEN typeof(snapshot_id) = 'text' AND octet_length(snapshot_id) = ? THEN snapshot_id END,
+		       octet_length(owner_device_id),
+		       CASE WHEN typeof(owner_device_id) = 'text' AND octet_length(owner_device_id) = ? THEN owner_device_id END,
+		       request_fingerprint, cut_cursor,
 		       envelope_generation, expires_at_ms, length(create_response_json),
 		       CASE WHEN length(create_response_json) BETWEEN 1 AND ? THEN create_response_json END
 		FROM snapshots
-		WHERE owner_device_id = ? AND request_id = ?`, maxBodyBytes, authenticated.DeviceID, call.RequestID,
-	).Scan(&storedSnapshotID, &storedOwner, &storedFingerprint, &storedCutBytes, &storedGenerationBytes, &storedExpiresAt, &storedResponseLength, &storedResponse)
+		WHERE owner_device_id = ? AND request_id = ?`, maxUUIDBytes, maxUUIDBytes, maxBodyBytes, authenticated.DeviceID, call.RequestID,
+	).Scan(&storedSnapshotIDLength, &storedSnapshotID, &storedOwnerLength, &storedOwner, &storedFingerprint, &storedCutBytes, &storedGenerationBytes, &storedExpiresAt, &storedResponseLength, &storedResponse)
 	if err == nil {
 		storedCut, cutErr := DecodeUint64(storedCutBytes)
 		storedGeneration, generationErr := DecodeUint64(storedGenerationBytes)
-		if len(storedFingerprint) != 32 || cutErr != nil || generationErr != nil || !boundedRequiredBytes(storedResponseLength, storedResponse, maxBodyBytes) ||
-			validateStoredSnapshotCreateResponse(storedResponse, store.identity, storedSnapshotID, storedOwner, storedCut, storedGeneration, storedExpiresAt) != nil {
+		if storedSnapshotIDLength != maxUUIDBytes || !boundedRequiredText(storedSnapshotIDLength, storedSnapshotID, maxUUIDBytes) || validateUUID(storedSnapshotID.String) != nil ||
+			storedOwnerLength != maxUUIDBytes || !boundedRequiredText(storedOwnerLength, storedOwner, maxUUIDBytes) || validateUUID(storedOwner.String) != nil ||
+			len(storedFingerprint) != 32 || cutErr != nil || generationErr != nil || !boundedRequiredBytes(storedResponseLength, storedResponse, maxBodyBytes) ||
+			validateStoredSnapshotCreateResponse(storedResponse, store.identity, storedSnapshotID.String, storedOwner.String, storedCut, storedGeneration, storedExpiresAt) != nil {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		var recorded [32]byte
@@ -240,18 +247,20 @@ func (store *Store) handleSnapshotPage(ctx context.Context, call api.Request, sn
 	if authenticated.DeviceID != request.DeviceID {
 		return api.Response{}, api.NewError("authenticated_device_mismatch", false)
 	}
-	var ownerDeviceID string
+	var ownerDeviceID sql.NullString
 	var cutBytes, generationBytes []byte
-	var expiresAt int64
+	var ownerDeviceIDLength, expiresAt int64
 	if err := transaction.QueryRowContext(ctx, `
-		SELECT owner_device_id, cut_cursor, envelope_generation, expires_at_ms
-		FROM snapshots WHERE snapshot_id = ?`, snapshotID,
-	).Scan(&ownerDeviceID, &cutBytes, &generationBytes, &expiresAt); errors.Is(err, sql.ErrNoRows) {
+		SELECT octet_length(owner_device_id),
+		       CASE WHEN typeof(owner_device_id) = 'text' AND octet_length(owner_device_id) = ? THEN owner_device_id END,
+		       cut_cursor, envelope_generation, expires_at_ms
+		FROM snapshots WHERE snapshot_id = ?`, maxUUIDBytes, snapshotID,
+	).Scan(&ownerDeviceIDLength, &ownerDeviceID, &cutBytes, &generationBytes, &expiresAt); errors.Is(err, sql.ErrNoRows) {
 		return api.Response{}, api.NewError("snapshot_not_found", false)
-	} else if err != nil {
+	} else if err != nil || ownerDeviceIDLength != maxUUIDBytes || !boundedRequiredText(ownerDeviceIDLength, ownerDeviceID, maxUUIDBytes) || validateUUID(ownerDeviceID.String) != nil {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
-	if ownerDeviceID != authenticated.DeviceID {
+	if ownerDeviceID.String != authenticated.DeviceID {
 		return api.Response{}, api.NewError("snapshot_not_found", false)
 	}
 	store.ephemeral.mu.Lock()
@@ -417,18 +426,23 @@ func (store *Store) admitSnapshotAttempt(deviceID string, now time.Time) *api.Er
 }
 
 func (store *Store) pruneExpiredSnapshots(ctx context.Context, transaction *sql.Tx, now time.Time) *api.Error {
-	rows, err := transaction.QueryContext(ctx, "SELECT snapshot_id FROM snapshots ORDER BY snapshot_id LIMIT 9")
+	rows, err := transaction.QueryContext(ctx, `
+		SELECT octet_length(snapshot_id),
+		       CASE WHEN typeof(snapshot_id) = 'text' AND octet_length(snapshot_id) = ? THEN snapshot_id END
+		FROM snapshots ORDER BY snapshot_id LIMIT 9`, maxUUIDBytes)
 	if err != nil {
 		return api.NewError("internal_error", true)
 	}
 	var identifiers []string
 	for rows.Next() {
-		var identifier string
-		if err := rows.Scan(&identifier); err != nil {
+		var identifier sql.NullString
+		var identifierLength int64
+		if err := rows.Scan(&identifierLength, &identifier); err != nil || identifierLength != maxUUIDBytes ||
+			!boundedRequiredText(identifierLength, identifier, maxUUIDBytes) || validateUUID(identifier.String) != nil {
 			rows.Close()
 			return api.NewError("internal_error", true)
 		}
-		identifiers = append(identifiers, identifier)
+		identifiers = append(identifiers, identifier.String)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -460,19 +474,26 @@ func (store *Store) pruneExpiredSnapshots(ctx context.Context, transaction *sql.
 
 func deleteSnapshotAndReleaseObjects(ctx context.Context, transaction *sql.Tx, snapshotID string) *api.Error {
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT revision_id, content_hash FROM snapshot_revision_refs
-		WHERE snapshot_id = ? ORDER BY revision_id`, snapshotID)
+		SELECT octet_length(revision_id),
+		       CASE WHEN typeof(revision_id) = 'text' AND octet_length(revision_id) = ? THEN revision_id END,
+		       content_hash
+		FROM snapshot_revision_refs
+		WHERE snapshot_id = ? ORDER BY revision_id`, maxUUIDBytes, snapshotID)
 	if err != nil {
 		return api.NewError("internal_error", true)
 	}
 	var references []snapshotRevisionReference
 	for rows.Next() {
 		var reference snapshotRevisionReference
+		var revisionID sql.NullString
+		var revisionIDLength int64
 		var hashBytes []byte
-		if rows.Scan(&reference.revisionID, &hashBytes) != nil || len(hashBytes) != 32 {
+		if rows.Scan(&revisionIDLength, &revisionID, &hashBytes) != nil || revisionIDLength != maxUUIDBytes ||
+			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil || len(hashBytes) != 32 {
 			rows.Close()
 			return api.NewError("internal_error", true)
 		}
+		reference.revisionID = revisionID.String
 		copy(reference.contentHash[:], hashBytes)
 		references = append(references, reference)
 	}
@@ -514,12 +535,16 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 	}
 
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT r.record_id, r.revision_id, r.content_hash, length(o.revision_json),
+		SELECT octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text' AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text' AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       r.content_hash, length(o.revision_json),
 		       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END
 		FROM record_heads h
 		JOIN record_revisions r ON r.revision_id = h.revision_id
 		JOIN revision_objects o USING (content_hash)
-		ORDER BY h.record_id, h.revision_id`, maxBodyBytes)
+		ORDER BY h.record_id, h.revision_id`, maxUUIDBytes, maxUUIDBytes, maxBodyBytes)
 	if err != nil {
 		return nil, nil, api.NewError("internal_error", true)
 	}
@@ -540,14 +565,17 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 		return nil
 	}
 	for rows.Next() {
-		var recordID, revisionID string
+		var recordID, revisionID sql.NullString
+		var recordIDLength, revisionIDLength int64
 		var hashBytes, body []byte
 		var bodyLength int64
 		var revision recordRevision
-		if rows.Scan(&recordID, &revisionID, &hashBytes, &bodyLength, &body) != nil || validateUUID(recordID) != nil || validateUUID(revisionID) != nil || len(hashBytes) != 32 ||
+		if rows.Scan(&recordIDLength, &recordID, &revisionIDLength, &revisionID, &hashBytes, &bodyLength, &body) != nil ||
+			recordIDLength != maxUUIDBytes || !boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || validateUUID(recordID.String) != nil ||
+			revisionIDLength != maxUUIDBytes || !boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil || len(hashBytes) != 32 ||
 			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
-			previousRecordID != "" && (recordID < previousRecordID || recordID == previousRecordID && revisionID <= previousRevisionID) ||
-			decodeStoredCanonical(body, &revision) != nil || revision.RecordID != recordID || revision.RevisionID != revisionID {
+			previousRecordID != "" && (recordID.String < previousRecordID || recordID.String == previousRecordID && revisionID.String <= previousRevisionID) ||
+			decodeStoredCanonical(body, &revision) != nil || revision.RecordID != recordID.String || revision.RevisionID != revisionID.String {
 			rows.Close()
 			return nil, nil, api.NewError("internal_error", true)
 		}
@@ -557,7 +585,7 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 			return nil, nil, api.NewError("internal_error", true)
 		}
 		candidateRevisions := append(pageRevisions, revision)
-		candidateIDs := append(pageRevisionIDs, revisionID)
+		candidateIDs := append(pageRevisionIDs, revisionID.String)
 		if len(candidateRevisions) > 128 || !snapshotPageFits(snapshotID, cutCursor, envelopeGeneration, candidateRevisions, snapshotPageDescriptor{RevisionIDs: candidateIDs, CollectionMarkers: []collectionMarker{}, SourceDevices: []sourceDevice{}}) {
 			if len(pageRevisions) == 0 {
 				rows.Close()
@@ -568,7 +596,7 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 				return nil, nil, protocolErr
 			}
 			pageRevisions = []recordRevision{revision}
-			pageRevisionIDs = []string{revisionID}
+			pageRevisionIDs = []string{revisionID.String}
 			if !snapshotPageFits(snapshotID, cutCursor, envelopeGeneration, pageRevisions, snapshotPageDescriptor{RevisionIDs: pageRevisionIDs, CollectionMarkers: []collectionMarker{}, SourceDevices: []sourceDevice{}}) {
 				rows.Close()
 				return nil, nil, api.NewError("internal_error", true)
@@ -579,14 +607,14 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 		}
 		var contentHash [32]byte
 		copy(contentHash[:], hashBytes)
-		reference := snapshotRevisionReference{revisionID: revisionID, contentHash: contentHash}
+		reference := snapshotRevisionReference{revisionID: revisionID.String, contentHash: contentHash}
 		accountSnapshotReference(&lower, snapshotID, reference)
 		if !lower.ok() || lower.total > availableMetadata {
 			rows.Close()
 			return nil, nil, api.NewError("limit_exceeded", false)
 		}
 		references = append(references, reference)
-		previousRecordID, previousRevisionID = recordID, revisionID
+		previousRecordID, previousRevisionID = recordID.String, revisionID.String
 	}
 	if rows.Err() != nil || rows.Close() != nil {
 		return nil, nil, api.NewError("internal_error", true)
@@ -651,16 +679,23 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 		return nil, nil, protocolErr
 	}
 
-	deviceRows, err := transaction.QueryContext(ctx, "SELECT device_id, max_author_counter FROM devices ORDER BY device_id LIMIT 65")
+	deviceRows, err := transaction.QueryContext(ctx, `
+		SELECT octet_length(device_id),
+		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
+		       max_author_counter
+		FROM devices ORDER BY device_id LIMIT 65`, maxUUIDBytes)
 	if err != nil {
 		return nil, nil, api.NewError("internal_error", true)
 	}
 	var pageDevices []sourceDevice
 	var previousDeviceID string
 	for deviceRows.Next() {
-		var deviceID string
+		var deviceID sql.NullString
+		var deviceIDLength int64
 		var counterBytes []byte
-		if deviceRows.Scan(&deviceID, &counterBytes) != nil || validateUUID(deviceID) != nil || previousDeviceID != "" && previousDeviceID >= deviceID {
+		if deviceRows.Scan(&deviceIDLength, &deviceID, &counterBytes) != nil || deviceIDLength != maxUUIDBytes ||
+			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			previousDeviceID != "" && previousDeviceID >= deviceID.String {
 			deviceRows.Close()
 			return nil, nil, api.NewError("internal_error", true)
 		}
@@ -669,8 +704,8 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 			deviceRows.Close()
 			return nil, nil, api.NewError("internal_error", true)
 		}
-		pageDevices = append(pageDevices, sourceDevice{DeviceID: deviceID, MaxAuthorCounter: encodeUint64Text(counter)})
-		previousDeviceID = deviceID
+		pageDevices = append(pageDevices, sourceDevice{DeviceID: deviceID.String, MaxAuthorCounter: encodeUint64Text(counter)})
+		previousDeviceID = deviceID.String
 	}
 	if deviceRows.Err() != nil || deviceRows.Close() != nil || len(pageDevices) > 64 {
 		return nil, nil, api.NewError("internal_error", true)

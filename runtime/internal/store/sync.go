@@ -285,11 +285,14 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 
 func classifyRevisionFrontier(ctx context.Context, transaction *sql.Tx, recordID string, candidate map[string]uint64) (bool, []string, *api.Error) {
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT r.revision_id, length(r.vector_json),
+		SELECT octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       length(r.vector_json),
 		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END
 		FROM record_heads h JOIN record_revisions r ON r.revision_id = h.revision_id
 		WHERE h.record_id = ?
-		ORDER BY h.revision_id LIMIT 33`, maxVectorBytes, recordID)
+		ORDER BY h.revision_id LIMIT 33`, maxUUIDBytes, maxVectorBytes, recordID)
 	if err != nil {
 		return false, nil, api.NewError("internal_error", true)
 	}
@@ -299,11 +302,13 @@ func classifyRevisionFrontier(ctx context.Context, transaction *sql.Tx, recordID
 	count := 0
 	for rows.Next() {
 		count++
-		var revisionID string
+		var revisionID sql.NullString
 		var vectorBody []byte
-		var vectorLength int64
+		var revisionIDLength, vectorLength int64
 		var entries []vectorEntry
-		if rows.Scan(&revisionID, &vectorLength, &vectorBody) != nil || !boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || json.Unmarshal(vectorBody, &entries) != nil {
+		if rows.Scan(&revisionIDLength, &revisionID, &vectorLength, &vectorBody) != nil ||
+			revisionIDLength != maxUUIDBytes || !boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil ||
+			!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || json.Unmarshal(vectorBody, &entries) != nil {
 			return false, nil, api.NewError("internal_error", true)
 		}
 		vector, err := validateVector(entries)
@@ -314,7 +319,7 @@ func classifyRevisionFrontier(ctx context.Context, transaction *sql.Tx, recordID
 			undominated = false
 		}
 		if vectorDominates(candidate, vector) {
-			dominated = append(dominated, revisionID)
+			dominated = append(dominated, revisionID.String)
 		}
 	}
 	if rows.Err() != nil || count > 32 {
@@ -411,21 +416,26 @@ func validateEqualVectorEquivocation(ctx context.Context, transaction *sql.Tx, r
 		}
 	}
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT r.revision_id, length(r.vector_json),
+		SELECT octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       length(r.vector_json),
 		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END
 		FROM record_vector_index i
 		JOIN record_revisions r ON r.revision_id = i.revision_id
 		WHERE i.record_id = ? AND i.vector_hash = ?
-		ORDER BY i.revision_id`, maxVectorBytes, recordID, vectorHash[:])
+		ORDER BY i.revision_id`, maxUUIDBytes, maxVectorBytes, recordID, vectorHash[:])
 	if err != nil {
 		return api.NewError("internal_error", true)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var existingID string
+		var existingID sql.NullString
 		var vectorJSON []byte
-		var vectorLength int64
-		if err := rows.Scan(&existingID, &vectorLength, &vectorJSON); err != nil || !boundedRequiredBytes(vectorLength, vectorJSON, maxVectorBytes) {
+		var existingIDLength, vectorLength int64
+		if err := rows.Scan(&existingIDLength, &existingID, &vectorLength, &vectorJSON); err != nil ||
+			existingIDLength != maxUUIDBytes || !boundedRequiredText(existingIDLength, existingID, maxUUIDBytes) || validateUUID(existingID.String) != nil ||
+			!boundedRequiredBytes(vectorLength, vectorJSON, maxVectorBytes) {
 			return api.NewError("internal_error", true)
 		}
 		var entries []vectorEntry
@@ -436,7 +446,7 @@ func validateEqualVectorEquivocation(ctx context.Context, transaction *sql.Tx, r
 		if err != nil {
 			return api.NewError("internal_error", true)
 		}
-		if existingID != revisionID && vectorsEqual(candidate, vector) {
+		if existingID.String != revisionID && vectorsEqual(candidate, vector) {
 			return api.NewError("revision_equivocation", false)
 		}
 	}
@@ -510,10 +520,13 @@ func validateRecordCausality(ctx context.Context, transaction *sql.Tx, recordID,
 		return api.NewError("internal_error", true)
 	}
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT r.revision_id, length(r.vector_json),
+		SELECT octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       length(r.vector_json),
 		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END
 		FROM record_heads h JOIN record_revisions r ON r.revision_id = h.revision_id
-		WHERE h.record_id = ? ORDER BY h.revision_id`, maxVectorBytes, recordID)
+		WHERE h.record_id = ? ORDER BY h.revision_id`, maxUUIDBytes, maxVectorBytes, recordID)
 	if err != nil {
 		return api.NewError("internal_error", true)
 	}
@@ -530,10 +543,12 @@ func validateRecordCausality(ctx context.Context, transaction *sql.Tx, recordID,
 		vectors = append(vectors, existingVector{id: item.revision.RevisionID, vector: item.vector})
 	}
 	for rows.Next() {
-		var existingID string
+		var existingID sql.NullString
 		var vectorJSON []byte
-		var vectorLength int64
-		if err := rows.Scan(&existingID, &vectorLength, &vectorJSON); err != nil || !boundedRequiredBytes(vectorLength, vectorJSON, maxVectorBytes) {
+		var existingIDLength, vectorLength int64
+		if err := rows.Scan(&existingIDLength, &existingID, &vectorLength, &vectorJSON); err != nil ||
+			existingIDLength != maxUUIDBytes || !boundedRequiredText(existingIDLength, existingID, maxUUIDBytes) || validateUUID(existingID.String) != nil ||
+			!boundedRequiredBytes(vectorLength, vectorJSON, maxVectorBytes) {
 			return api.NewError("internal_error", true)
 		}
 		var entries []vectorEntry
@@ -544,10 +559,10 @@ func validateRecordCausality(ctx context.Context, transaction *sql.Tx, recordID,
 		if validateErr != nil {
 			return api.NewError("internal_error", true)
 		}
-		if vectorsEqual(candidate, vector) && existingID != revisionID {
+		if vectorsEqual(candidate, vector) && existingID.String != revisionID {
 			return api.NewError("revision_equivocation", false)
 		}
-		vectors = append(vectors, existingVector{id: existingID, vector: vector})
+		vectors = append(vectors, existingVector{id: existingID.String, vector: vector})
 	}
 	if err := rows.Err(); err != nil {
 		return api.NewError("internal_error", true)
@@ -584,16 +599,22 @@ func vectorsEqual(left, right map[string]uint64) bool {
 }
 
 func loadChanges(ctx context.Context, transaction *sql.Tx, afterCursor uint64) ([]change, uint64, bool, *api.Error) {
+	const maximumKindBytes = len("collection_marker")
 	after := EncodeUint64(afterCursor)
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT cursor, kind, received_at_ms,
-		       length(record_revision_id),
-		       CASE WHEN length(record_revision_id) = 36 THEN record_revision_id END,
-		       length(collection_marker_record_id),
-		       CASE WHEN length(collection_marker_record_id) = 36 THEN collection_marker_record_id END,
+		SELECT cursor, octet_length(kind),
+		       CASE WHEN typeof(kind) = 'text' AND octet_length(kind) BETWEEN 1 AND ?
+		                  AND kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed') THEN kind END,
+		       received_at_ms,
+		       octet_length(record_revision_id),
+		       CASE WHEN typeof(record_revision_id) = 'text'
+		                  AND octet_length(record_revision_id) = ? THEN record_revision_id END,
+		       octet_length(collection_marker_record_id),
+		       CASE WHEN typeof(collection_marker_record_id) = 'text'
+		                  AND octet_length(collection_marker_record_id) = ? THEN collection_marker_record_id END,
 		       length(collection_marker_json),
 		       CASE WHEN length(collection_marker_json) BETWEEN 1 AND ? THEN collection_marker_json END
-		FROM changes WHERE cursor > ? ORDER BY cursor LIMIT ?`, maxBodyBytes, after[:], maxChanges+1)
+		FROM changes WHERE cursor > ? ORDER BY cursor LIMIT ?`, maximumKindBytes, maxUUIDBytes, maxUUIDBytes, maxBodyBytes, after[:], maxChanges+1)
 	if err != nil {
 		return nil, 0, false, api.NewError("internal_error", true)
 	}
@@ -608,14 +629,20 @@ func loadChanges(ctx context.Context, transaction *sql.Tx, afterCursor uint64) (
 	stored := make([]storedChange, 0, maxChanges+1)
 	for rows.Next() {
 		var item storedChange
+		var kind sql.NullString
+		var kindLength int64
 		var revisionIDLength, markerIDLength, markerBodyLength sql.NullInt64
-		if err := rows.Scan(&item.cursorBytes, &item.kind, &item.receivedAt,
+		if err := rows.Scan(&item.cursorBytes, &kindLength, &kind, &item.receivedAt,
 			&revisionIDLength, &item.revisionID, &markerIDLength, &item.markerRecordID, &markerBodyLength, &item.markerBody); err != nil ||
+			!boundedRequiredText(kindLength, kind, maximumKindBytes) ||
 			!boundedOptionalText(revisionIDLength, item.revisionID, maxUUIDBytes) || revisionIDLength.Valid && revisionIDLength.Int64 != maxUUIDBytes ||
+			item.revisionID.Valid && validateUUID(item.revisionID.String) != nil ||
 			!boundedOptionalText(markerIDLength, item.markerRecordID, maxUUIDBytes) || markerIDLength.Valid && markerIDLength.Int64 != maxUUIDBytes ||
+			item.markerRecordID.Valid && validateUUID(item.markerRecordID.String) != nil ||
 			!boundedOptionalBytes(markerBodyLength, item.markerBody, maxBodyBytes) {
 			return nil, 0, false, api.NewError("internal_error", true)
 		}
+		item.kind = kind.String
 		stored = append(stored, item)
 	}
 	if err := rows.Err(); err != nil {

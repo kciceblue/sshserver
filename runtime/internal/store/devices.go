@@ -48,8 +48,8 @@ func readDevice(ctx context.Context, query interface {
 	var createdAt int64
 	var revokedAt, lastSyncAt sql.NullInt64
 	err := query.QueryRowContext(ctx, `
-		SELECT token_hash, length(scopes_json),
-		       CASE WHEN length(scopes_json) = ? THEN scopes_json END,
+		SELECT token_hash, octet_length(scopes_json),
+		       CASE WHEN typeof(scopes_json) = 'text' AND octet_length(scopes_json) = ? THEN scopes_json END,
 		       created_at_ms, revoked_at_ms,
 		       last_sync_at_ms, last_ack_cursor, max_author_counter
 		FROM devices WHERE device_id = ?`, len(wantScopes), deviceID,
@@ -57,7 +57,8 @@ func readDevice(ctx context.Context, query interface {
 	if errors.Is(err, sql.ErrNoRows) {
 		return device{}, [32]byte{}, api.NewError("device_not_found", false)
 	}
-	if err != nil || len(tokenBytes) != 32 || !boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) {
+	if err != nil || len(tokenBytes) != 32 || scopesLength != int64(len(wantScopes)) ||
+		!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) {
 		return device{}, [32]byte{}, api.NewError("internal_error", true)
 	}
 	var scopes []string
@@ -98,17 +99,22 @@ func (store *Store) handleListDevices(ctx context.Context, call api.Request) (ap
 	if _, protocolErr := store.authenticate(ctx, transaction, call.Authorization, "devices:read"); protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
-	rows, err := transaction.QueryContext(ctx, "SELECT device_id FROM devices ORDER BY device_id LIMIT 65")
+	rows, err := transaction.QueryContext(ctx, `
+		SELECT octet_length(device_id),
+		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END
+		FROM devices ORDER BY device_id LIMIT 65`, maxUUIDBytes)
 	if err != nil {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	var identifiers []string
 	for rows.Next() {
-		var identifier string
-		if err := rows.Scan(&identifier); err != nil {
+		var identifier sql.NullString
+		var identifierLength int64
+		if err := rows.Scan(&identifierLength, &identifier); err != nil || identifierLength != maxUUIDBytes ||
+			!boundedRequiredText(identifierLength, identifier, maxUUIDBytes) || validateUUID(identifier.String) != nil {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
-		identifiers = append(identifiers, identifier)
+		identifiers = append(identifiers, identifier.String)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -301,8 +307,10 @@ type retiredSelfRevocationReceipt struct {
 // the requested target nor a match position selects the comparison work.
 func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, transaction *sql.Tx, presentedToken []byte, tokenErr error, targetDeviceID string) (*retiredSelfRevocationReceipt, bool, *api.Error) {
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT device_id, pre_revocation_token_hash
-		FROM self_revocation_receipts ORDER BY device_id LIMIT 65`)
+		SELECT octet_length(device_id),
+		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
+		       pre_revocation_token_hash
+		FROM self_revocation_receipts ORDER BY device_id LIMIT 65`, maxUUIDBytes)
 	if err != nil {
 		return nil, false, api.NewError("internal_error", true)
 	}
@@ -318,12 +326,14 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 	matchCount := 0
 	for rows.Next() {
 		rowCount++
-		var deviceID string
+		var deviceID sql.NullString
+		var deviceIDLength int64
 		var storedBytes []byte
-		if rows.Scan(&deviceID, &storedBytes) != nil || validateUUID(deviceID) != nil || len(storedBytes) != 32 {
+		if rows.Scan(&deviceIDLength, &deviceID, &storedBytes) != nil || deviceIDLength != maxUUIDBytes ||
+			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil || len(storedBytes) != 32 {
 			return nil, false, api.NewError("internal_error", true)
 		}
-		computed, err := auth.DeviceTokenHash(store.identity.InstanceID, store.identity.VaultID, deviceID, tokenForHash)
+		computed, err := auth.DeviceTokenHash(store.identity.InstanceID, store.identity.VaultID, deviceID.String, tokenForHash)
 		if err != nil {
 			return nil, false, api.NewError("internal_error", true)
 		}
@@ -331,10 +341,10 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 		copy(stored[:], storedBytes)
 		matches := auth.VerifyHash(stored, computed)
 		if tokenErr == nil && matches {
-			matchedDeviceID = deviceID
+			matchedDeviceID = deviceID.String
 			matchCount++
 		}
-		if deviceID == targetDeviceID {
+		if deviceID.String == targetDeviceID {
 			targetHasReceipt = true
 		}
 	}
@@ -347,18 +357,23 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 	var receipt retiredSelfRevocationReceipt
 	receipt.deviceID = matchedDeviceID
 	var fingerprint, headersBody, body []byte
-	var headersLength, bodyLength int64
+	var requestID sql.NullString
+	var requestIDLength, headersLength, bodyLength int64
 	if err := transaction.QueryRowContext(ctx, `
-		SELECT request_id, body_fingerprint, response_status,
+		SELECT octet_length(request_id),
+		       CASE WHEN typeof(request_id) = 'text' AND octet_length(request_id) = ? THEN request_id END,
+		       body_fingerprint, response_status,
 		       length(response_headers_json),
 		       CASE WHEN length(response_headers_json) BETWEEN 1 AND ? THEN response_headers_json END,
 		       length(response_json),
 		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
-		FROM self_revocation_receipts WHERE device_id = ?`, maxBodyBytes, maxBodyBytes, matchedDeviceID,
-	).Scan(&receipt.requestID, &fingerprint, &receipt.status, &headersLength, &headersBody, &bodyLength, &body); err != nil || len(fingerprint) != 32 ||
+		FROM self_revocation_receipts WHERE device_id = ?`, maxUUIDBytes, maxBodyBytes, maxBodyBytes, matchedDeviceID,
+	).Scan(&requestIDLength, &requestID, &fingerprint, &receipt.status, &headersLength, &headersBody, &bodyLength, &body); err != nil ||
+		requestIDLength != maxUUIDBytes || !boundedRequiredText(requestIDLength, requestID, maxUUIDBytes) || validateUUID(requestID.String) != nil || len(fingerprint) != 32 ||
 		!boundedRequiredBytes(headersLength, headersBody, maxBodyBytes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
 		return nil, false, api.NewError("internal_error", true)
 	}
+	receipt.requestID = requestID.String
 	copy(receipt.fingerprint[:], fingerprint)
 	var responseDevice device
 	if json.Unmarshal(headersBody, &receipt.headers) != nil {
@@ -415,27 +430,30 @@ func (store *Store) handleTokenRotation(ctx context.Context, call api.Request) (
 	} else if authErr.Code == "token_revoked" {
 		return api.Response{}, authErr
 	}
-	var storedDeviceID string
+	var storedDeviceID sql.NullString
 	var oldHashBytes, newHashBytes, storedFingerprint, responseBody []byte
-	var responseLength int64
+	var storedDeviceIDLength, responseLength int64
 	err = transaction.QueryRowContext(ctx, `
-		SELECT device_id, old_token_hash, new_token_hash, request_fingerprint,
+		SELECT octet_length(device_id),
+		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
+		       old_token_hash, new_token_hash, request_fingerprint,
 		       length(response_json),
 		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
-		FROM token_rotations WHERE rotation_id = ?`, maxBodyBytes, request.RotationID,
-	).Scan(&storedDeviceID, &oldHashBytes, &newHashBytes, &storedFingerprint, &responseLength, &responseBody)
+		FROM token_rotations WHERE rotation_id = ?`, maxUUIDBytes, maxBodyBytes, request.RotationID,
+	).Scan(&storedDeviceIDLength, &storedDeviceID, &oldHashBytes, &newHashBytes, &storedFingerprint, &responseLength, &responseBody)
 	if err == nil {
 		var storedResponse device
-		if len(oldHashBytes) != 32 || len(newHashBytes) != 32 || len(storedFingerprint) != 32 ||
+		if storedDeviceIDLength != maxUUIDBytes || !boundedRequiredText(storedDeviceIDLength, storedDeviceID, maxUUIDBytes) || validateUUID(storedDeviceID.String) != nil ||
+			len(oldHashBytes) != 32 || len(newHashBytes) != 32 || len(storedFingerprint) != 32 ||
 			!boundedRequiredBytes(responseLength, responseBody, maxBodyBytes) ||
-			decodeStoredCanonical(responseBody, &storedResponse) != nil || validateDevice(storedResponse) != nil || storedResponse.DeviceID != storedDeviceID {
+			decodeStoredCanonical(responseBody, &storedResponse) != nil || validateDevice(storedResponse) != nil || storedResponse.DeviceID != storedDeviceID.String {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		var oldHash, recordedNewHash, recordedFingerprint [32]byte
 		copy(oldHash[:], oldHashBytes)
 		copy(recordedNewHash[:], newHashBytes)
 		copy(recordedFingerprint[:], storedFingerprint)
-		presentedStoredHash, hashErr := auth.DeviceTokenHash(store.identity.InstanceID, store.identity.VaultID, storedDeviceID, presentedToken)
+		presentedStoredHash, hashErr := auth.DeviceTokenHash(store.identity.InstanceID, store.identity.VaultID, storedDeviceID.String, presentedToken)
 		if hashErr != nil {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
@@ -446,13 +464,13 @@ func (store *Store) handleTokenRotation(ctx context.Context, call api.Request) (
 			return api.Response{}, api.NewError("unauthorized", false)
 		}
 		var revoked bool
-		if err := transaction.QueryRowContext(ctx, "SELECT revoked_at_ms IS NOT NULL FROM devices WHERE device_id = ?", storedDeviceID).Scan(&revoked); err != nil {
+		if err := transaction.QueryRowContext(ctx, "SELECT revoked_at_ms IS NOT NULL FROM devices WHERE device_id = ?", storedDeviceID.String).Scan(&revoked); err != nil {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		if revoked {
 			return api.Response{}, api.NewError("token_revoked", false)
 		}
-		if storedDeviceID != request.DeviceID {
+		if storedDeviceID.String != request.DeviceID {
 			return api.Response{}, api.NewError("authenticated_device_mismatch", false)
 		}
 		if !auth.VerifyHash(recordedNewHash, newHash) || !auth.VerifyHash(recordedFingerprint, fingerprint) {

@@ -76,18 +76,23 @@ func (store *Store) StartBoot(ctx context.Context) error {
 	// Snapshot leases are defined in daemon-monotonic time. A restart cannot
 	// safely reconstruct that clock, so prior leases fail closed and release
 	// their immutable metadata references.
-	rows, err := transaction.QueryContext(ctx, "SELECT snapshot_id FROM snapshots ORDER BY snapshot_id LIMIT 9")
+	rows, err := transaction.QueryContext(ctx, `
+		SELECT octet_length(snapshot_id),
+		       CASE WHEN typeof(snapshot_id) = 'text' AND octet_length(snapshot_id) = ? THEN snapshot_id END
+		FROM snapshots ORDER BY snapshot_id LIMIT 9`, maxUUIDBytes)
 	if err != nil {
 		return fmt.Errorf("read prior snapshot leases: %w", err)
 	}
 	var snapshotIDs []string
 	for rows.Next() {
-		var snapshotID string
-		if rows.Scan(&snapshotID) != nil {
+		var snapshotID sql.NullString
+		var snapshotIDLength int64
+		if rows.Scan(&snapshotIDLength, &snapshotID) != nil || snapshotIDLength != maxUUIDBytes ||
+			!boundedRequiredText(snapshotIDLength, snapshotID, maxUUIDBytes) || validateUUID(snapshotID.String) != nil {
 			rows.Close()
 			return errors.New("read prior snapshot lease")
 		}
-		snapshotIDs = append(snapshotIDs, snapshotID)
+		snapshotIDs = append(snapshotIDs, snapshotID.String)
 	}
 	if rows.Err() != nil || rows.Close() != nil || len(snapshotIDs) > 8 {
 		return errors.New("invalid prior snapshot leases")
@@ -247,10 +252,12 @@ func (store *Store) authenticate(ctx context.Context, transaction *sql.Tx, autho
 	defer clear(token)
 	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT device_id, token_hash, length(scopes_json),
-		       CASE WHEN length(scopes_json) = ? THEN scopes_json END,
+		SELECT octet_length(device_id),
+		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
+		       token_hash, octet_length(scopes_json),
+		       CASE WHEN typeof(scopes_json) = 'text' AND octet_length(scopes_json) = ? THEN scopes_json END,
 		       revoked_at_ms IS NOT NULL
-		FROM devices ORDER BY device_id LIMIT 65`, len(wantScopes))
+		FROM devices ORDER BY device_id LIMIT 65`, maxUUIDBytes, len(wantScopes))
 	if err != nil {
 		return deviceAuth{}, api.NewError("internal_error", true)
 	}
@@ -259,16 +266,18 @@ func (store *Store) authenticate(ctx context.Context, transaction *sql.Tx, autho
 	rowCount := 0
 	for rows.Next() {
 		rowCount++
-		var deviceID string
+		var deviceID sql.NullString
 		var scopesJSON sql.NullString
-		var scopesLength int64
+		var deviceIDLength, scopesLength int64
 		var storedBytes []byte
 		var revoked bool
-		if err := rows.Scan(&deviceID, &storedBytes, &scopesLength, &scopesJSON, &revoked); err != nil || len(storedBytes) != 32 ||
+		if err := rows.Scan(&deviceIDLength, &deviceID, &storedBytes, &scopesLength, &scopesJSON, &revoked); err != nil ||
+			deviceIDLength != maxUUIDBytes || !boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil || len(storedBytes) != 32 ||
+			scopesLength != int64(len(wantScopes)) ||
 			!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) {
 			return deviceAuth{}, api.NewError("internal_error", true)
 		}
-		computed, err := auth.DeviceTokenHash(store.identity.InstanceID, store.identity.VaultID, deviceID, token)
+		computed, err := auth.DeviceTokenHash(store.identity.InstanceID, store.identity.VaultID, deviceID.String, token)
 		if err != nil {
 			return deviceAuth{}, api.NewError("internal_error", true)
 		}
@@ -279,7 +288,7 @@ func (store *Store) authenticate(ctx context.Context, transaction *sql.Tx, autho
 			if json.Unmarshal([]byte(scopesJSON.String), &scopes) != nil || auth.ValidateScopes(scopes) != nil {
 				return deviceAuth{}, api.NewError("internal_error", true)
 			}
-			candidate := deviceAuth{DeviceID: deviceID, Hash: stored, Scopes: scopes, Revoked: revoked}
+			candidate := deviceAuth{DeviceID: deviceID.String, Hash: stored, Scopes: scopes, Revoked: revoked}
 			match = &candidate
 		}
 	}
