@@ -151,7 +151,7 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 		return api.Response{}, protocolErr
 	}
 	defer transaction.Rollback()
-	retiredMatch, targetHasRetiredReceipt, protocolErr := store.lookupRetiredSelfRevocationReceipt(ctx, transaction, presentedToken, tokenErr, targetDeviceID)
+	retiredMatch, protocolErr := store.lookupRetiredSelfRevocationReceipt(ctx, transaction, presentedToken, tokenErr)
 	if protocolErr != nil {
 		return api.Response{}, protocolErr
 	}
@@ -173,9 +173,6 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 		if retiredMatch.requestID == call.RequestID && auth.VerifyHash(retiredMatch.fingerprint, selfFingerprint) {
 			return api.Response{Status: retiredMatch.status, Body: retiredMatch.body, Headers: retiredMatch.headers}, nil
 		}
-		return api.Response{}, api.NewError("token_revoked", false)
-	}
-	if targetHasRetiredReceipt {
 		return api.Response{}, api.NewError("token_revoked", false)
 	}
 	var request revokeDeviceRequest
@@ -317,14 +314,14 @@ type retiredSelfRevocationReceipt struct {
 // receipt token hashes before any ordinary device authentication. Hashes are
 // derived and compared for every retained row, even after a match, so neither
 // the requested target nor a match position selects the comparison work.
-func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, transaction *sql.Tx, presentedToken []byte, tokenErr error, targetDeviceID string) (*retiredSelfRevocationReceipt, bool, *api.Error) {
+func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, transaction *sql.Tx, presentedToken []byte, tokenErr error) (*retiredSelfRevocationReceipt, *api.Error) {
 	rows, err := transaction.QueryContext(ctx, `
 		SELECT octet_length(device_id),
 		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
 		       pre_revocation_token_hash
 		FROM self_revocation_receipts ORDER BY device_id LIMIT 65`, maxUUIDBytes)
 	if err != nil {
-		return nil, false, api.NewError("internal_error", true)
+		return nil, api.NewError("internal_error", true)
 	}
 	defer rows.Close()
 	tokenForHash := presentedToken
@@ -333,7 +330,6 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 		defer clear(tokenForHash)
 	}
 	var matchedDeviceID string
-	targetHasReceipt := false
 	rowCount := 0
 	matchCount := 0
 	for rows.Next() {
@@ -343,11 +339,11 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 		var storedBytes []byte
 		if rows.Scan(&deviceIDLength, &deviceID, &storedBytes) != nil || deviceIDLength != maxUUIDBytes ||
 			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil || len(storedBytes) != 32 {
-			return nil, false, api.NewError("internal_error", true)
+			return nil, api.NewError("internal_error", true)
 		}
 		computed, err := auth.DeviceTokenHash(store.identity.InstanceID, store.identity.VaultID, deviceID.String, tokenForHash)
 		if err != nil {
-			return nil, false, api.NewError("internal_error", true)
+			return nil, api.NewError("internal_error", true)
 		}
 		var stored [32]byte
 		copy(stored[:], storedBytes)
@@ -356,15 +352,12 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 			matchedDeviceID = deviceID.String
 			matchCount++
 		}
-		if deviceID.String == targetDeviceID {
-			targetHasReceipt = true
-		}
 	}
 	if rows.Err() != nil || rows.Close() != nil || rowCount > 64 || matchCount > 1 {
-		return nil, false, api.NewError("internal_error", true)
+		return nil, api.NewError("internal_error", true)
 	}
 	if matchCount == 0 {
-		return nil, targetHasReceipt, nil
+		return nil, nil
 	}
 	var receipt retiredSelfRevocationReceipt
 	receipt.deviceID = matchedDeviceID
@@ -383,23 +376,23 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 	).Scan(&requestIDLength, &requestID, &fingerprint, &receipt.status, &headersLength, &headersBody, &bodyLength, &body); err != nil ||
 		requestIDLength != maxUUIDBytes || !boundedRequiredText(requestIDLength, requestID, maxUUIDBytes) || validateUUID(requestID.String) != nil || len(fingerprint) != 32 ||
 		!boundedRequiredBytes(headersLength, headersBody, maxBodyBytes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
-		return nil, false, api.NewError("internal_error", true)
+		return nil, api.NewError("internal_error", true)
 	}
 	receipt.requestID = requestID.String
 	copy(receipt.fingerprint[:], fingerprint)
 	var responseDevice device
 	if json.Unmarshal(headersBody, &receipt.headers) != nil {
-		return nil, false, api.NewError("internal_error", true)
+		return nil, api.NewError("internal_error", true)
 	}
 	canonicalHeaders, headersErr := json.Marshal(receipt.headers)
 	if headersErr != nil || !bytes.Equal(canonicalHeaders, headersBody) || receipt.status != http.StatusOK ||
 		!slices.Equal(receipt.headers, api.V1ResponseHeaders(receipt.requestID, len(body))) ||
 		decodeStoredCanonical(body, &responseDevice) != nil || validateDevice(responseDevice) != nil ||
 		responseDevice.DeviceID != matchedDeviceID || responseDevice.Status != "revoked" {
-		return nil, false, api.NewError("internal_error", true)
+		return nil, api.NewError("internal_error", true)
 	}
 	receipt.body = append([]byte(nil), body...)
-	return &receipt, targetHasReceipt, nil
+	return &receipt, nil
 }
 
 const tokenRotationKeyProbeSQL = `

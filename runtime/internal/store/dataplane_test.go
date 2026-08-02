@@ -309,7 +309,7 @@ func TestEnvelopeSyncSnapshotRevocationAndRotationFixtures(t *testing.T) {
 	}
 	selfCall.RequestID = selfRequestID
 	selfCall.Authorization = "Bearer invalid"
-	if _, protocolErr := opened.HandleAPI(context.Background(), selfCall); protocolErr == nil || protocolErr.Code != "token_revoked" {
+	if _, protocolErr := opened.HandleAPI(context.Background(), selfCall); protocolErr == nil || protocolErr.Code != "unauthorized" {
 		t.Fatalf("self-revocation token mismatch error = %v", protocolErr)
 	}
 }
