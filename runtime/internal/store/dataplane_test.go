@@ -831,6 +831,34 @@ func TestEnrollmentGrantAndAPIConcurrencyDoesNotInvertLocks(t *testing.T) {
 	}
 }
 
+func TestEnrollmentGrantIssuancePrunesExpiredRetention(t *testing.T) {
+	opened, _ := openDataPlane(t)
+	defer opened.Close()
+	issuedAt := time.Now()
+	for index := 0; index < 8; index++ {
+		grant, err := opened.CreateEnrollmentGrant(context.Background(), issuedAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clear(grant.Grant)
+		issuedAt = issuedAt.Add(enrollmentGrantLifetime)
+	}
+
+	var durableCount int
+	if err := opened.db.QueryRow("SELECT count(*) FROM enrollment_grants").Scan(&durableCount); err != nil {
+		t.Fatal(err)
+	}
+	opened.ephemeral.mu.Lock()
+	deadlineCount := len(opened.ephemeral.grantDeadlines)
+	opened.ephemeral.mu.Unlock()
+	if durableCount != 1 {
+		t.Errorf("durable enrollment grant count=%d, want 1", durableCount)
+	}
+	if deadlineCount != 1 {
+		t.Errorf("in-memory enrollment grant deadline count=%d, want 1", deadlineCount)
+	}
+}
+
 func TestSelfRevocationReceiptReplaysIdenticalRawHTTP(t *testing.T) {
 	opened, _ := openDataPlane(t)
 	defer opened.Close()

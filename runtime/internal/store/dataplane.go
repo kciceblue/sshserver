@@ -115,13 +115,18 @@ func (store *Store) StartBoot(ctx context.Context) error {
 // CreateEnrollmentGrant creates one daemon-generation-bound five-minute
 // credential and persists only its domain-separated hash.
 func (store *Store) CreateEnrollmentGrant(ctx context.Context, now time.Time) (EnrollmentGrant, error) {
-	now = now.UTC()
 	store.ephemeral.mu.Lock()
 	if !store.ephemeral.booted {
 		store.ephemeral.mu.Unlock()
 		return EnrollmentGrant{}, errors.New("server daemon is not running")
 	}
 	bootID := store.ephemeral.bootID
+	expiredHashes := make([][32]byte, 0)
+	for _, candidate := range store.ephemeral.grantDeadlines {
+		if !now.Before(candidate.deadline) {
+			expiredHashes = append(expiredHashes, candidate.hash)
+		}
+	}
 	store.ephemeral.mu.Unlock()
 	grant := make([]byte, 32)
 	if _, err := rand.Read(grant); err != nil {
@@ -132,16 +137,44 @@ func (store *Store) CreateEnrollmentGrant(ctx context.Context, now time.Time) (E
 		clear(grant)
 		return EnrollmentGrant{}, err
 	}
-	expiresAt := now.Add(enrollmentGrantLifetime)
-	if _, err := store.db.ExecContext(ctx, `
+	deadline := now.Add(enrollmentGrantLifetime)
+	expiresAt := deadline.UTC()
+	transaction, err := store.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		clear(grant)
+		return EnrollmentGrant{}, fmt.Errorf("begin enrollment grant persistence: %w", err)
+	}
+	defer transaction.Rollback()
+	for _, expiredHash := range expiredHashes {
+		if _, err := transaction.ExecContext(ctx, "DELETE FROM enrollment_grants WHERE grant_hash = ? AND boot_id = ?", expiredHash[:], bootID[:]); err != nil {
+			clear(grant)
+			return EnrollmentGrant{}, fmt.Errorf("prune expired enrollment grant hashes: %w", err)
+		}
+	}
+	if _, err := transaction.ExecContext(ctx, `
 		INSERT INTO enrollment_grants (grant_hash, boot_id, expires_at_ms, consumed_enrollment_id)
 		VALUES (?, ?, ?, NULL)`, hash[:], bootID[:], expiresAt.UnixMilli()); err != nil {
 		clear(grant)
 		return EnrollmentGrant{}, fmt.Errorf("persist enrollment grant hash: %w", err)
 	}
+	if err := transaction.Commit(); err != nil {
+		clear(grant)
+		return EnrollmentGrant{}, fmt.Errorf("commit enrollment grant persistence: %w", err)
+	}
+	expired := make(map[[32]byte]struct{}, len(expiredHashes))
+	for _, expiredHash := range expiredHashes {
+		expired[expiredHash] = struct{}{}
+	}
 	store.ephemeral.mu.Lock()
+	retained := store.ephemeral.grantDeadlines[:0]
+	for _, candidate := range store.ephemeral.grantDeadlines {
+		if _, remove := expired[candidate.hash]; !remove {
+			retained = append(retained, candidate)
+		}
+	}
+	store.ephemeral.grantDeadlines = retained
 	store.ephemeral.grantDeadlines = append(store.ephemeral.grantDeadlines, grantDeadline{
-		hash: hash, deadline: now.Add(enrollmentGrantLifetime),
+		hash: hash, deadline: deadline,
 	})
 	store.ephemeral.mu.Unlock()
 	return EnrollmentGrant{Grant: grant, ExpiresAt: expiresAt}, nil
