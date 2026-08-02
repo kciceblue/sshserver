@@ -159,7 +159,7 @@ func TestNullableChangeIdentifierScansBoundBeforeLoading(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := validatePersistentChanges(context.Background(), seed.opened.db, devices, 3); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid change row") {
+	if err := validatePersistentChanges(context.Background(), seed.opened.db, devices, 3); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid change row") {
 		t.Fatalf("oversized nullable change identifier error=%v", err)
 	}
 }

@@ -30,11 +30,6 @@ type validatedDeviceRow struct {
 	maxReturned     uint64
 }
 
-type validatedMarkerChange struct {
-	cursor uint64
-	body   []byte
-}
-
 func invalidPersistentState(detail string) error {
 	return fmt.Errorf("%w: %s", ErrUnexpectedSchema, detail)
 }
@@ -78,11 +73,10 @@ func validatePersistentState(ctx context.Context, query schemaQueryer, identity 
 	if err := validatePersistentCollectionQueues(ctx, query, serverCursor); err != nil {
 		return err
 	}
-	latestMarkerChanges, err := validatePersistentChanges(ctx, query, devices, serverCursor)
-	if err != nil {
+	if err := validatePersistentChanges(ctx, query, devices, serverCursor); err != nil {
 		return err
 	}
-	if err := validatePersistentMarkers(ctx, query, devices, serverCursor, latestMarkerChanges); err != nil {
+	if err := validatePersistentMarkers(ctx, query, devices, serverCursor); err != nil {
 		return err
 	}
 	if err := validatePersistentReceipts(ctx, query, identity, devices); err != nil {
@@ -1260,7 +1254,7 @@ func decodeUint64Error(value []byte) error {
 	return err
 }
 
-func validatePersistentMarkers(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor uint64, latestChanges map[string]validatedMarkerChange) error {
+func validatePersistentMarkers(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor uint64) error {
 	rows, err := query.QueryContext(ctx, `
 		SELECT octet_length(m.record_id),
 		       CASE WHEN typeof(m.record_id) = 'text'
@@ -1280,34 +1274,45 @@ func validatePersistentMarkers(ctx context.Context, query schemaQueryer, devices
 		       length(r.vector_json),
 		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
 		       length(r.collection_witness_authenticator),
-		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END
+		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
+		       CASE WHEN typeof(c.kind) = 'text'
+		                  AND c.kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed') THEN c.kind END,
+		       octet_length(c.collection_marker_record_id),
+		       CASE WHEN typeof(c.collection_marker_record_id) = 'text'
+		                  AND octet_length(c.collection_marker_record_id) = ? THEN c.collection_marker_record_id END,
+		       length(c.collection_marker_json),
+		       CASE WHEN typeof(c.collection_marker_json) = 'blob'
+		                  AND length(c.collection_marker_json) BETWEEN 1 AND ? THEN c.collection_marker_json END
 		FROM collection_markers m
 		LEFT JOIN record_revisions r ON r.revision_id = m.witness_revision_id
-		ORDER BY m.record_id`, maxUUIDBytes, maxUUIDBytes, maxVectorBytes, maxBodyBytes, maxUUIDBytes, maxVectorBytes)
+		LEFT JOIN changes c ON c.cursor = m.change_cursor
+		ORDER BY m.record_id`, maxUUIDBytes, maxUUIDBytes, maxVectorBytes, maxBodyBytes, maxUUIDBytes, maxVectorBytes, maxUUIDBytes, maxBodyBytes)
 	if err != nil {
 		return invalidPersistentState("read marker rows")
 	}
 	defer rows.Close()
-	seen := make(map[string]struct{}, len(latestChanges))
 	for rows.Next() {
-		var recordID, witnessID sql.NullString
-		var frontierBody, authenticator, barrierBytes, body, changeBytes []byte
+		var recordID, witnessID, changeKind, changeRecordID sql.NullString
+		var frontierBody, authenticator, barrierBytes, body, changeBytes, changeMarkerBody []byte
 		var witnessRecordID sql.NullString
 		var witnessVector, witnessAuthenticator []byte
 		var recordIDLength, witnessIDLength, frontierLength, bodyLength int64
 		var witnessRecordIDLength, witnessVectorLength, witnessAuthenticatorLength sql.NullInt64
+		var changeRecordIDLength, changeMarkerBodyLength sql.NullInt64
 		var receivedAt int64
 		if rows.Scan(&recordIDLength, &recordID, &witnessIDLength, &witnessID, &frontierLength, &frontierBody, &authenticator, &barrierBytes, &bodyLength, &body, &changeBytes, &receivedAt,
-			&witnessRecordIDLength, &witnessRecordID, &witnessVectorLength, &witnessVector, &witnessAuthenticatorLength, &witnessAuthenticator) != nil ||
+			&witnessRecordIDLength, &witnessRecordID, &witnessVectorLength, &witnessVector, &witnessAuthenticatorLength, &witnessAuthenticator,
+			&changeKind, &changeRecordIDLength, &changeRecordID, &changeMarkerBodyLength, &changeMarkerBody) != nil ||
 			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
 			!boundedRequiredText(witnessIDLength, witnessID, maxUUIDBytes) || witnessIDLength != maxUUIDBytes || validateUUID(witnessID.String) != nil ||
 			!boundedOptionalText(witnessRecordIDLength, witnessRecordID, maxUUIDBytes) || !witnessRecordIDLength.Valid || validateUUID(witnessRecordID.String) != nil ||
 			!boundedRequiredBytes(frontierLength, frontierBody, maxVectorBytes) || len(authenticator) != 32 ||
 			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) || !boundedOptionalBytes(witnessVectorLength, witnessVector, maxVectorBytes) ||
-			!boundedOptionalBytes(witnessAuthenticatorLength, witnessAuthenticator, 32) || witnessAuthenticatorLength.Valid && witnessAuthenticatorLength.Int64 != 32 {
+			!boundedOptionalBytes(witnessAuthenticatorLength, witnessAuthenticator, 32) || witnessAuthenticatorLength.Valid && witnessAuthenticatorLength.Int64 != 32 ||
+			!boundedOptionalText(changeRecordIDLength, changeRecordID, maxUUIDBytes) || changeRecordIDLength.Valid && changeRecordIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalBytes(changeMarkerBodyLength, changeMarkerBody, maxBodyBytes) {
 			return invalidPersistentState("invalid marker row")
 		}
-		latestChange, hasLatestChange := latestChanges[recordID.String]
 		marker, err := decodeStoredCollectionMarker(body)
 		barrier, barrierErr := DecodeUint64(barrierBytes)
 		changeCursor, changeErr := DecodeUint64(changeBytes)
@@ -1317,10 +1322,10 @@ func validatePersistentMarkers(ctx context.Context, query schemaQueryer, devices
 			!bytes.Equal(canonicalFrontier, frontierBody) || !bytes.Equal(decodedAuthenticator, authenticator) || marker.BarrierCursor != encodeUint64Text(barrier) ||
 			barrier >= changeCursor || changeCursor > serverCursor || validateTimestamp(formatTimestamp(receivedAt)) != nil ||
 			witnessRecordID.String != recordID.String || !bytes.Equal(witnessVector, frontierBody) || !bytes.Equal(witnessAuthenticator, authenticator) ||
-			!hasLatestChange || latestChange.cursor != changeCursor || !bytes.Equal(latestChange.body, body) {
+			!changeKind.Valid || changeKind.String != "collection_marker" || !changeRecordID.Valid || changeRecordID.String != recordID.String ||
+			!bytes.Equal(changeMarkerBody, body) {
 			return invalidPersistentState("inconsistent marker row")
 		}
-		seen[recordID.String] = struct{}{}
 		frontier, _, _, _ := validateCollectionMarker(marker)
 		for deviceID, counter := range frontier {
 			deviceRow, exists := devices[deviceID]
@@ -1331,9 +1336,6 @@ func validatePersistentMarkers(ctx context.Context, query schemaQueryer, devices
 	}
 	if rows.Err() != nil {
 		return invalidPersistentState("read marker rows")
-	}
-	if len(seen) != len(latestChanges) {
-		return invalidPersistentState("marker change has no current marker")
 	}
 	return nil
 }
@@ -1374,16 +1376,7 @@ func validatePersistentEnrollmentGrants(ctx context.Context, query schemaQueryer
 	return nil
 }
 
-func validatePersistentChanges(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor uint64) (map[string]validatedMarkerChange, error) {
-	var floorBytes []byte
-	if query.QueryRowContext(ctx, "SELECT cursor_floor FROM runtime_state WHERE singleton = 1").Scan(&floorBytes) != nil {
-		return nil, invalidPersistentState("read cursor floor")
-	}
-	floor, err := DecodeUint64(floorBytes)
-	if err != nil || floor > serverCursor {
-		return nil, invalidPersistentState("invalid cursor floor")
-	}
-	rows, err := query.QueryContext(ctx, `
+const persistentChangesValidationQuery = `
 		SELECT c.cursor,
 		       CASE WHEN typeof(c.kind) = 'text'
 		                  AND c.kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed') THEN c.kind END,
@@ -1404,28 +1397,51 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, devices
 		                  AND c.device_change_kind IN ('enrolled', 'revoked') THEN c.device_change_kind END,
 		       r.retained,
 		       CASE WHEN typeof(p.kind) = 'text'
-		                  AND p.kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed') THEN p.kind END
+		                  AND p.kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed') THEN p.kind END,
+		       CASE WHEN m.record_id IS NULL THEN 0 ELSE 1 END,
+		       octet_length(m.change_cursor),
+		       CASE WHEN typeof(m.change_cursor) = 'blob'
+		                  AND octet_length(m.change_cursor) = 8 THEN m.change_cursor END,
+		       CASE WHEN m.record_id IS NULL THEN 0
+		            WHEN m.change_cursor = c.cursor THEN
+		                 CASE WHEN typeof(m.marker_json) = 'blob' AND length(m.marker_json) BETWEEN 1 AND ?
+		                            AND m.marker_json = c.collection_marker_json THEN 1 ELSE -1 END
+		            ELSE 0 END
 		FROM changes c LEFT JOIN record_revisions r
 		  ON r.revision_id = c.record_revision_id
 		LEFT JOIN change_origins p ON p.cursor = c.cursor
-		ORDER BY c.cursor`, maxUUIDBytes, maxUUIDBytes, maxBodyBytes, maxUUIDBytes)
+		LEFT JOIN collection_markers m ON m.record_id = c.collection_marker_record_id
+		ORDER BY c.cursor`
+
+func validatePersistentChanges(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor uint64) error {
+	var floorBytes []byte
+	if query.QueryRowContext(ctx, "SELECT cursor_floor FROM runtime_state WHERE singleton = 1").Scan(&floorBytes) != nil {
+		return invalidPersistentState("read cursor floor")
+	}
+	floor, err := DecodeUint64(floorBytes)
+	if err != nil || floor > serverCursor {
+		return invalidPersistentState("invalid cursor floor")
+	}
+	rows, err := query.QueryContext(ctx, persistentChangesValidationQuery,
+		maxUUIDBytes, maxUUIDBytes, maxBodyBytes, maxUUIDBytes, maxBodyBytes)
 	if err != nil {
-		return nil, invalidPersistentState("read change rows")
+		return invalidPersistentState("read change rows")
 	}
 	defer rows.Close()
 	previous := uint64(0)
 	retainedCursor := floor
-	latestMarkerChanges := make(map[string]validatedMarkerChange)
 	enrollmentChanges := make(map[string]struct{}, len(devices))
 	revocationChanges := make(map[string]uint64, len(devices))
 	for rows.Next() {
-		var cursorBytes, markerBody []byte
+		var cursorBytes, markerBody, currentMarkerCursorBytes []byte
 		var kind sql.NullString
 		var receivedAt int64
 		var revisionID, markerID, changedDeviceID, deviceChangeKind sql.NullString
 		var revisionIDLength, markerIDLength, markerBodyLength, changedDeviceIDLength, deviceChangeKindLength sql.NullInt64
+		var currentMarkerCursorLength sql.NullInt64
 		var revisionRetained sql.NullInt64
 		var originKind sql.NullString
+		var currentMarkerState, currentMarkerBodyState int
 		if rows.Scan(
 			&cursorBytes, &kind, &receivedAt,
 			&revisionIDLength, &revisionID, &markerIDLength, &markerID,
@@ -1433,95 +1449,101 @@ func validatePersistentChanges(ctx context.Context, query schemaQueryer, devices
 			&changedDeviceIDLength, &changedDeviceID,
 			&deviceChangeKindLength, &deviceChangeKind,
 			&revisionRetained, &originKind,
+			&currentMarkerState, &currentMarkerCursorLength, &currentMarkerCursorBytes, &currentMarkerBodyState,
 		) != nil ||
 			!boundedOptionalText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength.Valid && revisionIDLength.Int64 != maxUUIDBytes ||
 			!boundedOptionalText(markerIDLength, markerID, maxUUIDBytes) || markerIDLength.Valid && markerIDLength.Int64 != maxUUIDBytes ||
 			!boundedOptionalBytes(markerBodyLength, markerBody, maxBodyBytes) ||
 			!boundedOptionalText(changedDeviceIDLength, changedDeviceID, maxUUIDBytes) || changedDeviceIDLength.Valid && changedDeviceIDLength.Int64 != maxUUIDBytes ||
-			!boundedOptionalText(deviceChangeKindLength, deviceChangeKind, 8) {
-			return nil, invalidPersistentState("invalid change row")
+			!boundedOptionalText(deviceChangeKindLength, deviceChangeKind, 8) ||
+			currentMarkerState < 0 || currentMarkerState > 1 ||
+			!boundedOptionalBytes(currentMarkerCursorLength, currentMarkerCursorBytes, 8) || currentMarkerCursorLength.Valid && currentMarkerCursorLength.Int64 != 8 ||
+			currentMarkerBodyState < -1 || currentMarkerBodyState > 1 {
+			return invalidPersistentState("invalid change row")
 		}
 		if !kind.Valid || !originKind.Valid || originKind.String != kind.String {
-			return nil, invalidPersistentState("change row does not match durable origin")
+			return invalidPersistentState("change row does not match durable origin")
 		}
 		cursor, err := DecodeUint64(cursorBytes)
 		if err != nil || cursor == 0 || cursor <= previous || cursor > serverCursor || validateTimestamp(formatTimestamp(receivedAt)) != nil {
-			return nil, invalidPersistentState("invalid change cursor")
+			return invalidPersistentState("invalid change cursor")
 		}
 		if cursor > floor {
 			if retainedCursor == math.MaxUint64 || cursor != retainedCursor+1 {
-				return nil, invalidPersistentState("retained change cursor gap")
+				return invalidPersistentState("retained change cursor gap")
 			}
 			retainedCursor = cursor
 		}
 		switch kind.String {
 		case "record_revision":
 			if !revisionID.Valid || markerID.Valid || markerBody != nil || changedDeviceID.Valid || deviceChangeKind.Valid || validateUUID(revisionID.String) != nil {
-				return nil, invalidPersistentState("invalid revision change")
+				return invalidPersistentState("invalid revision change")
 			}
 			if !revisionRetained.Valid || revisionRetained.Int64 != 1 {
-				return nil, invalidPersistentState("orphan revision change")
+				return invalidPersistentState("orphan revision change")
 			}
 		case "collection_marker":
 			marker, markerErr := decodeStoredCollectionMarker(markerBody)
-			if revisionID.Valid || !markerID.Valid || changedDeviceID.Valid || deviceChangeKind.Valid || markerErr != nil || marker.RecordID != markerID.String {
-				return nil, invalidPersistentState("invalid marker change")
+			currentMarkerCursor, currentMarkerCursorErr := DecodeUint64(currentMarkerCursorBytes)
+			if revisionID.Valid || !markerID.Valid || changedDeviceID.Valid || deviceChangeKind.Valid || markerErr != nil || marker.RecordID != markerID.String ||
+				currentMarkerState != 1 || !currentMarkerCursorLength.Valid || currentMarkerCursorErr != nil || currentMarkerCursor < cursor ||
+				currentMarkerBodyState != boolToInt(currentMarkerCursor == cursor) {
+				return invalidPersistentState("invalid marker change")
 			}
-			latestMarkerChanges[markerID.String] = validatedMarkerChange{cursor: cursor, body: append([]byte(nil), markerBody...)}
 		case "envelope_changed":
 			if revisionID.Valid || markerID.Valid || markerBody != nil || changedDeviceID.Valid || deviceChangeKind.Valid {
-				return nil, invalidPersistentState("invalid metadata change")
+				return invalidPersistentState("invalid metadata change")
 			}
 		case "device_changed":
 			device, exists := devices[changedDeviceID.String]
 			if revisionID.Valid || markerID.Valid || markerBody != nil || !changedDeviceID.Valid || !deviceChangeKind.Valid ||
 				validateUUID(changedDeviceID.String) != nil || !exists {
-				return nil, invalidPersistentState("invalid device change")
+				return invalidPersistentState("invalid device change")
 			}
 			switch deviceChangeKind.String {
 			case "enrolled":
 				if cursor != device.createdCursor || receivedAt != device.createdAt {
-					return nil, invalidPersistentState("device enrollment history mismatch")
+					return invalidPersistentState("device enrollment history mismatch")
 				}
 				if _, duplicate := enrollmentChanges[changedDeviceID.String]; duplicate {
-					return nil, invalidPersistentState("duplicate device enrollment change")
+					return invalidPersistentState("duplicate device enrollment change")
 				}
 				enrollmentChanges[changedDeviceID.String] = struct{}{}
 			case "revoked":
 				if !device.revoked || receivedAt != device.revokedAt || cursor <= device.createdCursor ||
 					!device.baselineRevoked && cursor != device.revokedCursor {
-					return nil, invalidPersistentState("device revocation history mismatch")
+					return invalidPersistentState("device revocation history mismatch")
 				}
 				if _, duplicate := revocationChanges[changedDeviceID.String]; duplicate {
-					return nil, invalidPersistentState("duplicate device revocation change")
+					return invalidPersistentState("duplicate device revocation change")
 				}
 				revocationChanges[changedDeviceID.String] = cursor
 			default:
-				return nil, invalidPersistentState("invalid device change kind")
+				return invalidPersistentState("invalid device change kind")
 			}
 		default:
-			return nil, invalidPersistentState("invalid change kind")
+			return invalidPersistentState("invalid change kind")
 		}
 		previous = cursor
 	}
 	if rows.Err() != nil {
-		return nil, invalidPersistentState("read change rows")
+		return invalidPersistentState("read change rows")
 	}
 	if retainedCursor != serverCursor {
-		return nil, invalidPersistentState("retained change cursor gap")
+		return invalidPersistentState("retained change cursor gap")
 	}
 	for deviceID, device := range devices {
 		_, enrolled := enrollmentChanges[deviceID]
 		if enrolled != (device.createdCursor != 0) {
-			return nil, invalidPersistentState("device enrollment change mismatch")
+			return invalidPersistentState("device enrollment change mismatch")
 		}
 		_, revoked := revocationChanges[deviceID]
 		expectedRevocation := device.revoked && !device.baselineRevoked
 		if revoked != expectedRevocation {
-			return nil, invalidPersistentState("device revocation change mismatch")
+			return invalidPersistentState("device revocation change mismatch")
 		}
 	}
-	return latestMarkerChanges, nil
+	return nil
 }
 
 func validatePersistentReceipts(ctx context.Context, query schemaQueryer, identity Identity, devices map[string]validatedDeviceRow) error {

@@ -253,7 +253,67 @@ func (store *Store) lookupGrant(ctx context.Context, transaction *sql.Tx, presen
 	return nil, nil
 }
 
+const enrollmentKeyProbeSQL = `
+	SELECT octet_length(enrollment_id),
+	       CASE WHEN typeof(enrollment_id) = 'text'
+	                  AND octet_length(enrollment_id) = ? THEN enrollment_id END
+	FROM enrollments
+	WHERE enrollment_id >= ? AND enrollment_id < ?
+	UNION ALL
+	SELECT octet_length(enrollment_id),
+	       CASE WHEN typeof(enrollment_id) = 'text'
+	                  AND octet_length(enrollment_id) = ? THEN enrollment_id END
+	FROM enrollments
+	WHERE enrollment_id >= ? AND enrollment_id < ?
+	LIMIT 2`
+
+// preflightEnrollmentKey makes exact enrollment-key absence authoritative
+// without scanning unrelated enrollment history. SQLite orders storage classes
+// before values, so separate primary-key ranges cover TEXT and BLOB forms of
+// the canonical UUID plus every byte-suffixed variant.
+func preflightEnrollmentKey(ctx context.Context, transaction *sql.Tx, enrollmentID string) (bool, *api.Error) {
+	if validateUUID(enrollmentID) != nil {
+		return false, api.NewError("internal_error", true)
+	}
+	lowerBytes := []byte(enrollmentID)
+	upperBytes := append([]byte(nil), lowerBytes...)
+	upperBytes[len(upperBytes)-1]++
+	rows, err := transaction.QueryContext(ctx, enrollmentKeyProbeSQL,
+		maxUUIDBytes, enrollmentID, string(upperBytes),
+		maxUUIDBytes, lowerBytes, upperBytes,
+	)
+	if err != nil {
+		return false, api.NewError("internal_error", true)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+		var storedEnrollmentID sql.NullString
+		var enrollmentIDLength int64
+		if rows.Scan(&enrollmentIDLength, &storedEnrollmentID) != nil || enrollmentIDLength != maxUUIDBytes ||
+			!boundedRequiredText(enrollmentIDLength, storedEnrollmentID, maxUUIDBytes) ||
+			validateUUID(storedEnrollmentID.String) != nil || storedEnrollmentID.String != enrollmentID {
+			rows.Close()
+			return false, api.NewError("internal_error", true)
+		}
+	}
+	iterationErr := rows.Err()
+	closeErr := rows.Close()
+	if iterationErr != nil || closeErr != nil || count > 1 {
+		return false, api.NewError("internal_error", true)
+	}
+	return count == 1, nil
+}
+
 func (store *Store) lookupEnrollment(ctx context.Context, transaction *sql.Tx, enrollmentID string, request enrollmentRequest, tokenHash, fingerprint [32]byte) ([]byte, bool, *api.Error) {
+	present, protocolErr := preflightEnrollmentKey(ctx, transaction, enrollmentID)
+	if protocolErr != nil {
+		return nil, false, protocolErr
+	}
+	if !present {
+		return nil, false, nil
+	}
 	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	var deviceID sql.NullString
 	var scopesJSON sql.NullString
@@ -271,7 +331,7 @@ func (store *Store) lookupEnrollment(ctx context.Context, transaction *sql.Tx, e
 		FROM enrollments WHERE enrollment_id = ?`, maxUUIDBytes, len(wantScopes), maxBodyBytes, enrollmentID,
 	).Scan(&deviceIDLength, &deviceID, &storedToken, &scopesLength, &scopesJSON, &storedFingerprint, &responseLength, &response, &createdStatus)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, nil
+		return nil, false, api.NewError("internal_error", true)
 	}
 	if err != nil || deviceIDLength != maxUUIDBytes || !boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
 		len(storedToken) != 32 || len(storedFingerprint) != 32 ||

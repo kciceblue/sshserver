@@ -381,7 +381,7 @@ func TestDeviceOriginProvenanceFailsClosed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := validatePersistentChanges(context.Background(), opened.db, devices, 1); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "device enrollment change mismatch") {
+		if err := validatePersistentChanges(context.Background(), opened.db, devices, 1); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "device enrollment change mismatch") {
 			t.Fatalf("deleted enrollment provenance error=%v", err)
 		}
 	})
@@ -450,7 +450,7 @@ func TestDeviceRevocationProvenanceFailsClosed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := validatePersistentChanges(ctx, opened.db, devices, 1); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "device revocation change mismatch") {
+		if err := validatePersistentChanges(ctx, opened.db, devices, 1); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "device revocation change mismatch") {
 			t.Fatalf("missing baseline revocation event error=%v", err)
 		}
 	})
@@ -2143,19 +2143,19 @@ func TestOversizedRevisionVectorIsGuardedAtEveryStartupJoin(t *testing.T) {
 	tests := []struct {
 		name   string
 		detail string
-		check  func(context.Context, boundedPersistenceSeed, uint64, uint64, uint64, map[string]validatedDeviceRow, map[string]validatedMarkerChange) error
+		check  func(context.Context, boundedPersistenceSeed, uint64, uint64, uint64, map[string]validatedDeviceRow) error
 	}{
-		{name: "revision replay", detail: "invalid revision row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, _, collectionGeneration uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
+		{name: "revision replay", detail: "invalid revision row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, _, collectionGeneration uint64, devices map[string]validatedDeviceRow) error {
 			_, err := validatePersistentRevisions(ctx, seed.opened.db, devices, cursor, collectionGeneration)
 			return err
 		}},
-		{name: "permanent vector index", detail: "invalid record vector index", check: func(ctx context.Context, seed boundedPersistenceSeed, _, _, _ uint64, _ map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
+		{name: "permanent vector index", detail: "invalid record vector index", check: func(ctx context.Context, seed boundedPersistenceSeed, _, _, _ uint64, _ map[string]validatedDeviceRow) error {
 			return validatePersistentRecordVectorIndex(ctx, seed.opened.db)
 		}},
-		{name: "marker witness join", detail: "invalid marker row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, _, _ uint64, devices map[string]validatedDeviceRow, changes map[string]validatedMarkerChange) error {
-			return validatePersistentMarkers(ctx, seed.opened.db, devices, cursor, changes)
+		{name: "marker witness join", detail: "invalid marker row", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, _, _ uint64, devices map[string]validatedDeviceRow) error {
+			return validatePersistentMarkers(ctx, seed.opened.db, devices, cursor)
 		}},
-		{name: "snapshot reference join", detail: "invalid snapshot reference", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, envelopeGeneration, collectionGeneration uint64, devices map[string]validatedDeviceRow, _ map[string]validatedMarkerChange) error {
+		{name: "snapshot reference join", detail: "invalid snapshot reference", check: func(ctx context.Context, seed boundedPersistenceSeed, cursor, envelopeGeneration, collectionGeneration uint64, devices map[string]validatedDeviceRow) error {
 			return validatePersistentSnapshots(ctx, seed.opened.db, testIdentity, devices, cursor, envelopeGeneration, collectionGeneration)
 		}},
 	}
@@ -2175,11 +2175,10 @@ func TestOversizedRevisionVectorIsGuardedAtEveryStartupJoin(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			changes, err := validatePersistentChanges(ctx, seed.opened.db, devices, cursor)
-			if err != nil {
+			if err := validatePersistentChanges(ctx, seed.opened.db, devices, cursor); err != nil {
 				t.Fatal(err)
 			}
-			err = test.check(ctx, seed, cursor, envelopeGeneration, collectionGeneration, devices, changes)
+			err = test.check(ctx, seed, cursor, envelopeGeneration, collectionGeneration, devices)
 			if !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), test.detail) {
 				t.Fatalf("guarded vector join error=%v", err)
 			}
