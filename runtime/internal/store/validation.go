@@ -387,7 +387,10 @@ func validatePersistentChangeOrigins(ctx context.Context, query schemaQueryer, s
 		       CASE WHEN r.change_cursor IS NULL THEN 0
 		            WHEN typeof(r.revision_id) = 'text'
 		                  AND octet_length(r.revision_id) = 36 THEN 1
-		            ELSE -1 END
+		            ELSE -1 END,
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = 36
+		            THEN r.revision_id END
 		FROM change_origins o
 		LEFT JOIN changes c ON c.cursor = o.cursor
 		LEFT JOIN record_revisions r ON r.change_cursor = o.cursor
@@ -402,16 +405,17 @@ func validatePersistentChangeOrigins(ctx context.Context, query schemaQueryer, s
 		var cursorBytes, generationBytes []byte
 		var cursorLength int64
 		var generationLength sql.NullInt64
-		var kind sql.NullString
+		var kind, revisionID sql.NullString
 		var changeState, revisionState int
 		if rows.Scan(
 			&cursorLength, &cursorBytes, &kind,
-			&generationLength, &generationBytes, &changeState, &revisionState,
+			&generationLength, &generationBytes, &changeState, &revisionState, &revisionID,
 		) != nil ||
 			cursorLength != 8 || len(cursorBytes) != 8 || !kind.Valid ||
 			generationLength.Valid && (generationLength.Int64 != 8 || len(generationBytes) != 8) ||
 			!generationLength.Valid && generationBytes != nil ||
-			changeState < 0 || changeState > 1 || revisionState < 0 || revisionState > 1 {
+			changeState < 0 || changeState > 1 || revisionState < 0 || revisionState > 1 ||
+			(revisionState == 1) != revisionID.Valid || revisionID.Valid && validateUUID(revisionID.String) != nil {
 			return nil, invalidPersistentState("invalid change origin")
 		}
 		cursor, cursorErr := DecodeUint64(cursorBytes)

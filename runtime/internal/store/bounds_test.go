@@ -1193,6 +1193,7 @@ func TestChangeOriginScanBoundsFieldsBeforeLoading(t *testing.T) {
 	oversizedSuffix := strings.Repeat("x", oversizedBytes)
 	oversizedKind := "envelope_changed\x00" + oversizedSuffix
 	oversizedRevisionID := "e8330000-0000-4000-8000-000000000001\x00" + oversizedSuffix
+	invalidRevisionID := "\x001000000-0000-4000-8000-000000000007"
 	tests := []struct {
 		name   string
 		mutate func(*testing.T, *sql.DB)
@@ -1234,6 +1235,15 @@ func TestChangeOriginScanBoundsFieldsBeforeLoading(t *testing.T) {
 			mutate: func(t *testing.T, database *sql.DB) {
 				three := EncodeUint64(3)
 				if _, err := database.Exec("UPDATE record_revisions SET revision_id = ? WHERE change_cursor = ?", oversizedRevisionID, three[:]); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "invalid 36-octet joined revision UUID",
+			mutate: func(t *testing.T, database *sql.DB) {
+				three := EncodeUint64(3)
+				if _, err := database.Exec("UPDATE record_revisions SET revision_id = ? WHERE change_cursor = ?", invalidRevisionID, three[:]); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -1340,6 +1350,69 @@ func TestEnvelopePutBoundsPermanentOriginBeforeMutation(t *testing.T) {
 		originLength != maxBodyBytes+1 || !slices.Equal(retainedBody, expectedBody) || newOriginCount != 0 || newChangeCount != 0 || newReceiptCount != 0 {
 		t.Fatalf("oversized-origin PUT mutated state: runtime=%d row=%d cursor=%d origin_length=%d origins=%d changes=%d receipts=%d",
 			runtimeGeneration, rowGeneration, serverCursor, originLength, newOriginCount, newChangeCount, newReceiptCount)
+	}
+}
+
+func TestEnvelopePutValidatesPermanentRevisionOwnerBeforeMutation(t *testing.T) {
+	seed := seedBoundedPersistence(t, boundedSeedOptions{})
+	defer seed.opened.Close()
+	invalidRevisionID := "\x001000000-0000-4000-8000-000000000007"
+	if len(invalidRevisionID) != maxUUIDBytes {
+		t.Fatalf("invalid revision fixture length=%d", len(invalidRevisionID))
+	}
+	if _, err := seed.opened.db.Exec("PRAGMA ignore_check_constraints = ON"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.opened.db.Exec("UPDATE record_revisions SET revision_id = ? WHERE revision_id = ?", invalidRevisionID, seed.revisionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.opened.db.Exec("PRAGMA ignore_check_constraints = OFF"); err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		BaseMode         putEnvelopeRequest `json:"base_mode"`
+		PassphraseRewrap putEnvelopeRequest `json:"passphrase_rewrap"`
+	}
+	loadFixture(t, "vault-envelope.json", &fixture)
+	expectedBody, err := marshalJSON(fixture.BaseMode.Envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBody, err := marshalJSON(fixture.PassphraseRewrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := "e8340000-0000-4000-8000-000000000001"
+	expectInternalError(t, seed.opened, api.Request{
+		Method: "PUT", Path: "/v1/vault-envelope", RequestID: requestID,
+		Authorization: authorization(seed.token), Body: requestBody, Now: protocolFixtureTime.Add(4 * time.Second),
+	})
+	two := EncodeUint64(2)
+	three := EncodeUint64(3)
+	four := EncodeUint64(4)
+	var runtimeGenerationBytes, serverCursorBytes, rowGenerationBytes, retainedBody []byte
+	var retainedRevisionID string
+	var newOriginCount, newChangeCount, newReceiptCount int
+	if err := seed.opened.db.QueryRow(`
+		SELECT r.envelope_generation, r.server_cursor, v.generation, v.envelope_json,
+		       (SELECT revision_id FROM record_revisions WHERE change_cursor = ?),
+		       (SELECT count(*) FROM change_origins WHERE kind = 'envelope_changed' AND envelope_generation = ?),
+		       (SELECT count(*) FROM changes WHERE cursor = ?),
+		       (SELECT count(*) FROM operation_receipts WHERE operation = 'vault-envelope' AND request_id = ?)
+		FROM runtime_state r JOIN vault_envelope v ON v.singleton = r.singleton
+		WHERE r.singleton = 1`, three[:], two[:], four[:], requestID).Scan(
+		&runtimeGenerationBytes, &serverCursorBytes, &rowGenerationBytes, &retainedBody,
+		&retainedRevisionID, &newOriginCount, &newChangeCount, &newReceiptCount,
+	); err != nil {
+		t.Fatal(err)
+	}
+	runtimeGeneration, runtimeErr := DecodeUint64(runtimeGenerationBytes)
+	serverCursor, cursorErr := DecodeUint64(serverCursorBytes)
+	rowGeneration, rowErr := DecodeUint64(rowGenerationBytes)
+	if runtimeErr != nil || cursorErr != nil || rowErr != nil || runtimeGeneration != 1 || rowGeneration != 1 || serverCursor != 3 ||
+		retainedRevisionID != invalidRevisionID || !slices.Equal(retainedBody, expectedBody) || newOriginCount != 0 || newChangeCount != 0 || newReceiptCount != 0 {
+		t.Fatalf("invalid-owner PUT mutated state: runtime=%d row=%d cursor=%d revision=%q origins=%d changes=%d receipts=%d",
+			runtimeGeneration, rowGeneration, serverCursor, retainedRevisionID, newOriginCount, newChangeCount, newReceiptCount)
 	}
 }
 
