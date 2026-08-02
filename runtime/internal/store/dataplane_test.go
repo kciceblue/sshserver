@@ -289,6 +289,9 @@ func TestEnvelopeSyncSnapshotRevocationAndRotationFixtures(t *testing.T) {
 	if protocolErr != nil || selfResponse.Status != 200 {
 		t.Fatalf("self revoke: response=%+v error=%v", selfResponse, protocolErr)
 	}
+	if _, protocolErr := opened.HandleAPI(context.Background(), rotationCall); protocolErr == nil || protocolErr.Code != "token_revoked" {
+		t.Fatalf("revoked old-token rotation retry error = %v", protocolErr)
+	}
 	selfRetry, protocolErr := opened.HandleAPI(context.Background(), selfCall)
 	if protocolErr != nil || !bytes.Equal(selfRetry.Body, selfResponse.Body) {
 		t.Fatalf("self-revocation receipt: response=%+v error=%v", selfRetry, protocolErr)
@@ -500,6 +503,190 @@ func TestTombstoneCollectionMarkerCursorFloorAndRestartBoundSnapshot(t *testing.
 	if _, protocolErr := reopened.HandleAPI(context.Background(), pageCall); protocolErr == nil || protocolErr.Code != "snapshot_not_found" {
 		t.Fatalf("prior-boot snapshot error = %v", protocolErr)
 	}
+}
+
+func TestMarkerFallbackPreservesLiveWitnessAndPrunesTombstoneWitness(t *testing.T) {
+	setUptime := func(t *testing.T, opened *Store, elapsed time.Duration) {
+		t.Helper()
+		encoded := EncodeUint64(uint64(elapsed / time.Millisecond))
+		if _, err := opened.db.Exec("UPDATE runtime_state SET accumulated_uptime_ms = ? WHERE singleton = 1", encoded[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	syncCall := func(t *testing.T, opened *Store, deviceID string, token []byte, requestID, after, ack string, mutations []recordRevision) syncResponse {
+		t.Helper()
+		body, err := marshalJSON(syncRequest{
+			ProtocolVersion: "1", DeviceID: deviceID, RequestID: requestID,
+			AfterCursor: after, AckCursor: ack, Mutations: mutations,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, protocolErr := opened.HandleAPI(context.Background(), api.Request{
+			Method: "POST", Path: "/v1/sync", RequestID: requestID,
+			Authorization: authorization(token), Body: body, Now: protocolFixtureTime,
+		})
+		if protocolErr != nil || response.Status != http.StatusOK {
+			t.Fatalf("sync %s: response=%+v error=%v", requestID, response, protocolErr)
+		}
+		var decoded syncResponse
+		if err := json.Unmarshal(response.Body, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+	makeRevision := func(deviceID, recordID, revisionID string, counter uint64, tombstone, authorized bool) recordRevision {
+		revision := recordRevision{
+			RecordID: recordID, RevisionID: revisionID, AuthorDeviceID: deviceID,
+			AuthorCounter: encodeUint64Text(counter),
+			VersionVector: []vectorEntry{{DeviceID: deviceID, Counter: encodeUint64Text(counter)}},
+			PayloadSchema: "1", CryptoSuite: cryptoSuite, Tombstone: tombstone,
+			Nonce:      base64.RawURLEncoding.EncodeToString(make([]byte, 24)),
+			Ciphertext: base64.RawURLEncoding.EncodeToString(make([]byte, 16)),
+		}
+		if authorized {
+			value := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+			revision.CollectionWitnessAuthenticator = &value
+		}
+		return revision
+	}
+
+	t.Run("live marker witness remains snapshot-visible", func(t *testing.T) {
+		opened, _ := openDataPlane(t)
+		defer opened.Close()
+		deviceID := "e1000000-0000-4000-8000-000000000001"
+		token := tokenWithByte(0xe1)
+		enrollDevice(t, opened, protocolFixtureTime,
+			"e1000000-0000-4000-8000-000000000002", deviceID,
+			"e1000000-0000-4000-8000-000000000003", token,
+		)
+		var envelopeFixture struct {
+			BaseMode putEnvelopeRequest `json:"base_mode"`
+		}
+		loadFixture(t, "vault-envelope.json", &envelopeFixture)
+		envelopeBody, _ := marshalJSON(envelopeFixture.BaseMode)
+		if response, protocolErr := opened.HandleAPI(context.Background(), api.Request{
+			Method: "PUT", Path: "/v1/vault-envelope", RequestID: "e1000000-0000-4000-8000-000000000004",
+			Authorization: authorization(token), Body: envelopeBody, Now: protocolFixtureTime,
+		}); protocolErr != nil || response.Status != http.StatusOK {
+			t.Fatalf("put envelope: response=%+v error=%v", response, protocolErr)
+		}
+		recordID := "e1000000-0000-4000-8000-000000000005"
+		first := makeRevision(deviceID, recordID, "e1000000-0000-4000-8000-000000000006", 1, false, false)
+		liveWitness := makeRevision(deviceID, recordID, "e1000000-0000-4000-8000-000000000007", 2, false, true)
+		seed := syncCall(t, opened, deviceID, token, "e1000000-0000-4000-8000-000000000008", "0", "0", []recordRevision{first, liveWitness})
+		if seed.ServerCursor != "4" || seed.NextCursor != "4" {
+			t.Fatalf("seed cursors = %+v", seed)
+		}
+		setUptime(t, opened, minimumRetentionUptime)
+		firstPass := syncCall(t, opened, deviceID, token, "e1000000-0000-4000-8000-000000000009", "4", "4", []recordRevision{})
+		if firstPass.ServerCursor != "5" || len(firstPass.Changes) != 1 || firstPass.Changes[0].CollectionMarker == nil {
+			t.Fatalf("first collection pass = %+v", firstPass)
+		}
+		secondPass := syncCall(t, opened, deviceID, token, "e1000000-0000-4000-8000-00000000000a", "5", "5", []recordRevision{})
+		if secondPass.ServerCursor != "5" || len(secondPass.Changes) != 0 {
+			t.Fatalf("second collection pass = %+v", secondPass)
+		}
+		var firstRetained, witnessRetained int
+		if err := opened.db.QueryRow("SELECT retained FROM record_revisions WHERE revision_id = ?", first.RevisionID).Scan(&firstRetained); err != nil {
+			t.Fatal(err)
+		}
+		if err := opened.db.QueryRow("SELECT retained FROM record_revisions WHERE revision_id = ?", liveWitness.RevisionID).Scan(&witnessRetained); err != nil {
+			t.Fatal(err)
+		}
+		if firstRetained != 0 || witnessRetained != 1 {
+			t.Fatalf("live collection retention: first=%d witness=%d", firstRetained, witnessRetained)
+		}
+
+		createID := "e1000000-0000-4000-8000-00000000000b"
+		createBody, _ := marshalJSON(snapshotCreateRequest{
+			ProtocolVersion: "1", DeviceID: deviceID, RequestID: createID,
+			RequiredCapabilities: append([]string(nil), requiredSnapshotCapabilities...),
+		})
+		created, protocolErr := opened.HandleAPI(context.Background(), api.Request{
+			Method: "POST", Path: "/v1/snapshot-reads", RequestID: createID,
+			Authorization: authorization(token), Body: createBody, Now: protocolFixtureTime,
+		})
+		if protocolErr != nil || created.Status != http.StatusCreated {
+			t.Fatalf("create live-witness snapshot: response=%+v error=%v", created, protocolErr)
+		}
+		var snapshot snapshotCreateResponse
+		if err := json.Unmarshal(created.Body, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		_, revisions, _ := readAllSnapshotPages(t, opened, snapshot, deviceID, token, protocolFixtureTime)
+		if len(revisions) != 1 || revisions[0].RevisionID != liveWitness.RevisionID {
+			t.Fatalf("snapshot live revisions = %+v", revisions)
+		}
+	})
+
+	t.Run("exact tombstone marker witness is pruned once eligible", func(t *testing.T) {
+		opened, _ := openDataPlane(t)
+		defer opened.Close()
+		deviceID := "e2000000-0000-4000-8000-000000000001"
+		token := tokenWithByte(0xe2)
+		enrollDevice(t, opened, protocolFixtureTime,
+			"e2000000-0000-4000-8000-000000000002", deviceID,
+			"e2000000-0000-4000-8000-000000000003", token,
+		)
+		recordID := "e2000000-0000-4000-8000-000000000004"
+		first := makeRevision(deviceID, recordID, "e2000000-0000-4000-8000-000000000005", 1, false, false)
+		seed := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-000000000006", "0", "0", []recordRevision{first})
+		if seed.ServerCursor != "2" || seed.NextCursor != "2" {
+			t.Fatalf("seed cursors = %+v", seed)
+		}
+		setUptime(t, opened, minimumRetentionUptime)
+		tombstone := makeRevision(deviceID, recordID, "e2000000-0000-4000-8000-000000000007", 2, true, true)
+		withTombstone := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-000000000008", "2", "2", []recordRevision{tombstone})
+		if withTombstone.ServerCursor != "3" || withTombstone.NextCursor != "3" {
+			t.Fatalf("tombstone cursors = %+v", withTombstone)
+		}
+		firstPass := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-000000000009", "3", "3", []recordRevision{})
+		if firstPass.ServerCursor != "4" || len(firstPass.Changes) != 1 || firstPass.Changes[0].CollectionMarker == nil {
+			t.Fatalf("first collection pass = %+v", firstPass)
+		}
+		var firstRetained, tombstoneRetained int
+		if err := opened.db.QueryRow("SELECT retained FROM record_revisions WHERE revision_id = ?", first.RevisionID).Scan(&firstRetained); err != nil {
+			t.Fatal(err)
+		}
+		if err := opened.db.QueryRow("SELECT retained FROM record_revisions WHERE revision_id = ?", tombstone.RevisionID).Scan(&tombstoneRetained); err != nil {
+			t.Fatal(err)
+		}
+		if firstRetained != 0 || tombstoneRetained != 1 {
+			t.Fatalf("first-pass retention: first=%d tombstone=%d", firstRetained, tombstoneRetained)
+		}
+		setUptime(t, opened, 2*minimumRetentionUptime)
+		secondPass := syncCall(t, opened, deviceID, token, "e2000000-0000-4000-8000-00000000000a", "4", "4", []recordRevision{})
+		if secondPass.ServerCursor != "4" || len(secondPass.Changes) != 0 {
+			t.Fatalf("second collection pass = %+v", secondPass)
+		}
+		var objectCount, markerCount int
+		if err := opened.db.QueryRow("SELECT retained FROM record_revisions WHERE revision_id = ?", tombstone.RevisionID).Scan(&tombstoneRetained); err != nil {
+			t.Fatal(err)
+		}
+		if err := opened.db.QueryRow("SELECT count(*) FROM revision_objects").Scan(&objectCount); err != nil {
+			t.Fatal(err)
+		}
+		if err := opened.db.QueryRow("SELECT count(*) FROM collection_markers WHERE record_id = ?", recordID).Scan(&markerCount); err != nil {
+			t.Fatal(err)
+		}
+		if tombstoneRetained != 0 || objectCount != 0 || markerCount != 1 {
+			t.Fatalf("tombstone fallback: retained=%d objects=%d markers=%d", tombstoneRetained, objectCount, markerCount)
+		}
+		equivocation := tombstone
+		equivocation.RevisionID = "e2000000-0000-4000-8000-00000000000b"
+		equivocationID := "e2000000-0000-4000-8000-00000000000c"
+		equivocationBody, _ := marshalJSON(syncRequest{
+			ProtocolVersion: "1", DeviceID: deviceID, RequestID: equivocationID,
+			AfterCursor: "4", AckCursor: "4", Mutations: []recordRevision{equivocation},
+		})
+		if _, protocolErr := opened.HandleAPI(context.Background(), api.Request{
+			Method: "POST", Path: "/v1/sync", RequestID: equivocationID,
+			Authorization: authorization(token), Body: equivocationBody, Now: protocolFixtureTime,
+		}); protocolErr == nil || protocolErr.Code != "revision_equivocation" {
+			t.Fatalf("post-collection equal-vector error = %v", protocolErr)
+		}
+	})
 }
 
 func TestBackwardWallClockAndRevokedNoOpReceipt(t *testing.T) {
@@ -1133,6 +1320,29 @@ func TestSnapshotGraphCorruptionFailsClosedAtStartup(t *testing.T) {
 	t.Run("metadata accounting", func(t *testing.T) {
 		opened, path, created := seed(t)
 		if _, err := opened.db.Exec("UPDATE snapshots SET metadata_bytes = metadata_bytes + 1 WHERE snapshot_id = ?", created.SnapshotID); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		assertRejected(t, opened, path)
+	})
+	t.Run("declared page budget", func(t *testing.T) {
+		opened, path, created := seed(t)
+		var ownerID, requestID string
+		var createBody []byte
+		if err := opened.db.QueryRow(`
+			SELECT owner_device_id, request_id, create_response_json
+			FROM snapshots WHERE snapshot_id = ?`, created.SnapshotID,
+		).Scan(&ownerID, &requestID, &createBody); err != nil {
+			opened.Close()
+			t.Fatal(err)
+		}
+		account := snapshotMetadataAccounting{}
+		accountSnapshotBase(&account, created.SnapshotID, ownerID, requestID, createBody)
+		if !account.ok() {
+			opened.Close()
+			t.Fatal("snapshot base accounting overflow")
+		}
+		if _, err := opened.db.Exec("UPDATE snapshots SET metadata_bytes = ? WHERE snapshot_id = ?", account.total, created.SnapshotID); err != nil {
 			opened.Close()
 			t.Fatal(err)
 		}

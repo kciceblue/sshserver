@@ -556,7 +556,7 @@ func validatePersistentRecordHeads(ctx context.Context, query schemaQueryer) err
 func validatePersistentRecordVectorIndex(ctx context.Context, query schemaQueryer) error {
 	rows, err := query.QueryContext(ctx, `
 		SELECT i.record_id, i.vector_hash, i.revision_id,
-		       r.record_id, r.vector_json, r.retained
+		       r.record_id, r.vector_json
 		FROM record_vector_index i
 		LEFT JOIN record_revisions r ON r.revision_id = i.revision_id
 		ORDER BY i.record_id, i.vector_hash, i.revision_id`)
@@ -567,10 +567,9 @@ func validatePersistentRecordVectorIndex(ctx context.Context, query schemaQuerye
 		var recordID, revisionID string
 		var vectorHash, vectorBody []byte
 		var revisionRecord sql.NullString
-		var retained sql.NullInt64
-		if rows.Scan(&recordID, &vectorHash, &revisionID, &revisionRecord, &vectorBody, &retained) != nil ||
+		if rows.Scan(&recordID, &vectorHash, &revisionID, &revisionRecord, &vectorBody) != nil ||
 			validateUUID(recordID) != nil || validateUUID(revisionID) != nil || len(vectorHash) != 32 || !revisionRecord.Valid || revisionRecord.String != recordID ||
-			!retained.Valid || retained.Int64 != 1 {
+			vectorBody == nil {
 			rows.Close()
 			return invalidPersistentState("invalid record vector index")
 		}
@@ -586,7 +585,7 @@ func validatePersistentRecordVectorIndex(ctx context.Context, query schemaQuerye
 	var missing int
 	if query.QueryRowContext(ctx, `
 		SELECT count(*) FROM (
-			SELECT record_id, revision_id FROM record_revisions WHERE retained = 1
+			SELECT record_id, revision_id FROM record_revisions
 			EXCEPT
 			SELECT record_id, revision_id FROM record_vector_index
 		)`).Scan(&missing) != nil || missing != 0 {
@@ -989,9 +988,11 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		referenceRecordIDs map[string]string
 		sourceCounters     map[string]uint64
 		orderedRevisionIDs []string
+		validationAccount  snapshotMetadataAccounting
 	}
 	snapshots := make(map[string]*validatedSnapshot)
 	ownerCounts := make(map[string]int)
+	declaredMetadata := int64(0)
 	rows, err := query.QueryContext(ctx, `
 		SELECT snapshot_id, owner_device_id, request_id, request_fingerprint,
 		       cut_cursor, envelope_generation, expires_at_ms, metadata_bytes,
@@ -1018,6 +1019,17 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 			rows.Close()
 			return invalidPersistentState("inconsistent snapshot row")
 		}
+		if metadataBytes > snapshotMetadataLimit-declaredMetadata {
+			rows.Close()
+			return invalidPersistentState("active snapshot metadata exceeds limit")
+		}
+		validationAccount := snapshotMetadataAccounting{}
+		accountSnapshotBase(&validationAccount, snapshotID, ownerID, requestID, body)
+		if !validationAccount.ok() || validationAccount.total > metadataBytes {
+			rows.Close()
+			return invalidPersistentState("snapshot metadata undercounts base row")
+		}
+		declaredMetadata += metadataBytes
 		ownerCounts[ownerID]++
 		if ownerCounts[ownerID] > 1 {
 			rows.Close()
@@ -1026,7 +1038,7 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		snapshots[snapshotID] = &validatedSnapshot{
 			ownerID: ownerID, requestID: requestID, metadataBytes: metadataBytes,
 			createBody: body, create: create, referenceRecordIDs: make(map[string]string),
-			sourceCounters: make(map[string]uint64),
+			sourceCounters: make(map[string]uint64), validationAccount: validationAccount,
 		}
 	}
 	if rows.Err() != nil || rows.Close() != nil {
@@ -1051,6 +1063,11 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		if snapshot == nil || index < 0 || index != int64(len(snapshot.pages)) || decodeBase64Token(token) != nil || decodeStoredSnapshotPageDescriptor(body, &descriptor) != nil {
 			pageRows.Close()
 			return invalidPersistentState("invalid snapshot page")
+		}
+		accountSnapshotPage(&snapshot.validationAccount, snapshotID, len(snapshot.pages), token, body)
+		if !snapshot.validationAccount.ok() || snapshot.validationAccount.total > snapshot.metadataBytes {
+			pageRows.Close()
+			return invalidPersistentState("snapshot pages exceed declared metadata")
 		}
 		snapshot.pages = append(snapshot.pages, storedSnapshotPage{token: token, descriptor: descriptor, body: body})
 	}
@@ -1165,7 +1182,13 @@ func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, ident
 		}
 		var contentHash [32]byte
 		copy(contentHash[:], hashBytes)
-		snapshot.references = append(snapshot.references, snapshotRevisionReference{revisionID: revisionID, contentHash: contentHash})
+		reference := snapshotRevisionReference{revisionID: revisionID, contentHash: contentHash}
+		accountSnapshotReference(&snapshot.validationAccount, snapshotID, reference)
+		if !snapshot.validationAccount.ok() || snapshot.validationAccount.total > snapshot.metadataBytes {
+			refRows.Close()
+			return invalidPersistentState("snapshot references exceed declared metadata")
+		}
+		snapshot.references = append(snapshot.references, reference)
 		snapshot.referenceRecordIDs[revisionID] = recordID.String
 	}
 	if refRows.Err() != nil || refRows.Close() != nil {

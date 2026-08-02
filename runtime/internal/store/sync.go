@@ -173,6 +173,9 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		vectorHash := sha256.Sum256(vectorJSON)
+		// Revision metadata is permanent in V1, so this index is permanent too:
+		// equal-vector equivocation must retain its error precedence even after
+		// the corresponding ciphertext object and change row are collected.
 		if _, err := transaction.ExecContext(ctx, `
 			INSERT INTO record_vector_index (record_id, vector_hash, revision_id)
 			VALUES (?, ?, ?)`, item.revision.RecordID, vectorHash[:], item.revision.RevisionID); err != nil {

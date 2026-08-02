@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -26,7 +25,6 @@ type collectionRevision struct {
 	recordID         string
 	vectorEntries    []vectorEntry
 	vector           map[string]uint64
-	vectorHash       [32]byte
 	authenticator    []byte
 	contentHash      [32]byte
 	tombstone        bool
@@ -178,11 +176,6 @@ func (store *Store) collectEligible(ctx context.Context, transaction *sql.Tx, no
 				WHERE record_id = ? AND accepted_uptime_ms = ? AND revision_id = ?`, candidate.recordID, encodedAcceptedUptime[:], candidate.revisionID); err != nil {
 				return 0, api.NewError("internal_error", true)
 			}
-			if _, err := transaction.ExecContext(ctx, `
-				DELETE FROM record_vector_index
-				WHERE record_id = ? AND vector_hash = ? AND revision_id = ?`, candidate.recordID, candidate.vectorHash[:], candidate.revisionID); err != nil {
-				return 0, api.NewError("internal_error", true)
-			}
 			if candidate.changeCursor > cursorFloor {
 				cursorFloor = candidate.changeCursor
 			}
@@ -331,7 +324,6 @@ func loadCollectionRevisionRows(ctx context.Context, transaction *sql.Tx, statem
 			return nil, api.NewError("internal_error", true)
 		}
 		revision.vector = vector
-		revision.vectorHash = sha256.Sum256(vectorBody)
 		revision.authenticator = append([]byte(nil), authenticator...)
 		revision.acceptedUptimeMS = accepted
 		revision.changeCursor = cursor
@@ -486,7 +478,13 @@ func selectMarkerCoveredCandidates(revisions []collectionRevision, marker stored
 	}
 	var candidates []collectionRevision
 	for _, candidate := range revisions {
-		if candidate.revisionID == marker.witnessRevisionID && vectorsEqual(candidate.vector, marker.frontier) || vectorDominates(marker.frontier, candidate.vector) {
+		if candidate.revisionID == marker.witnessRevisionID && vectorsEqual(candidate.vector, marker.frontier) {
+			if candidate.tombstone {
+				candidates = append(candidates, candidate)
+			}
+			continue
+		}
+		if vectorDominates(marker.frontier, candidate.vector) {
 			candidates = append(candidates, candidate)
 		}
 	}

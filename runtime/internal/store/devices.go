@@ -426,6 +426,13 @@ func (store *Store) handleTokenRotation(ctx context.Context, call api.Request) (
 		if !authMatches {
 			return api.Response{}, api.NewError("unauthorized", false)
 		}
+		var revoked bool
+		if err := transaction.QueryRowContext(ctx, "SELECT revoked_at_ms IS NOT NULL FROM devices WHERE device_id = ?", storedDeviceID).Scan(&revoked); err != nil {
+			return api.Response{}, api.NewError("internal_error", true)
+		}
+		if revoked {
+			return api.Response{}, api.NewError("token_revoked", false)
+		}
 		if storedDeviceID != request.DeviceID {
 			return api.Response{}, api.NewError("authenticated_device_mismatch", false)
 		}
