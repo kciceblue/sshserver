@@ -184,7 +184,7 @@ func (runner Runner) runDeployApply(ctx context.Context, operation string, args 
 			return err
 		}
 	}
-	return json.NewEncoder(runner.Stdout).Encode(result)
+	return runner.writeApplyResult(result)
 }
 
 func wrapOptionalError(operation string, err error) error {
@@ -192,6 +192,10 @@ func wrapOptionalError(operation string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func (runner Runner) writeApplyResult(result deployment.ApplyResult) error {
+	return json.NewEncoder(runner.Stdout).Encode(result)
 }
 
 func (runner Runner) runDeployStatus(ctx context.Context, args []string) error {
@@ -234,7 +238,7 @@ func (runner Runner) runDeployRollback(ctx context.Context, args []string) error
 	if err != nil {
 		return err
 	}
-	return json.NewEncoder(runner.Stdout).Encode(result)
+	return runner.writeApplyResult(result)
 }
 
 func (runner Runner) runDeployUninstall(ctx context.Context, args []string) error {

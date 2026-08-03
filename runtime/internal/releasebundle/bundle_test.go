@@ -98,7 +98,11 @@ func TestActivationLineIsPinnedTargetSpecificAndUsesNoHostTool(t *testing.T) {
 		if strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
 			t.Fatalf("%s activation is not exactly one line", key)
 		}
-		for _, forbidden := range []string{"curl", "wget", "fetch", "openssl", "sh ", "bash", "sudo", "sha256sum", "shasum", "chmod ", "mkdir ", "rm ", "uname ", "latest", "|", ";", "(", ")", "$", "'", `"`} {
+		for _, forbidden := range []string{
+			"curl", "wget", "fetch", "openssl", "sh ", "bash", "sudo", "sha256sum", "shasum",
+			"chmod ", "mkdir ", "rm ", "uname ", "latest", "instance_secret", "enrollment_grant",
+			"device_token", "bearer", "password", "|", ";", ">", "<", "(", ")", "$", "'", `"`,
+		} {
 			if strings.Contains(line, forbidden) {
 				t.Fatalf("%s activation contains forbidden %q: %s", key, forbidden, line)
 			}

@@ -52,10 +52,12 @@ NOTICE                 0400
 
 It then invokes the matching `activation-*.txt` line as one SSH exec command.
 That command uses no shell pipeline, downloader, checksum utility, `sudo`, or
-host package prerequisite. The uploaded binary reopens and re-verifies the
-pinned manifest, artifact, LICENSE, and NOTICE before publishing anything.
-`--consume-inputs` removes the four verified upload files only after a
-successful transaction.
+host package prerequisite, and does not redirect stdout or stderr. The uploaded
+binary reopens and re-verifies the pinned manifest, artifact, LICENSE, and
+NOTICE before publishing anything. `--consume-inputs` removes the four verified
+upload files only after a successful transaction. On success, the activation
+line therefore passes through the one-line `deploy apply` JSON result, including
+its `deployment_locator`, unchanged.
 
 This is deliberately the server activation foundation, not yet a standalone
 copy-and-paste installer: target detection, downloads, local verification,
@@ -100,9 +102,42 @@ transaction journal.
 
 ## Stable deployment locator and upgrade refresh
 
-The app retains one previously verified immutable lifecycle binary together
-with the canonical home, install-root, and state-directory paths from the
-lifecycle request/result context. Before each new sync channel it runs:
+A successful fresh, idempotent, or recovered apply and a successful rollback
+emit exactly one nested `deployment_locator` with these keys:
+
+```text
+version                     string "1"
+lifecycle_binary_path       canonical absolute immutable installed binary
+home_dir                    canonical absolute selected-user home
+install_root                canonical absolute deployment root beneath home
+state_dir                   canonical absolute protected state root beneath home
+release                     exact immutable release identifier
+os                          linux or darwin
+architecture                amd64 or arm64
+manifest_sha256             64 lowercase hexadecimal characters
+binary_sha256               64 lowercase hexadecimal characters
+binary_bytes                positive bounded integer
+```
+
+The lifecycle builds the object only from its already validated layout and
+committed active release. It never uses the consumed upload path, `PATH`,
+ambient defaults, or the current executable path. Errors, uninstall, and a
+recovery-required status emit no locator rather than a partial one. The locator
+contains no password, SSH key, token, grant, instance secret, device/instance/
+vault/host identifier, service definition, endpoint port, or transaction data.
+The host-local absolute paths can disclose an account name and should be
+handled as operational metadata.
+
+This object is a credential-free routing receipt, not an attestation or a claim
+of provenance. Copied or pasted output is untrusted. The app binds it to the
+user-selected host profile only after host-key verification and SSH
+authentication, strict V1 decoding, comparison with the locally pinned release
+manifest, canonical validation of the complete path tuple, and no-follow SFTP
+verification of the remote binary's exact byte count and SHA-256. It stores the
+host binding separately and never places an SSH credential in the receipt.
+
+The app retains one accepted immutable lifecycle binary and layout tuple.
+Before each new sync channel it runs:
 
 ```text
 <absolute-verified-lifecycle-binary> deploy status \
