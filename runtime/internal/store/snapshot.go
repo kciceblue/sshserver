@@ -130,24 +130,35 @@ func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) 
 	var storedSnapshotID sql.NullString
 	var storedOwner sql.NullString
 	var storedCutBytes, storedGenerationBytes []byte
-	var storedSnapshotIDLength, storedOwnerLength, storedExpiresAt, storedResponseLength int64
+	var storedSnapshotIDLength, storedOwnerLength, storedFingerprintLength, storedCutLength, storedGenerationLength int64
+	var storedExpiresAt, storedResponseLength int64
 	err := transaction.QueryRowContext(ctx, `
 		SELECT octet_length(snapshot_id),
 		       CASE WHEN typeof(snapshot_id) = 'text' AND octet_length(snapshot_id) = ? THEN snapshot_id END,
 		       octet_length(owner_device_id),
 		       CASE WHEN typeof(owner_device_id) = 'text' AND octet_length(owner_device_id) = ? THEN owner_device_id END,
-		       request_fingerprint, cut_cursor,
-		       envelope_generation, expires_at_ms, length(create_response_json),
+		       octet_length(request_fingerprint),
+		       CASE WHEN typeof(request_fingerprint) = 'blob' AND octet_length(request_fingerprint) = 32 THEN request_fingerprint END,
+		       octet_length(cut_cursor),
+		       CASE WHEN typeof(cut_cursor) = 'blob' AND octet_length(cut_cursor) = 8 THEN cut_cursor END,
+		       octet_length(envelope_generation),
+		       CASE WHEN typeof(envelope_generation) = 'blob' AND octet_length(envelope_generation) = 8 THEN envelope_generation END,
+		       expires_at_ms, length(create_response_json),
 		       CASE WHEN length(create_response_json) BETWEEN 1 AND ? THEN create_response_json END
 		FROM snapshots
 		WHERE owner_device_id = ? AND request_id = ?`, maxUUIDBytes, maxUUIDBytes, maxBodyBytes, authenticated.DeviceID, call.RequestID,
-	).Scan(&storedSnapshotIDLength, &storedSnapshotID, &storedOwnerLength, &storedOwner, &storedFingerprint, &storedCutBytes, &storedGenerationBytes, &storedExpiresAt, &storedResponseLength, &storedResponse)
+	).Scan(&storedSnapshotIDLength, &storedSnapshotID, &storedOwnerLength, &storedOwner,
+		&storedFingerprintLength, &storedFingerprint, &storedCutLength, &storedCutBytes,
+		&storedGenerationLength, &storedGenerationBytes, &storedExpiresAt, &storedResponseLength, &storedResponse)
 	if err == nil {
 		storedCut, cutErr := DecodeUint64(storedCutBytes)
 		storedGeneration, generationErr := DecodeUint64(storedGenerationBytes)
 		if storedSnapshotIDLength != maxUUIDBytes || !boundedRequiredText(storedSnapshotIDLength, storedSnapshotID, maxUUIDBytes) || validateUUID(storedSnapshotID.String) != nil ||
 			storedOwnerLength != maxUUIDBytes || !boundedRequiredText(storedOwnerLength, storedOwner, maxUUIDBytes) || validateUUID(storedOwner.String) != nil ||
-			len(storedFingerprint) != 32 || cutErr != nil || generationErr != nil || !boundedRequiredBytes(storedResponseLength, storedResponse, maxBodyBytes) ||
+			!boundedRequiredBytes(storedFingerprintLength, storedFingerprint, 32) || storedFingerprintLength != 32 ||
+			!boundedRequiredBytes(storedCutLength, storedCutBytes, 8) || storedCutLength != 8 ||
+			!boundedRequiredBytes(storedGenerationLength, storedGenerationBytes, 8) || storedGenerationLength != 8 ||
+			cutErr != nil || generationErr != nil || !boundedRequiredBytes(storedResponseLength, storedResponse, maxBodyBytes) ||
 			validateStoredSnapshotCreateResponse(storedResponse, store.identity, storedSnapshotID.String, storedOwner.String, storedCut, storedGeneration, storedExpiresAt) != nil {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
@@ -265,7 +276,13 @@ func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) 
 		}
 	}
 	var maxReturnedBytes []byte
-	if err := transaction.QueryRowContext(ctx, "SELECT max_returned_cursor FROM device_sync_state WHERE device_id = ?", authenticated.DeviceID).Scan(&maxReturnedBytes); err != nil {
+	var maxReturnedLength int64
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT octet_length(max_returned_cursor),
+		       CASE WHEN typeof(max_returned_cursor) = 'blob' AND octet_length(max_returned_cursor) = 8 THEN max_returned_cursor END
+		FROM device_sync_state WHERE device_id = ?`, authenticated.DeviceID,
+	).Scan(&maxReturnedLength, &maxReturnedBytes); err != nil ||
+		!boundedRequiredBytes(maxReturnedLength, maxReturnedBytes, 8) || maxReturnedLength != 8 {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	maxReturned, err := DecodeUint64(maxReturnedBytes)
@@ -315,15 +332,21 @@ func (store *Store) handleSnapshotPage(ctx context.Context, call api.Request, sn
 	}
 	var ownerDeviceID sql.NullString
 	var cutBytes, generationBytes []byte
-	var ownerDeviceIDLength, expiresAt int64
+	var ownerDeviceIDLength, cutLength, generationLength, expiresAt int64
 	if err := transaction.QueryRowContext(ctx, `
 		SELECT octet_length(owner_device_id),
 		       CASE WHEN typeof(owner_device_id) = 'text' AND octet_length(owner_device_id) = ? THEN owner_device_id END,
-		       cut_cursor, envelope_generation, expires_at_ms
+		       octet_length(cut_cursor),
+		       CASE WHEN typeof(cut_cursor) = 'blob' AND octet_length(cut_cursor) = 8 THEN cut_cursor END,
+		       octet_length(envelope_generation),
+		       CASE WHEN typeof(envelope_generation) = 'blob' AND octet_length(envelope_generation) = 8 THEN envelope_generation END,
+		       expires_at_ms
 		FROM snapshots WHERE snapshot_id = ?`, maxUUIDBytes, snapshotID,
-	).Scan(&ownerDeviceIDLength, &ownerDeviceID, &cutBytes, &generationBytes, &expiresAt); errors.Is(err, sql.ErrNoRows) {
+	).Scan(&ownerDeviceIDLength, &ownerDeviceID, &cutLength, &cutBytes, &generationLength, &generationBytes, &expiresAt); errors.Is(err, sql.ErrNoRows) {
 		return api.Response{}, api.NewError("snapshot_not_found", false)
-	} else if err != nil || ownerDeviceIDLength != maxUUIDBytes || !boundedRequiredText(ownerDeviceIDLength, ownerDeviceID, maxUUIDBytes) || validateUUID(ownerDeviceID.String) != nil {
+	} else if err != nil || ownerDeviceIDLength != maxUUIDBytes || !boundedRequiredText(ownerDeviceIDLength, ownerDeviceID, maxUUIDBytes) || validateUUID(ownerDeviceID.String) != nil ||
+		!boundedRequiredBytes(cutLength, cutBytes, 8) || cutLength != 8 ||
+		!boundedRequiredBytes(generationLength, generationBytes, 8) || generationLength != 8 {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	if ownerDeviceID.String != authenticated.DeviceID {
@@ -362,16 +385,21 @@ func (store *Store) handleSnapshotPage(ctx context.Context, call api.Request, sn
 	revisions := make([]recordRevision, 0, len(descriptor.RevisionIDs))
 	for _, revisionID := range descriptor.RevisionIDs {
 		var revisionBody, storedHashBytes, referencedHashBytes []byte
-		var revisionLength int64
+		var revisionLength, storedHashLength, referencedHashLength int64
 		if err := transaction.QueryRowContext(ctx, `
 			SELECT length(o.revision_json),
 			       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END,
-			       o.content_hash, s.content_hash
+			       octet_length(o.content_hash),
+			       CASE WHEN typeof(o.content_hash) = 'blob' AND octet_length(o.content_hash) = 32 THEN o.content_hash END,
+			       octet_length(s.content_hash),
+			       CASE WHEN typeof(s.content_hash) = 'blob' AND octet_length(s.content_hash) = 32 THEN s.content_hash END
 			FROM snapshot_revision_refs s
 			JOIN revision_objects o USING (content_hash)
 			WHERE s.snapshot_id = ? AND s.revision_id = ?`, maxBodyBytes, snapshotID, revisionID,
-		).Scan(&revisionLength, &revisionBody, &storedHashBytes, &referencedHashBytes); err != nil ||
-			!boundedRequiredBytes(revisionLength, revisionBody, maxBodyBytes) || len(storedHashBytes) != 32 || len(referencedHashBytes) != 32 {
+		).Scan(&revisionLength, &revisionBody, &storedHashLength, &storedHashBytes, &referencedHashLength, &referencedHashBytes); err != nil ||
+			!boundedRequiredBytes(revisionLength, revisionBody, maxBodyBytes) ||
+			!boundedRequiredBytes(storedHashLength, storedHashBytes, 32) || storedHashLength != 32 ||
+			!boundedRequiredBytes(referencedHashLength, referencedHashBytes, 32) || referencedHashLength != 32 {
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		var storedHash, referencedHash [32]byte
@@ -542,7 +570,8 @@ func deleteSnapshotAndReleaseObjects(ctx context.Context, transaction *sql.Tx, s
 	rows, err := transaction.QueryContext(ctx, `
 		SELECT octet_length(revision_id),
 		       CASE WHEN typeof(revision_id) = 'text' AND octet_length(revision_id) = ? THEN revision_id END,
-		       content_hash
+		       octet_length(content_hash),
+		       CASE WHEN typeof(content_hash) = 'blob' AND octet_length(content_hash) = 32 THEN content_hash END
 		FROM snapshot_revision_refs
 		WHERE snapshot_id = ? ORDER BY revision_id`, maxUUIDBytes, snapshotID)
 	if err != nil {
@@ -552,10 +581,11 @@ func deleteSnapshotAndReleaseObjects(ctx context.Context, transaction *sql.Tx, s
 	for rows.Next() {
 		var reference snapshotRevisionReference
 		var revisionID sql.NullString
-		var revisionIDLength int64
+		var revisionIDLength, hashLength int64
 		var hashBytes []byte
-		if rows.Scan(&revisionIDLength, &revisionID, &hashBytes) != nil || revisionIDLength != maxUUIDBytes ||
-			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil || len(hashBytes) != 32 {
+		if rows.Scan(&revisionIDLength, &revisionID, &hashLength, &hashBytes) != nil || revisionIDLength != maxUUIDBytes ||
+			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil ||
+			!boundedRequiredBytes(hashLength, hashBytes, 32) || hashLength != 32 {
 			rows.Close()
 			return api.NewError("internal_error", true)
 		}
@@ -605,7 +635,9 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 		       CASE WHEN typeof(r.record_id) = 'text' AND octet_length(r.record_id) = ? THEN r.record_id END,
 		       octet_length(r.revision_id),
 		       CASE WHEN typeof(r.revision_id) = 'text' AND octet_length(r.revision_id) = ? THEN r.revision_id END,
-		       r.content_hash, length(o.revision_json),
+		       octet_length(r.content_hash),
+		       CASE WHEN typeof(r.content_hash) = 'blob' AND octet_length(r.content_hash) = 32 THEN r.content_hash END,
+		       length(o.revision_json),
 		       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END
 		FROM record_heads h
 		JOIN record_revisions r ON r.revision_id = h.revision_id
@@ -634,11 +666,12 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 		var recordID, revisionID sql.NullString
 		var recordIDLength, revisionIDLength int64
 		var hashBytes, body []byte
-		var bodyLength int64
+		var hashLength, bodyLength int64
 		var revision recordRevision
-		if rows.Scan(&recordIDLength, &recordID, &revisionIDLength, &revisionID, &hashBytes, &bodyLength, &body) != nil ||
+		if rows.Scan(&recordIDLength, &recordID, &revisionIDLength, &revisionID, &hashLength, &hashBytes, &bodyLength, &body) != nil ||
 			recordIDLength != maxUUIDBytes || !boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || validateUUID(recordID.String) != nil ||
-			revisionIDLength != maxUUIDBytes || !boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil || len(hashBytes) != 32 ||
+			revisionIDLength != maxUUIDBytes || !boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil ||
+			!boundedRequiredBytes(hashLength, hashBytes, 32) || hashLength != 32 ||
 			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
 			previousRecordID != "" && (recordID.String < previousRecordID || recordID.String == previousRecordID && revisionID.String <= previousRevisionID) ||
 			decodeStoredCanonical(body, &revision) != nil || revision.RecordID != recordID.String || revision.RevisionID != revisionID.String {
@@ -748,7 +781,8 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 	deviceRows, err := transaction.QueryContext(ctx, `
 		SELECT octet_length(device_id),
 		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
-		       max_author_counter
+		       octet_length(max_author_counter),
+		       CASE WHEN typeof(max_author_counter) = 'blob' AND octet_length(max_author_counter) = 8 THEN max_author_counter END
 		FROM devices ORDER BY device_id LIMIT 65`, maxUUIDBytes)
 	if err != nil {
 		return nil, nil, api.NewError("internal_error", true)
@@ -757,10 +791,11 @@ func buildSnapshotPlan(ctx context.Context, transaction *sql.Tx, snapshotID, own
 	var previousDeviceID string
 	for deviceRows.Next() {
 		var deviceID sql.NullString
-		var deviceIDLength int64
+		var deviceIDLength, counterLength int64
 		var counterBytes []byte
-		if deviceRows.Scan(&deviceIDLength, &deviceID, &counterBytes) != nil || deviceIDLength != maxUUIDBytes ||
+		if deviceRows.Scan(&deviceIDLength, &deviceID, &counterLength, &counterBytes) != nil || deviceIDLength != maxUUIDBytes ||
 			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			!boundedRequiredBytes(counterLength, counterBytes, 8) || counterLength != 8 ||
 			previousDeviceID != "" && previousDeviceID >= deviceID.String {
 			deviceRows.Close()
 			return nil, nil, api.NewError("internal_error", true)

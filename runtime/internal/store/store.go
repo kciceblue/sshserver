@@ -166,12 +166,21 @@ func (store *Store) CreateDevice(ctx context.Context, deviceID string, token []b
 	}
 	defer transaction.Rollback()
 	var cursorBytes, activeBootID []byte
+	var cursorLength int64
+	var activeBootLength sql.NullInt64
 	var snapshotCount int
 	if err := transaction.QueryRowContext(ctx, `
-		SELECT server_cursor, active_boot_id,
+		SELECT octet_length(server_cursor),
+		       CASE WHEN typeof(server_cursor) = 'blob' AND octet_length(server_cursor) = 8 THEN server_cursor END,
+		       octet_length(active_boot_id),
+		       CASE WHEN typeof(active_boot_id) = 'blob' AND octet_length(active_boot_id) = 16 THEN active_boot_id END,
 		       (SELECT count(*) FROM (SELECT 1 FROM snapshots LIMIT 1))
-		FROM runtime_state WHERE singleton = 1`).Scan(&cursorBytes, &activeBootID, &snapshotCount); err != nil {
+		FROM runtime_state WHERE singleton = 1`).Scan(&cursorLength, &cursorBytes, &activeBootLength, &activeBootID, &snapshotCount); err != nil {
 		return fmt.Errorf("read baseline activation state: %w", err)
+	}
+	if !boundedRequiredBytes(cursorLength, cursorBytes, 8) || cursorLength != 8 ||
+		!boundedOptionalBytes(activeBootLength, activeBootID, 16) || activeBootLength.Valid && activeBootLength.Int64 != 16 {
+		return errors.New("stored baseline activation state is invalid")
 	}
 	cursor, err := DecodeUint64(cursorBytes)
 	if err != nil || cursor != 0 || activeBootID != nil || snapshotCount != 0 {
@@ -215,18 +224,21 @@ func (store *Store) DeviceCredential(ctx context.Context, deviceID string) (hash
 	var hashBytes []byte
 	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	var scopesJSON sql.NullString
-	var scopesLength int64
+	var hashLength, scopesLength int64
 	if err := store.db.QueryRowContext(
 		ctx,
-		`SELECT token_hash, octet_length(scopes_json),
+		`SELECT octet_length(token_hash),
+		        CASE WHEN typeof(token_hash) = 'blob' AND octet_length(token_hash) = 32 THEN token_hash END,
+		        octet_length(scopes_json),
 		        CASE WHEN typeof(scopes_json) = 'text'
 		                   AND octet_length(scopes_json) = ? THEN scopes_json END
 		 FROM devices WHERE device_id = ?`,
 		len(wantScopes), deviceID,
-	).Scan(&hashBytes, &scopesLength, &scopesJSON); err != nil {
+	).Scan(&hashLength, &hashBytes, &scopesLength, &scopesJSON); err != nil {
 		return hash, nil, err
 	}
-	if len(hashBytes) != len(hash) || !boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) {
+	if !boundedRequiredBytes(hashLength, hashBytes, len(hash)) || hashLength != int64(len(hash)) ||
+		!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) {
 		return hash, nil, errors.New("stored device credential is invalid")
 	}
 	copy(hash[:], hashBytes)

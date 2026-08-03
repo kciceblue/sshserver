@@ -54,14 +54,26 @@ const collectionHeadsSQL = `
 		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
 		       length(r.vector_json),
 		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
-		       r.content_hash, length(r.collection_witness_authenticator),
-		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
+		       octet_length(r.content_hash),
+		       CASE WHEN typeof(r.content_hash) = 'blob'
+		                  AND octet_length(r.content_hash) = 32 THEN r.content_hash END,
+		       octet_length(r.collection_witness_authenticator),
+		       CASE WHEN typeof(r.collection_witness_authenticator) = 'blob'
+		                  AND octet_length(r.collection_witness_authenticator) = 32
+		            THEN r.collection_witness_authenticator END,
 		       r.tombstone,
-		       r.accepted_uptime_ms, r.accepted_uptime_ms,
+		       octet_length(r.accepted_uptime_ms),
+		       CASE WHEN typeof(r.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(r.accepted_uptime_ms) = 8 THEN r.accepted_uptime_ms END,
+		       octet_length(r.accepted_uptime_ms),
+		       CASE WHEN typeof(r.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(r.accepted_uptime_ms) = 8 THEN r.accepted_uptime_ms END,
 		       octet_length(a.accepted_uptime_ms),
 		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
 		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END,
-		       r.change_cursor
+		       octet_length(r.change_cursor),
+		       CASE WHEN typeof(r.change_cursor) = 'blob'
+		                  AND octet_length(r.change_cursor) = 8 THEN r.change_cursor END
 		FROM record_heads h JOIN record_revisions r ON r.revision_id = h.revision_id
 		LEFT JOIN revision_acceptance_origins a ON a.revision_id = r.revision_id
 		WHERE h.record_id = ?
@@ -76,14 +88,26 @@ const collectionCandidatesSQL = `
 		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
 		       length(r.vector_json),
 		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
-		       r.content_hash, length(r.collection_witness_authenticator),
-		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
+		       octet_length(r.content_hash),
+		       CASE WHEN typeof(r.content_hash) = 'blob'
+		                  AND octet_length(r.content_hash) = 32 THEN r.content_hash END,
+		       octet_length(r.collection_witness_authenticator),
+		       CASE WHEN typeof(r.collection_witness_authenticator) = 'blob'
+		                  AND octet_length(r.collection_witness_authenticator) = 32
+		            THEN r.collection_witness_authenticator END,
 		       r.tombstone,
-		       q.accepted_uptime_ms, r.accepted_uptime_ms,
+		       octet_length(q.accepted_uptime_ms),
+		       CASE WHEN typeof(q.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(q.accepted_uptime_ms) = 8 THEN q.accepted_uptime_ms END,
+		       octet_length(r.accepted_uptime_ms),
+		       CASE WHEN typeof(r.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(r.accepted_uptime_ms) = 8 THEN r.accepted_uptime_ms END,
 		       octet_length(a.accepted_uptime_ms),
 		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
 		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END,
-		       r.change_cursor
+		       octet_length(r.change_cursor),
+		       CASE WHEN typeof(r.change_cursor) = 'blob'
+		                  AND octet_length(r.change_cursor) = 8 THEN r.change_cursor END
 		FROM collection_candidates q
 		JOIN record_revisions r
 		  ON r.revision_id = q.revision_id AND r.record_id = q.record_id
@@ -126,7 +150,13 @@ func (store *Store) checkpointUptimeTx(ctx context.Context, transaction *sql.Tx,
 	store.ephemeral.mu.Unlock()
 
 	var encoded []byte
-	if err := transaction.QueryRowContext(ctx, "SELECT accumulated_uptime_ms FROM runtime_state WHERE singleton = 1").Scan(&encoded); err != nil {
+	var encodedLength int64
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT octet_length(accumulated_uptime_ms),
+		       CASE WHEN typeof(accumulated_uptime_ms) = 'blob'
+		                  AND octet_length(accumulated_uptime_ms) = 8 THEN accumulated_uptime_ms END
+		FROM runtime_state WHERE singleton = 1`,
+	).Scan(&encodedLength, &encoded); err != nil || encodedLength != 8 || !boundedRequiredBytes(encodedLength, encoded, 8) {
 		return 0, pendingUptimeCheckpoint{}, api.NewError("internal_error", true)
 	}
 	accumulated, err := DecodeUint64(encoded)
@@ -166,9 +196,14 @@ func (store *Store) commitUptimeTransaction(transaction *sql.Tx, checkpoint pend
 
 func (store *Store) collectEligible(ctx context.Context, transaction *sql.Tx, now time.Time, accumulatedUptimeMS, serverCursor uint64) (uint64, *api.Error) {
 	var collectionGenerationBytes []byte
+	var collectionGenerationLength int64
 	if err := transaction.QueryRowContext(ctx, `
-		SELECT collection_generation FROM runtime_state WHERE singleton = 1`,
-	).Scan(&collectionGenerationBytes); err != nil {
+		SELECT octet_length(collection_generation),
+		       CASE WHEN typeof(collection_generation) = 'blob'
+		                  AND octet_length(collection_generation) = 8 THEN collection_generation END
+		FROM runtime_state WHERE singleton = 1`,
+	).Scan(&collectionGenerationLength, &collectionGenerationBytes); err != nil ||
+		collectionGenerationLength != 8 || !boundedRequiredBytes(collectionGenerationLength, collectionGenerationBytes, 8) {
 		return 0, api.NewError("internal_error", true)
 	}
 	collectionGeneration, err := DecodeUint64(collectionGenerationBytes)
@@ -294,7 +329,11 @@ func (store *Store) collectEligible(ctx context.Context, transaction *sql.Tx, no
 }
 
 func loadActiveAcknowledgements(ctx context.Context, transaction *sql.Tx) ([]uint64, *api.Error) {
-	rows, err := transaction.QueryContext(ctx, "SELECT last_ack_cursor FROM devices WHERE revoked_at_ms IS NULL ORDER BY device_id LIMIT 65")
+	rows, err := transaction.QueryContext(ctx, `
+		SELECT octet_length(last_ack_cursor),
+		       CASE WHEN typeof(last_ack_cursor) = 'blob'
+		                  AND octet_length(last_ack_cursor) = 8 THEN last_ack_cursor END
+		FROM devices WHERE revoked_at_ms IS NULL ORDER BY device_id LIMIT 65`)
 	if err != nil {
 		return nil, api.NewError("internal_error", true)
 	}
@@ -302,7 +341,9 @@ func loadActiveAcknowledgements(ctx context.Context, transaction *sql.Tx) ([]uin
 	var result []uint64
 	for rows.Next() {
 		var encoded []byte
-		if err := rows.Scan(&encoded); err != nil {
+		var encodedLength int64
+		if err := rows.Scan(&encodedLength, &encoded); err != nil || encodedLength != 8 ||
+			!boundedRequiredBytes(encodedLength, encoded, 8) {
 			return nil, api.NewError("internal_error", true)
 		}
 		value, err := DecodeUint64(encoded)
@@ -369,7 +410,13 @@ func boundedEmptyOrUUIDText(length int64, value sql.NullString) bool {
 
 func loadCollectionRecordWork(ctx context.Context, transaction *sql.Tx, recordID string, accumulatedUptimeMS uint64) (uint64, []collectionRevision, []collectionRevision, *api.Error) {
 	var barrierBytes []byte
-	if err := transaction.QueryRowContext(ctx, "SELECT barrier_cursor FROM collection_records WHERE record_id = ?", recordID).Scan(&barrierBytes); err != nil {
+	var barrierLength int64
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT octet_length(barrier_cursor),
+		       CASE WHEN typeof(barrier_cursor) = 'blob'
+		                  AND octet_length(barrier_cursor) = 8 THEN barrier_cursor END
+		FROM collection_records WHERE record_id = ?`, recordID,
+	).Scan(&barrierLength, &barrierBytes); err != nil || barrierLength != 8 || !boundedRequiredBytes(barrierLength, barrierBytes, 8) {
 		return 0, nil, nil, api.NewError("internal_error", true)
 	}
 	barrier, err := DecodeUint64(barrierBytes)
@@ -408,14 +455,22 @@ func loadCollectionRevisionRows(ctx context.Context, transaction *sql.Tx, statem
 		var revision collectionRevision
 		var revisionID, recordID sql.NullString
 		var vectorBody, indexedAcceptedBytes, revisionAcceptedBytes, originAcceptedBytes, cursorBytes, contentHash, authenticator []byte
-		var revisionIDLength, recordIDLength, vectorLength int64
+		var revisionIDLength, recordIDLength, vectorLength, contentHashLength int64
+		var indexedAcceptedLength, revisionAcceptedLength, cursorLength int64
 		var authenticatorLength, originAcceptedLength sql.NullInt64
-		if rows.Scan(&revisionIDLength, &revisionID, &recordIDLength, &recordID, &vectorLength, &vectorBody, &contentHash, &authenticatorLength, &authenticator, &revision.tombstone, &indexedAcceptedBytes, &revisionAcceptedBytes, &originAcceptedLength, &originAcceptedBytes, &cursorBytes) != nil ||
+		if rows.Scan(&revisionIDLength, &revisionID, &recordIDLength, &recordID, &vectorLength, &vectorBody,
+			&contentHashLength, &contentHash, &authenticatorLength, &authenticator, &revision.tombstone,
+			&indexedAcceptedLength, &indexedAcceptedBytes, &revisionAcceptedLength, &revisionAcceptedBytes,
+			&originAcceptedLength, &originAcceptedBytes, &cursorLength, &cursorBytes) != nil ||
 			revisionIDLength != maxUUIDBytes || !boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil ||
-			recordIDLength != maxUUIDBytes || !boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || validateUUID(recordID.String) != nil || len(contentHash) != 32 ||
+			recordIDLength != maxUUIDBytes || !boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || validateUUID(recordID.String) != nil ||
+			contentHashLength != 32 || !boundedRequiredBytes(contentHashLength, contentHash, 32) ||
 			!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || !boundedOptionalBytes(authenticatorLength, authenticator, 32) ||
 			authenticatorLength.Valid && authenticatorLength.Int64 != 32 ||
-			!originAcceptedLength.Valid || originAcceptedLength.Int64 != 8 || len(originAcceptedBytes) != 8 ||
+			indexedAcceptedLength != 8 || !boundedRequiredBytes(indexedAcceptedLength, indexedAcceptedBytes, 8) ||
+			revisionAcceptedLength != 8 || !boundedRequiredBytes(revisionAcceptedLength, revisionAcceptedBytes, 8) ||
+			!originAcceptedLength.Valid || originAcceptedLength.Int64 != 8 || !boundedOptionalBytes(originAcceptedLength, originAcceptedBytes, 8) ||
+			cursorLength != 8 || !boundedRequiredBytes(cursorLength, cursorBytes, 8) ||
 			!bytes.Equal(indexedAcceptedBytes, revisionAcceptedBytes) || !bytes.Equal(revisionAcceptedBytes, originAcceptedBytes) {
 			return nil, api.NewError("internal_error", true)
 		}
@@ -449,7 +504,14 @@ func loadCollectionRevisionRows(ctx context.Context, transaction *sql.Tx, statem
 func deleteUnreferencedRevisionObject(ctx context.Context, transaction *sql.Tx, hash [32]byte, revisionID string) *api.Error {
 	var retained int
 	var revisionHash []byte
-	if err := transaction.QueryRowContext(ctx, "SELECT retained, content_hash FROM record_revisions WHERE revision_id = ?", revisionID).Scan(&retained, &revisionHash); err != nil || len(revisionHash) != 32 || !bytes.Equal(revisionHash, hash[:]) {
+	var revisionHashLength int64
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT retained, octet_length(content_hash),
+		       CASE WHEN typeof(content_hash) = 'blob'
+		                  AND octet_length(content_hash) = 32 THEN content_hash END
+		FROM record_revisions WHERE revision_id = ?`, revisionID,
+	).Scan(&retained, &revisionHashLength, &revisionHash); err != nil || revisionHashLength != 32 ||
+		!boundedRequiredBytes(revisionHashLength, revisionHash, 32) || !bytes.Equal(revisionHash, hash[:]) {
 		return api.NewError("internal_error", true)
 	}
 	if retained == 1 {
@@ -555,19 +617,29 @@ func loadCollectionMarker(ctx context.Context, transaction *sql.Tx, recordID str
 	}
 	var witnessRevisionID sql.NullString
 	var frontierBody, authenticator, barrierBytes []byte
-	var witnessRevisionIDLength, frontierLength, bodyLength int64
+	var witnessRevisionIDLength, frontierLength, authenticatorLength, barrierLength, bodyLength int64
 	err := transaction.QueryRowContext(ctx, `
 		SELECT octet_length(witness_revision_id),
 		       CASE WHEN typeof(witness_revision_id) = 'text'
 		                  AND octet_length(witness_revision_id) = ? THEN witness_revision_id END,
 		       length(frontier_json),
 		       CASE WHEN length(frontier_json) BETWEEN 1 AND ? THEN frontier_json END,
-		       collection_witness_authenticator, barrier_cursor, length(marker_json),
+		       octet_length(collection_witness_authenticator),
+		       CASE WHEN typeof(collection_witness_authenticator) = 'blob'
+		                  AND octet_length(collection_witness_authenticator) = 32
+		            THEN collection_witness_authenticator END,
+		       octet_length(barrier_cursor),
+		       CASE WHEN typeof(barrier_cursor) = 'blob'
+		                  AND octet_length(barrier_cursor) = 8 THEN barrier_cursor END,
+		       length(marker_json),
 		       CASE WHEN length(marker_json) BETWEEN 1 AND ? THEN marker_json END
 		FROM collection_markers WHERE record_id = ?`, maxUUIDBytes, maxVectorBytes, maxBodyBytes, recordID,
-	).Scan(&witnessRevisionIDLength, &witnessRevisionID, &frontierLength, &frontierBody, &authenticator, &barrierBytes, &bodyLength, &marker.body)
+	).Scan(&witnessRevisionIDLength, &witnessRevisionID, &frontierLength, &frontierBody,
+		&authenticatorLength, &authenticator, &barrierLength, &barrierBytes, &bodyLength, &marker.body)
 	if err != nil || witnessRevisionIDLength != maxUUIDBytes || !boundedRequiredText(witnessRevisionIDLength, witnessRevisionID, maxUUIDBytes) || validateUUID(witnessRevisionID.String) != nil ||
-		!boundedRequiredBytes(frontierLength, frontierBody, maxVectorBytes) || len(authenticator) != 32 ||
+		!boundedRequiredBytes(frontierLength, frontierBody, maxVectorBytes) ||
+		authenticatorLength != 32 || !boundedRequiredBytes(authenticatorLength, authenticator, 32) ||
+		barrierLength != 8 || !boundedRequiredBytes(barrierLength, barrierBytes, 8) ||
 		!boundedRequiredBytes(bodyLength, marker.body, maxBodyBytes) {
 		return marker, api.NewError("internal_error", true)
 	}

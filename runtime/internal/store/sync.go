@@ -79,12 +79,22 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 		return api.Response{}, api.NewError("invalid_request", false)
 	}
 	var storedAckBytes, maxCounterBytes, maxReturnedBytes []byte
+	var storedAckLength, maxCounterLength, maxReturnedLength int64
 	var createdAtMS int64
 	if err := transaction.QueryRowContext(ctx, `
-		SELECT d.created_at_ms, d.last_ack_cursor, d.max_author_counter, s.max_returned_cursor
+		SELECT d.created_at_ms,
+		       octet_length(d.last_ack_cursor),
+		       CASE WHEN typeof(d.last_ack_cursor) = 'blob' AND octet_length(d.last_ack_cursor) = 8 THEN d.last_ack_cursor END,
+		       octet_length(d.max_author_counter),
+		       CASE WHEN typeof(d.max_author_counter) = 'blob' AND octet_length(d.max_author_counter) = 8 THEN d.max_author_counter END,
+		       octet_length(s.max_returned_cursor),
+		       CASE WHEN typeof(s.max_returned_cursor) = 'blob' AND octet_length(s.max_returned_cursor) = 8 THEN s.max_returned_cursor END
 		FROM devices d JOIN device_sync_state s USING (device_id)
 		WHERE d.device_id = ?`, authenticated.DeviceID,
-	).Scan(&createdAtMS, &storedAckBytes, &maxCounterBytes, &maxReturnedBytes); err != nil {
+	).Scan(&createdAtMS, &storedAckLength, &storedAckBytes, &maxCounterLength, &maxCounterBytes, &maxReturnedLength, &maxReturnedBytes); err != nil ||
+		!boundedRequiredBytes(storedAckLength, storedAckBytes, 8) || storedAckLength != 8 ||
+		!boundedRequiredBytes(maxCounterLength, maxCounterBytes, 8) || maxCounterLength != 8 ||
+		!boundedRequiredBytes(maxReturnedLength, maxReturnedBytes, 8) || maxReturnedLength != 8 {
 		return api.Response{}, api.NewError("internal_error", true)
 	}
 	storedAck, err := DecodeUint64(storedAckBytes)
@@ -454,9 +464,14 @@ func (store *Store) validateMutations(ctx context.Context, transaction *sql.Tx, 
 		vectorJSON, _ := json.Marshal(revision.VersionVector)
 		vectorHash := sha256.Sum256(vectorJSON)
 		var storedHash []byte
-		err = transaction.QueryRowContext(ctx, "SELECT content_hash FROM record_revisions WHERE revision_id = ?", revision.RevisionID).Scan(&storedHash)
+		var storedHashLength int64
+		err = transaction.QueryRowContext(ctx, `
+			SELECT octet_length(content_hash),
+			       CASE WHEN typeof(content_hash) = 'blob' AND octet_length(content_hash) = 32 THEN content_hash END
+			FROM record_revisions WHERE revision_id = ?`, revision.RevisionID,
+		).Scan(&storedHashLength, &storedHash)
 		if err == nil {
-			if len(storedHash) != 32 {
+			if !boundedRequiredBytes(storedHashLength, storedHash, 32) || storedHashLength != 32 {
 				return nil, 0, 0, api.NewError("internal_error", true)
 			}
 			var recorded [32]byte
@@ -578,9 +593,14 @@ func validateVectorRegistry(ctx context.Context, transaction *sql.Tx, authorDevi
 			continue
 		}
 		var storedCounter []byte
-		if err := transaction.QueryRowContext(ctx, "SELECT max_author_counter FROM devices WHERE device_id = ?", vectorDeviceID).Scan(&storedCounter); errors.Is(err, sql.ErrNoRows) {
+		var storedCounterLength int64
+		if err := transaction.QueryRowContext(ctx, `
+			SELECT octet_length(max_author_counter),
+			       CASE WHEN typeof(max_author_counter) = 'blob' AND octet_length(max_author_counter) = 8 THEN max_author_counter END
+			FROM devices WHERE device_id = ?`, vectorDeviceID,
+		).Scan(&storedCounterLength, &storedCounter); errors.Is(err, sql.ErrNoRows) {
 			return api.NewError("invalid_request", false)
-		} else if err != nil {
+		} else if err != nil || !boundedRequiredBytes(storedCounterLength, storedCounter, 8) || storedCounterLength != 8 {
 			return api.NewError("internal_error", true)
 		}
 		maximum, err := DecodeUint64(storedCounter)
@@ -702,7 +722,9 @@ func loadChanges(ctx context.Context, transaction *sql.Tx, afterCursor uint64) (
 	const maximumKindBytes = len("collection_marker")
 	after := EncodeUint64(afterCursor)
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT cursor, octet_length(kind),
+		SELECT octet_length(cursor),
+		       CASE WHEN typeof(cursor) = 'blob' AND octet_length(cursor) = 8 THEN cursor END,
+		       octet_length(kind),
 		       CASE WHEN typeof(kind) = 'text' AND octet_length(kind) BETWEEN 1 AND ?
 		                  AND kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed') THEN kind END,
 		       received_at_ms,
@@ -720,6 +742,7 @@ func loadChanges(ctx context.Context, transaction *sql.Tx, afterCursor uint64) (
 	}
 	type storedChange struct {
 		cursorBytes    []byte
+		cursorLength   int64
 		kind           string
 		receivedAt     int64
 		revisionID     sql.NullString
@@ -732,8 +755,9 @@ func loadChanges(ctx context.Context, transaction *sql.Tx, afterCursor uint64) (
 		var kind sql.NullString
 		var kindLength int64
 		var revisionIDLength, markerIDLength, markerBodyLength sql.NullInt64
-		if err := rows.Scan(&item.cursorBytes, &kindLength, &kind, &item.receivedAt,
+		if err := rows.Scan(&item.cursorLength, &item.cursorBytes, &kindLength, &kind, &item.receivedAt,
 			&revisionIDLength, &item.revisionID, &markerIDLength, &item.markerRecordID, &markerBodyLength, &item.markerBody); err != nil ||
+			!boundedRequiredBytes(item.cursorLength, item.cursorBytes, 8) || item.cursorLength != 8 ||
 			!boundedRequiredText(kindLength, kind, maximumKindBytes) ||
 			!boundedOptionalText(revisionIDLength, item.revisionID, maxUUIDBytes) || revisionIDLength.Valid && revisionIDLength.Int64 != maxUUIDBytes ||
 			item.revisionID.Valid && validateUUID(item.revisionID.String) != nil ||
@@ -767,14 +791,16 @@ func loadChanges(ctx context.Context, transaction *sql.Tx, afterCursor uint64) (
 		switch storedItem.kind {
 		case "record_revision":
 			var body, hashBytes []byte
-			var bodyLength int64
+			var bodyLength, hashLength int64
 			if !storedItem.revisionID.Valid || transaction.QueryRowContext(ctx, `
 				SELECT length(o.revision_json),
 				       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END,
-				       r.content_hash
+				       octet_length(r.content_hash),
+				       CASE WHEN typeof(r.content_hash) = 'blob' AND octet_length(r.content_hash) = 32 THEN r.content_hash END
 				FROM record_revisions r JOIN revision_objects o USING (content_hash)
 				WHERE r.revision_id = ? AND r.retained = 1`, maxBodyBytes, storedItem.revisionID.String,
-			).Scan(&bodyLength, &body, &hashBytes) != nil || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) || len(hashBytes) != 32 {
+			).Scan(&bodyLength, &body, &hashLength, &hashBytes) != nil || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
+				!boundedRequiredBytes(hashLength, hashBytes, 32) || hashLength != 32 {
 				return nil, 0, false, api.NewError("internal_error", true)
 			}
 			var revision recordRevision

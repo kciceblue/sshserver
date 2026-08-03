@@ -255,7 +255,9 @@ func (store *Store) authenticate(ctx context.Context, transaction *sql.Tx, autho
 	rows, err := transaction.QueryContext(ctx, `
 		SELECT octet_length(device_id),
 		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
-		       token_hash, octet_length(scopes_json),
+		       octet_length(token_hash),
+		       CASE WHEN typeof(token_hash) = 'blob' AND octet_length(token_hash) = 32 THEN token_hash END,
+		       octet_length(scopes_json),
 		       CASE WHEN typeof(scopes_json) = 'text' AND octet_length(scopes_json) = ? THEN scopes_json END,
 		       revoked_at_ms IS NOT NULL
 		FROM devices ORDER BY device_id LIMIT 65`, maxUUIDBytes, len(wantScopes))
@@ -269,11 +271,12 @@ func (store *Store) authenticate(ctx context.Context, transaction *sql.Tx, autho
 		rowCount++
 		var deviceID sql.NullString
 		var scopesJSON sql.NullString
-		var deviceIDLength, scopesLength int64
+		var deviceIDLength, storedLength, scopesLength int64
 		var storedBytes []byte
 		var revoked bool
-		if err := rows.Scan(&deviceIDLength, &deviceID, &storedBytes, &scopesLength, &scopesJSON, &revoked); err != nil ||
-			deviceIDLength != maxUUIDBytes || !boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil || len(storedBytes) != 32 ||
+		if err := rows.Scan(&deviceIDLength, &deviceID, &storedLength, &storedBytes, &scopesLength, &scopesJSON, &revoked); err != nil ||
+			deviceIDLength != maxUUIDBytes || !boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			!boundedRequiredBytes(storedLength, storedBytes, 32) || storedLength != 32 ||
 			scopesLength != int64(len(wantScopes)) ||
 			!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) {
 			return deviceAuth{}, api.NewError("internal_error", true)
@@ -336,21 +339,24 @@ func requestFingerprint(store *Store, label, deviceID string, body []byte) ([32]
 
 func (store *Store) lookupReceipt(ctx context.Context, transaction *sql.Tx, deviceID, operation, requestID string, fingerprint [32]byte) (api.Response, bool, *api.Error) {
 	var storedFingerprint, body []byte
-	var bodyLength int64
+	var fingerprintLength, bodyLength int64
 	var status int
 	err := transaction.QueryRowContext(ctx, `
-		SELECT request_fingerprint, response_status, length(response_json),
+		SELECT octet_length(request_fingerprint),
+		       CASE WHEN typeof(request_fingerprint) = 'blob' AND octet_length(request_fingerprint) = 32 THEN request_fingerprint END,
+		       response_status, length(response_json),
 		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
 		FROM operation_receipts WHERE device_id = ? AND operation = ? AND request_id = ?`,
 		maxBodyBytes, deviceID, operation, requestID,
-	).Scan(&storedFingerprint, &status, &bodyLength, &body)
+	).Scan(&fingerprintLength, &storedFingerprint, &status, &bodyLength, &body)
 	if errors.Is(err, sql.ErrNoRows) {
 		if protocolErr := preflightOperationReceiptKeys(ctx, transaction, deviceID, operation, requestID, fingerprint); protocolErr != nil {
 			return api.Response{}, false, protocolErr
 		}
 		return api.Response{}, false, nil
 	}
-	if err != nil || len(storedFingerprint) != 32 || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
+	if err != nil || !boundedRequiredBytes(fingerprintLength, storedFingerprint, 32) || fingerprintLength != 32 ||
+		!boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
 		validateStoredOperationResponse(operation, status, body, store.identity) != nil {
 		return api.Response{}, false, api.NewError("internal_error", true)
 	}
@@ -417,7 +423,10 @@ const receiptCandidateValidationQuery = `
 	       octet_length(q.device_id),
 	       CASE WHEN typeof(q.device_id) = 'text' AND octet_length(q.device_id) = ? THEN q.device_id END,
 	       CASE WHEN typeof(q.receipt_class) = 'text' AND q.receipt_class IN ('sync', 'other') THEN q.receipt_class END,
-	       r.created_uptime_ms, q.created_uptime_ms
+	       octet_length(r.created_uptime_ms),
+	       CASE WHEN typeof(r.created_uptime_ms) = 'blob' AND octet_length(r.created_uptime_ms) = 8 THEN r.created_uptime_ms END,
+	       octet_length(q.created_uptime_ms),
+	       CASE WHEN typeof(q.created_uptime_ms) = 'blob' AND octet_length(q.created_uptime_ms) = 8 THEN q.created_uptime_ms END
 	FROM operation_receipts r
 	LEFT JOIN operation_receipt_retention q ON q.receipt_sequence = r.receipt_sequence
 	WHERE r.receipt_sequence = ? LIMIT 2`
@@ -525,8 +534,8 @@ func validateReceiptKeyCandidate(ctx context.Context, transaction *sql.Tx, seque
 		var receiptSequence int64
 		var mappingSequence sql.NullInt64
 		var receiptDeviceID, operation, storedRequestID, mappingDeviceID, receiptClass sql.NullString
-		var receiptDeviceIDLength, operationLength, storedRequestIDLength int64
-		var mappingDeviceIDLength sql.NullInt64
+		var receiptDeviceIDLength, operationLength, storedRequestIDLength, receiptUptimeLength int64
+		var mappingDeviceIDLength, mappingUptimeLength sql.NullInt64
 		var receiptUptime, mappingUptime []byte
 		if rows.Scan(
 			&receiptSequence,
@@ -535,7 +544,7 @@ func validateReceiptKeyCandidate(ctx context.Context, transaction *sql.Tx, seque
 			&storedRequestIDLength, &storedRequestID,
 			&mappingSequence,
 			&mappingDeviceIDLength, &mappingDeviceID, &receiptClass,
-			&receiptUptime, &mappingUptime,
+			&receiptUptimeLength, &receiptUptime, &mappingUptimeLength, &mappingUptime,
 		) != nil || receiptSequence != sequence ||
 			!boundedRequiredText(receiptDeviceIDLength, receiptDeviceID, maxUUIDBytes) || receiptDeviceIDLength != maxUUIDBytes ||
 			validateUUID(receiptDeviceID.String) != nil || receiptDeviceID.String != deviceID ||
@@ -547,6 +556,8 @@ func validateReceiptKeyCandidate(ctx context.Context, transaction *sql.Tx, seque
 			!boundedOptionalText(mappingDeviceIDLength, mappingDeviceID, maxUUIDBytes) || !mappingDeviceIDLength.Valid ||
 			mappingDeviceIDLength.Int64 != maxUUIDBytes || validateUUID(mappingDeviceID.String) != nil || mappingDeviceID.String != receiptDeviceID.String ||
 			!receiptClass.Valid || (operation.String == "sync") != (receiptClass.String == "sync") ||
+			!boundedRequiredBytes(receiptUptimeLength, receiptUptime, 8) || receiptUptimeLength != 8 ||
+			!boundedOptionalBytes(mappingUptimeLength, mappingUptime, 8) || !mappingUptimeLength.Valid || mappingUptimeLength.Int64 != 8 ||
 			decodeUint64Error(receiptUptime) != nil || decodeUint64Error(mappingUptime) != nil || !bytes.Equal(receiptUptime, mappingUptime) {
 			return api.NewError("internal_error", true)
 		}
@@ -675,11 +686,22 @@ func pruneOperationReceipts(ctx context.Context, transaction *sql.Tx, deviceID, 
 
 func readRuntimeState(ctx context.Context, transaction *sql.Tx) (cursor, envelopeGeneration, secretGeneration, collectionGeneration uint64, err *api.Error) {
 	var cursorBytes, envelopeBytes, secretBytes, collectionBytes []byte
+	var cursorLength, envelopeLength, secretLength, collectionLength int64
 	if scanErr := transaction.QueryRowContext(ctx, `
-		SELECT server_cursor, envelope_generation, instance_secret_generation,
-		       collection_generation
+		SELECT octet_length(server_cursor),
+		       CASE WHEN typeof(server_cursor) = 'blob' AND octet_length(server_cursor) = 8 THEN server_cursor END,
+		       octet_length(envelope_generation),
+		       CASE WHEN typeof(envelope_generation) = 'blob' AND octet_length(envelope_generation) = 8 THEN envelope_generation END,
+		       octet_length(instance_secret_generation),
+		       CASE WHEN typeof(instance_secret_generation) = 'blob' AND octet_length(instance_secret_generation) = 8 THEN instance_secret_generation END,
+		       octet_length(collection_generation),
+		       CASE WHEN typeof(collection_generation) = 'blob' AND octet_length(collection_generation) = 8 THEN collection_generation END
 		FROM runtime_state WHERE singleton = 1`,
-	).Scan(&cursorBytes, &envelopeBytes, &secretBytes, &collectionBytes); scanErr != nil {
+	).Scan(&cursorLength, &cursorBytes, &envelopeLength, &envelopeBytes, &secretLength, &secretBytes, &collectionLength, &collectionBytes); scanErr != nil ||
+		!boundedRequiredBytes(cursorLength, cursorBytes, 8) || cursorLength != 8 ||
+		!boundedRequiredBytes(envelopeLength, envelopeBytes, 8) || envelopeLength != 8 ||
+		!boundedRequiredBytes(secretLength, secretBytes, 8) || secretLength != 8 ||
+		!boundedRequiredBytes(collectionLength, collectionBytes, 8) || collectionLength != 8 {
 		return 0, 0, 0, 0, api.NewError("internal_error", true)
 	}
 	var decodeErr error
@@ -700,7 +722,12 @@ func readRuntimeState(ctx context.Context, transaction *sql.Tx) (cursor, envelop
 
 func readCursorFloor(ctx context.Context, transaction *sql.Tx) (uint64, *api.Error) {
 	var encoded []byte
-	if err := transaction.QueryRowContext(ctx, "SELECT cursor_floor FROM runtime_state WHERE singleton = 1").Scan(&encoded); err != nil {
+	var encodedLength int64
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT octet_length(cursor_floor),
+		       CASE WHEN typeof(cursor_floor) = 'blob' AND octet_length(cursor_floor) = 8 THEN cursor_floor END
+		FROM runtime_state WHERE singleton = 1`,
+	).Scan(&encodedLength, &encoded); err != nil || !boundedRequiredBytes(encodedLength, encoded, 8) || encodedLength != 8 {
 		return 0, api.NewError("internal_error", true)
 	}
 	value, err := DecodeUint64(encoded)

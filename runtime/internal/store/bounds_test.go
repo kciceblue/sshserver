@@ -516,16 +516,48 @@ func TestMaximumStoredVectorBoundMatchesCanonicalProfile(t *testing.T) {
 	}
 }
 
+func writeOversizedCheckedBlob(t *testing.T, database *sql.DB, statement string, arguments ...any) {
+	t.Helper()
+	if _, err := database.Exec("PRAGMA ignore_check_constraints = ON"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := database.Exec("PRAGMA ignore_check_constraints = OFF"); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if _, err := database.Exec(statement, arguments...); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOversizedDurableValuesFailClosedAtStartup(t *testing.T) {
 	wantScopes, _ := json.Marshal(auth.FixedScopes())
 	tests := []struct {
-		name    string
-		options boundedSeedOptions
-		mutate  func(*testing.T, boundedPersistenceSeed)
+		name       string
+		options    boundedSeedOptions
+		mutate     func(*testing.T, boundedPersistenceSeed)
+		wantDetail string
 	}{
 		{name: "device scopes text", mutate: func(t *testing.T, seed boundedPersistenceSeed) {
 			_, err := seed.opened.db.Exec("UPDATE devices SET scopes_json = ?", strings.Repeat("x", len(wantScopes)+1))
 			checkMutation(t, err)
+		}},
+		{name: "device token hash", wantDetail: "invalid device row", mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+			writeOversizedCheckedBlob(t, seed.opened.db,
+				"UPDATE devices SET token_hash = zeroblob(?) WHERE device_id = ?", maxBodyBytes+1, seed.deviceID)
+		}},
+		{name: "device last ack cursor", wantDetail: "invalid device row", mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+			writeOversizedCheckedBlob(t, seed.opened.db,
+				"UPDATE devices SET last_ack_cursor = zeroblob(?) WHERE device_id = ?", maxBodyBytes+1, seed.deviceID)
+		}},
+		{name: "device author counter", wantDetail: "invalid device row", mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+			writeOversizedCheckedBlob(t, seed.opened.db,
+				"UPDATE devices SET max_author_counter = zeroblob(?) WHERE device_id = ?", maxBodyBytes+1, seed.deviceID)
+		}},
+		{name: "device max returned cursor", wantDetail: "invalid device row", mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+			writeOversizedCheckedBlob(t, seed.opened.db,
+				"UPDATE device_sync_state SET max_returned_cursor = zeroblob(?) WHERE device_id = ?", maxBodyBytes+1, seed.deviceID)
 		}},
 		{name: "envelope body", mutate: func(t *testing.T, seed boundedPersistenceSeed) {
 			_, err := seed.opened.db.Exec("UPDATE vault_envelope SET envelope_json = zeroblob(?)", maxBodyBytes+1)
@@ -600,6 +632,12 @@ func TestOversizedDurableValuesFailClosedAtStartup(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			seed := seedBoundedPersistence(t, test.options)
 			test.mutate(t, seed)
+			if test.wantDetail != "" {
+				if err := seed.opened.Ready(context.Background()); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid readiness device sentinel") {
+					seed.opened.Close()
+					t.Fatalf("oversized durable value readiness error=%v", err)
+				}
+			}
 			if err := seed.opened.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -609,6 +647,39 @@ func TestOversizedDurableValuesFailClosedAtStartup(t *testing.T) {
 			}
 			if !errors.Is(err, ErrUnexpectedSchema) {
 				t.Fatalf("oversized durable value startup error=%v", err)
+			}
+			if test.wantDetail != "" && !strings.Contains(err.Error(), test.wantDetail) {
+				t.Fatalf("oversized durable value startup detail=%v, want=%q", err, test.wantDetail)
+			}
+		})
+	}
+}
+
+func TestDeviceFixedBlobStorageClassesFailClosed(t *testing.T) {
+	tests := []struct {
+		name      string
+		table     string
+		statement string
+		value     string
+	}{
+		{name: "token hash", table: "devices", statement: "UPDATE devices SET token_hash = CAST(? AS TEXT) WHERE device_id = ?", value: strings.Repeat("h", 32)},
+		{name: "last ack cursor", table: "devices", statement: "UPDATE devices SET last_ack_cursor = CAST(? AS TEXT) WHERE device_id = ?", value: "12345678"},
+		{name: "author counter", table: "devices", statement: "UPDATE devices SET max_author_counter = CAST(? AS TEXT) WHERE device_id = ?", value: "12345678"},
+		{name: "max returned cursor", table: "device_sync_state", statement: "UPDATE device_sync_state SET max_returned_cursor = CAST(? AS TEXT) WHERE device_id = ?", value: "12345678"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			seed := seedBoundedPersistence(t, boundedSeedOptions{})
+			mutateValidationOwnerWrongType(t, seed.opened.db, test.table, test.statement, test.value, seed.deviceID)
+			if err := seed.opened.Ready(context.Background()); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid readiness device sentinel") {
+				seed.opened.Close()
+				t.Fatalf("wrong-type fixed BLOB readiness error=%v", err)
+			}
+			if err := seed.opened.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(context.Background(), seed.path, testIdentity); !errors.Is(err, ErrUnexpectedSchema) || !strings.Contains(err.Error(), "invalid device row") {
+				t.Fatalf("wrong-type fixed BLOB startup error=%v", err)
 			}
 		})
 	}
@@ -647,6 +718,36 @@ func TestOversizedDurableValuesFailClosedOnLiveReplayAndRead(t *testing.T) {
 			},
 		},
 		{
+			name: "device token hash during authentication",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE devices SET token_hash = zeroblob(?) WHERE device_id = ?", maxBodyBytes+1, seed.deviceID)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request {
+				return api.Request{Method: "GET", Path: "/v1/devices", RequestID: "e2000000-0000-4000-8000-00000000000b", Authorization: authorization(seed.token), Now: protocolFixtureTime}
+			},
+		},
+		{
+			name: "device ack cursor during list read",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE devices SET last_ack_cursor = zeroblob(?) WHERE device_id = ?", maxBodyBytes+1, seed.deviceID)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request {
+				return api.Request{Method: "GET", Path: "/v1/devices", RequestID: "e2000000-0000-4000-8000-00000000000c", Authorization: authorization(seed.token), Now: protocolFixtureTime}
+			},
+		},
+		{
+			name: "device author counter during list read",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE devices SET max_author_counter = zeroblob(?) WHERE device_id = ?", maxBodyBytes+1, seed.deviceID)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request {
+				return api.Request{Method: "GET", Path: "/v1/devices", RequestID: "e2000000-0000-4000-8000-00000000000d", Authorization: authorization(seed.token), Now: protocolFixtureTime}
+			},
+		},
+		{
 			name: "envelope body",
 			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
 				_, err := seed.opened.db.Exec("UPDATE vault_envelope SET envelope_json = zeroblob(?)", maxBodyBytes+1)
@@ -657,10 +758,48 @@ func TestOversizedDurableValuesFailClosedOnLiveReplayAndRead(t *testing.T) {
 			},
 		},
 		{
+			name: "runtime server cursor",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE runtime_state SET server_cursor = zeroblob(?) WHERE singleton = 1", maxBodyBytes+1)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request {
+				return api.Request{Method: "GET", Path: "/v1/vault-envelope", RequestID: "e2000000-0000-4000-8000-00000000000e", Authorization: authorization(seed.token), Now: protocolFixtureTime}
+			},
+		},
+		{
+			name: "runtime cursor floor",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE runtime_state SET cursor_floor = zeroblob(?) WHERE singleton = 1", maxBodyBytes+1)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request {
+				return boundedSyncCall(seed, "e2000000-0000-4000-8000-00000000000f", "0", nil)
+			},
+		},
+		{
+			name: "envelope generation",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE vault_envelope SET generation = zeroblob(?) WHERE singleton = 1", maxBodyBytes+1)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request {
+				return api.Request{Method: "GET", Path: "/v1/vault-envelope", RequestID: "e2000000-0000-4000-8000-000000000010", Authorization: authorization(seed.token), Now: protocolFixtureTime}
+			},
+		},
+		{
 			name: "operation response replay",
 			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
 				_, err := seed.opened.db.Exec("UPDATE operation_receipts SET response_json = zeroblob(?) WHERE operation = 'sync'", maxBodyBytes+1)
 				checkMutation(t, err)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request { return seed.sync },
+		},
+		{
+			name: "operation fingerprint replay",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE operation_receipts SET request_fingerprint = zeroblob(?) WHERE operation = 'sync'", maxBodyBytes+1)
 			},
 			call: func(seed boundedPersistenceSeed) api.Request { return seed.sync },
 		},
@@ -677,6 +816,22 @@ func TestOversizedDurableValuesFailClosedOnLiveReplayAndRead(t *testing.T) {
 			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
 				_, err := seed.opened.db.Exec("UPDATE enrollments SET response_json = zeroblob(?)", maxBodyBytes+1)
 				checkMutation(t, err)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request { return seed.enrollment },
+		},
+		{
+			name: "enrollment token hash replay",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE enrollments SET token_hash = zeroblob(?)", maxBodyBytes+1)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request { return seed.enrollment },
+		},
+		{
+			name: "enrollment fingerprint replay",
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE enrollments SET request_fingerprint = zeroblob(?)", maxBodyBytes+1)
 			},
 			call: func(seed boundedPersistenceSeed) api.Request { return seed.enrollment },
 		},
@@ -722,6 +877,33 @@ func TestOversizedDurableValuesFailClosedOnLiveReplayAndRead(t *testing.T) {
 			call: func(seed boundedPersistenceSeed) api.Request { return seed.rotation },
 		},
 		{
+			name:    "token rotation old hash replay",
+			options: boundedSeedOptions{rotation: true},
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE token_rotations SET old_token_hash = zeroblob(?)", maxBodyBytes+1)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request { return seed.rotation },
+		},
+		{
+			name:    "token rotation new hash replay",
+			options: boundedSeedOptions{rotation: true},
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE token_rotations SET new_token_hash = zeroblob(?)", maxBodyBytes+1)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request { return seed.rotation },
+		},
+		{
+			name:    "token rotation fingerprint replay",
+			options: boundedSeedOptions{rotation: true},
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE token_rotations SET request_fingerprint = zeroblob(?)", maxBodyBytes+1)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request { return seed.rotation },
+		},
+		{
 			name:    "self-revocation headers replay",
 			options: boundedSeedOptions{self: true},
 			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
@@ -739,6 +921,24 @@ func TestOversizedDurableValuesFailClosedOnLiveReplayAndRead(t *testing.T) {
 			},
 			call: func(seed boundedPersistenceSeed) api.Request { return seed.selfRevocation },
 		},
+		{
+			name:    "self-revocation retired token hash",
+			options: boundedSeedOptions{self: true},
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE self_revocation_receipts SET pre_revocation_token_hash = zeroblob(?)", maxBodyBytes+1)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request { return seed.selfRevocation },
+		},
+		{
+			name:    "self-revocation fingerprint replay",
+			options: boundedSeedOptions{self: true},
+			mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+				writeOversizedCheckedBlob(t, seed.opened.db,
+					"UPDATE self_revocation_receipts SET body_fingerprint = zeroblob(?)", maxBodyBytes+1)
+			},
+			call: func(seed boundedPersistenceSeed) api.Request { return seed.selfRevocation },
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -750,18 +950,105 @@ func TestOversizedDurableValuesFailClosedOnLiveReplayAndRead(t *testing.T) {
 	}
 }
 
-func TestOversizedDeviceScopesFailClosedOnDirectReads(t *testing.T) {
+func TestOversizedDeviceCredentialsFailClosedOnDirectReads(t *testing.T) {
+	wantScopes, _ := json.Marshal(auth.FixedScopes())
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, boundedPersistenceSeed)
+	}{
+		{name: "scopes", mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+			if _, err := seed.opened.db.Exec("UPDATE devices SET scopes_json = ?", strings.Repeat("x", len(wantScopes)+1)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "token hash", mutate: func(t *testing.T, seed boundedPersistenceSeed) {
+			writeOversizedCheckedBlob(t, seed.opened.db,
+				"UPDATE devices SET token_hash = zeroblob(?) WHERE device_id = ?", maxBodyBytes+1, seed.deviceID)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			seed := seedBoundedPersistence(t, boundedSeedOptions{})
+			defer seed.opened.Close()
+			test.mutate(t, seed)
+			if _, _, protocolErr := readDevice(context.Background(), seed.opened.db, seed.deviceID); protocolErr == nil || protocolErr.Code != "internal_error" {
+				t.Fatalf("direct device read error=%v", protocolErr)
+			}
+			if _, _, err := seed.opened.DeviceCredential(context.Background(), seed.deviceID); err == nil {
+				t.Fatal("direct device credential accepted oversized durable value")
+			}
+		})
+	}
+}
+
+func TestOversizedGrantHashFailsClosedBeforeComparison(t *testing.T) {
 	seed := seedBoundedPersistence(t, boundedSeedOptions{})
 	defer seed.opened.Close()
-	wantScopes, _ := json.Marshal(auth.FixedScopes())
-	if _, err := seed.opened.db.Exec("UPDATE devices SET scopes_json = ?", strings.Repeat("x", len(wantScopes)+1)); err != nil {
+	writeOversizedCheckedBlob(t, seed.opened.db,
+		"UPDATE enrollment_grants SET grant_hash = zeroblob(?)", maxBodyBytes+1)
+	transaction, err := seed.opened.db.Begin()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, protocolErr := readDevice(context.Background(), seed.opened.db, seed.deviceID); protocolErr == nil || protocolErr.Code != "internal_error" {
-		t.Fatalf("direct device read error=%v", protocolErr)
+	defer transaction.Rollback()
+	if _, protocolErr := seed.opened.lookupGrant(context.Background(), transaction, [32]byte{}, protocolFixtureTime); protocolErr == nil || protocolErr.Code != "internal_error" {
+		t.Fatalf("oversized grant hash error=%v", protocolErr)
 	}
-	if _, _, err := seed.opened.DeviceCredential(context.Background(), seed.deviceID); err == nil {
-		t.Fatal("direct device credential accepted oversized scopes")
+}
+
+func TestOversizedReceiptUptimesFailClosedBeforeComparison(t *testing.T) {
+	tests := []struct {
+		name      string
+		table     string
+		statement string
+	}{
+		{name: "receipt", table: "operation_receipts", statement: "UPDATE operation_receipts SET created_uptime_ms = zeroblob(?) WHERE receipt_sequence = ?"},
+		{name: "retention mapping", table: "operation_receipt_retention", statement: "UPDATE operation_receipt_retention SET created_uptime_ms = zeroblob(?) WHERE receipt_sequence = ?"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			seed := seedBoundedPersistence(t, boundedSeedOptions{})
+			defer seed.opened.Close()
+			var sequence int64
+			if err := seed.opened.db.QueryRow(`
+				SELECT receipt_sequence FROM operation_receipts
+				WHERE device_id = ? AND operation = 'sync' AND request_id = ?`, seed.deviceID, seed.sync.RequestID,
+			).Scan(&sequence); err != nil {
+				t.Fatal(err)
+			}
+			writeOversizedCheckedBlob(t, seed.opened.db, test.statement, maxBodyBytes+1, sequence)
+			transaction, err := seed.opened.db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer transaction.Rollback()
+			if protocolErr := validateReceiptKeyCandidate(context.Background(), transaction, sequence, receiptLogicalKeyCandidate, seed.deviceID, "sync", seed.sync.RequestID); protocolErr == nil || protocolErr.Code != "internal_error" {
+				t.Fatalf("oversized %s uptime error=%v", test.table, protocolErr)
+			}
+		})
+	}
+}
+
+func TestCreateDeviceGuardsBaselineRuntimeBlobs(t *testing.T) {
+	tests := []struct {
+		name      string
+		statement string
+	}{
+		{name: "server cursor", statement: "UPDATE runtime_state SET server_cursor = zeroblob(?) WHERE singleton = 1"},
+		{name: "active boot ID", statement: "UPDATE runtime_state SET active_boot_id = zeroblob(?) WHERE singleton = 1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opened, err := Open(context.Background(), filepath.Join(t.TempDir(), "server.db"), testIdentity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Close()
+			writeOversizedCheckedBlob(t, opened.db, test.statement, maxBodyBytes+1)
+			if err := opened.CreateDevice(context.Background(), "e2000000-0000-4000-8000-000000000020", tokenWithByte(0xe2), auth.FixedScopes(), protocolFixtureTime); err == nil {
+				t.Fatal("baseline device creation accepted oversized runtime BLOB")
+			}
+		})
 	}
 }
 

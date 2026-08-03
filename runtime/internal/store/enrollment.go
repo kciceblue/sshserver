@@ -273,7 +273,9 @@ func (store *Store) lookupGrant(ctx context.Context, transaction *sql.Tx, presen
 		return nil, api.NewError("grant_expired", false)
 	}
 	rows, err := transaction.QueryContext(ctx, `
-		SELECT grant_hash, expires_at_ms, octet_length(consumed_enrollment_id),
+		SELECT octet_length(grant_hash),
+		       CASE WHEN typeof(grant_hash) = 'blob' AND octet_length(grant_hash) = 32 THEN grant_hash END,
+		       expires_at_ms, octet_length(consumed_enrollment_id),
 		       CASE WHEN typeof(consumed_enrollment_id) = 'text' AND octet_length(consumed_enrollment_id) = ?
 		            THEN consumed_enrollment_id END
 		FROM enrollment_grants WHERE boot_id = ? ORDER BY grant_hash`, maxUUIDBytes, bootID[:])
@@ -285,10 +287,11 @@ func (store *Store) lookupGrant(ctx context.Context, transaction *sql.Tx, presen
 	var consumed sql.NullString
 	for rows.Next() {
 		var hashBytes []byte
-		var expiresAt int64
+		var hashLength, expiresAt int64
 		var consumedLength sql.NullInt64
 		var candidateConsumed sql.NullString
-		if err := rows.Scan(&hashBytes, &expiresAt, &consumedLength, &candidateConsumed); err != nil || len(hashBytes) != 32 ||
+		if err := rows.Scan(&hashLength, &hashBytes, &expiresAt, &consumedLength, &candidateConsumed); err != nil ||
+			!boundedRequiredBytes(hashLength, hashBytes, 32) || hashLength != 32 ||
 			!boundedOptionalText(consumedLength, candidateConsumed, maxUUIDBytes) || consumedLength.Valid &&
 			(consumedLength.Int64 != maxUUIDBytes || validateUUID(candidateConsumed.String) != nil) {
 			return nil, api.NewError("internal_error", true)
@@ -389,23 +392,28 @@ func (store *Store) lookupEnrollment(ctx context.Context, transaction *sql.Tx, e
 	var deviceID sql.NullString
 	var scopesJSON sql.NullString
 	var storedToken, storedFingerprint, response []byte
-	var deviceIDLength, scopesLength, responseLength int64
+	var deviceIDLength, tokenLength, scopesLength, fingerprintLength, responseLength int64
 	var createdStatus int
 	err := transaction.QueryRowContext(ctx, `
 		SELECT octet_length(device_id),
 		       CASE WHEN typeof(device_id) = 'text' AND octet_length(device_id) = ? THEN device_id END,
-		       token_hash, octet_length(scopes_json),
+		       octet_length(token_hash),
+		       CASE WHEN typeof(token_hash) = 'blob' AND octet_length(token_hash) = 32 THEN token_hash END,
+		       octet_length(scopes_json),
 		       CASE WHEN typeof(scopes_json) = 'text' AND octet_length(scopes_json) = ? THEN scopes_json END,
-		       request_fingerprint, length(response_json),
+		       octet_length(request_fingerprint),
+		       CASE WHEN typeof(request_fingerprint) = 'blob' AND octet_length(request_fingerprint) = 32 THEN request_fingerprint END,
+		       length(response_json),
 		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END,
 		       created_status
 		FROM enrollments WHERE enrollment_id = ?`, maxUUIDBytes, len(wantScopes), maxBodyBytes, enrollmentID,
-	).Scan(&deviceIDLength, &deviceID, &storedToken, &scopesLength, &scopesJSON, &storedFingerprint, &responseLength, &response, &createdStatus)
+	).Scan(&deviceIDLength, &deviceID, &tokenLength, &storedToken, &scopesLength, &scopesJSON, &fingerprintLength, &storedFingerprint, &responseLength, &response, &createdStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, api.NewError("internal_error", true)
 	}
 	if err != nil || deviceIDLength != maxUUIDBytes || !boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
-		len(storedToken) != 32 || len(storedFingerprint) != 32 ||
+		!boundedRequiredBytes(tokenLength, storedToken, 32) || tokenLength != 32 ||
+		!boundedRequiredBytes(fingerprintLength, storedFingerprint, 32) || fingerprintLength != 32 ||
 		scopesLength != int64(len(wantScopes)) ||
 		!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) ||
 		!boundedRequiredBytes(responseLength, response, maxBodyBytes) || createdStatus != http.StatusCreated ||
