@@ -913,6 +913,15 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	attestInstanceLease := func() error {
 		return attestConfirmedInitializationLease(instanceLease)
 	}
+	initializeInstance := func(ctx context.Context, listeners []string) (config.Settings, error) {
+		settings, initializeErr := instanceLease.Initialize(ctx, listeners)
+		if initializeErr != nil {
+			if attestErr := attestInstanceLease(); attestErr != nil {
+				return config.Settings{}, attestErr
+			}
+		}
+		return settings, initializeErr
+	}
 	if err := lifecycle.verifyApplyConfirmationInputs(request, desired); err != nil {
 		return ApplyResult{}, err
 	}
@@ -978,7 +987,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 				return ApplyResult{}, err
 			}
 		}
-		result, err := lifecycle.runApply(ctx, &journal, instanceLease.Initialize, attestInstanceLease)
+		result, err := lifecycle.runApply(ctx, &journal, initializeInstance, attestInstanceLease)
 		if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || journal.Phase == PhaseStateSaved {
 			return result, err
 		}
@@ -1035,7 +1044,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	if err := lifecycle.injectCrash(PhasePlanned); err != nil {
 		return ApplyResult{}, err
 	}
-	result, err = lifecycle.runApply(ctx, &journal, instanceLease.Initialize, attestInstanceLease)
+	result, err = lifecycle.runApply(ctx, &journal, initializeInstance, attestInstanceLease)
 	if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || journal.Phase == PhaseStateSaved {
 		return result, err
 	}
@@ -1082,16 +1091,25 @@ func (lifecycle *Lifecycle) verifyRecordedReleaseForApply(ctx context.Context, s
 		return nil
 	}
 	err := lifecycle.verifyPreviewRelease(ctx, *state.Active)
-	if err == nil {
-		return nil
-	}
 	// An exact idempotent request may restore missing immutable files from the
 	// already verified inputs. Upgrades require an intact prior release because
 	// it is the rollback target; corruption is never repairable implicitly.
-	if *state.Active == desired && errors.Is(err, errInstalledReleaseFilesMissing) {
+	if err != nil && !(*state.Active == desired && errors.Is(err, errInstalledReleaseFilesMissing)) {
+		return fmt.Errorf("verify recorded active release before apply: %w", err)
+	}
+	return lifecycle.verifyRetainedRollbackReleaseForApply(ctx, state, desired)
+}
+
+func (lifecycle *Lifecycle) verifyRetainedRollbackReleaseForApply(ctx context.Context, state *DeploymentState, desired InstalledRelease) error {
+	if state == nil || state.Active == nil || state.Previous == nil || *state.Active != desired {
 		return nil
 	}
-	return fmt.Errorf("verify recorded active release before apply: %w", err)
+	// A same-release apply retains Previous in committedApplyState. Unlike the
+	// active release, that rollback target has no confirmed source-repair path.
+	if err := lifecycle.verifyPreviewRelease(ctx, *state.Previous); err != nil {
+		return fmt.Errorf("verify retained rollback release before apply: %w", err)
+	}
+	return nil
 }
 
 func (lifecycle *Lifecycle) validateIdempotentApply(

@@ -523,6 +523,11 @@ func (lifecycle *Lifecycle) classifyJournalPreview(ctx context.Context, preview 
 }
 
 func (lifecycle *Lifecycle) classifyStatePreview(ctx context.Context, preview DeploymentPreview, desired InstalledRelease, availability ManagerAvailability, state DeploymentState, statePresent bool) (DeploymentPreview, error) {
+	if statePresent {
+		if err := lifecycle.verifyRetainedRollbackReleaseForApply(ctx, &state, desired); err != nil {
+			return lifecycle.finishBlockedPreview(preview, "installed_release_verification_failed")
+		}
+	}
 	if !statePresent || state.Status == StatusUninstalled {
 		preview.Classification = PreviewFresh
 		preview.ApplyAllowed = true

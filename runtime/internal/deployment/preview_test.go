@@ -1075,11 +1075,96 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 		upgrade.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
 		before := snapshotPreviewTree(t, fixture.layout.HomeDir)
 		if _, err := fixture.lifecycle.Apply(context.Background(), upgrade); err == nil ||
-			!strings.Contains(err.Error(), "verify recorded active release before apply") {
+			!strings.Contains(err.Error(), "verify retained rollback release before apply") {
 			t.Fatalf("damaged prior-release confirmed apply error=%v", err)
 		}
 		if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
 			t.Fatalf("damaged prior-release apply mutated target\n before=%+v\n after=%+v", before, after)
+		}
+	})
+
+	t.Run("state-saved same-release recovery verifies retained rollback release", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, true)
+		rollbackRequest, rollback := fixture.release(t, "v1.2.3", "state-saved-retained-rollback")
+		if _, err := applyConfirmed(t, fixture.lifecycle, rollbackRequest); err != nil {
+			t.Fatal(err)
+		}
+		desiredRequest, desired := fixture.release(t, "v1.2.4", "state-saved-retained-desired")
+		if _, err := applyConfirmed(t, fixture.lifecycle, desiredRequest); err != nil {
+			t.Fatal(err)
+		}
+		state, err := LoadState(fixture.layout)
+		if err != nil || state.Status != StatusForeground || state.Active == nil || *state.Active != desired || state.Previous == nil || *state.Previous != rollback {
+			t.Fatalf("foreground rollback state=%+v err=%v", state, err)
+		}
+
+		fixture.manager.availability = ManagerAvailability{
+			Manager:           ManagerSystemd,
+			Available:         true,
+			ServiceDefinition: fixture.manager.definition,
+		}
+		fixture.lifecycle.failAfterPhase = PhaseStateSaved
+		if _, err := applyConfirmed(t, fixture.lifecycle, desiredRequest); !errors.Is(err, ErrInjectedDeploymentCrash) {
+			t.Fatalf("injected same-release state-saved apply error=%v", err)
+		}
+		fixture.lifecycle.failAfterPhase = ""
+		journal, err := LoadJournal(fixture.layout)
+		if err != nil || journal.Phase != PhaseStateSaved || journal.PriorState == nil || journal.PriorState.Active == nil ||
+			*journal.PriorState.Active != desired || journal.PriorState.Previous == nil || *journal.PriorState.Previous != rollback {
+			t.Fatalf("same-release state-saved journal=%+v err=%v", journal, err)
+		}
+		state, err = LoadState(fixture.layout)
+		if err != nil || state.Status != StatusActive || state.Active == nil || *state.Active != desired || state.Previous == nil || *state.Previous != rollback {
+			t.Fatalf("same-release committed state=%+v err=%v", state, err)
+		}
+		journalBefore, err := os.ReadFile(fixture.layout.JournalPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stateBefore, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.lifecycle.verifyPreviewRelease = func(_ context.Context, release InstalledRelease) error {
+			if release == rollback {
+				return fmt.Errorf("retained rollback release is missing: %w", errInstalledReleaseFilesMissing)
+			}
+			return nil
+		}
+
+		preview, err := fixture.lifecycle.Preview(context.Background(), desiredRequest.previewRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if preview.Classification != PreviewResumeOrRecoveryRequired || preview.ApplyAllowed ||
+			preview.BlockReason != "installed_release_verification_failed_during_recovery" || len(preview.Actions) != 0 ||
+			preview.Existing.Journal == nil || preview.Existing.Journal.Phase != PhaseStateSaved {
+			t.Fatalf("missing retained rollback recovery preview=%+v", preview)
+		}
+		journalAfterPreview, err := os.ReadFile(fixture.layout.JournalPath)
+		if err != nil || !bytes.Equal(journalAfterPreview, journalBefore) {
+			t.Fatalf("missing retained rollback preview changed journal: equal=%v err=%v", bytes.Equal(journalAfterPreview, journalBefore), err)
+		}
+		canonical, err := preview.CanonicalBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		desiredRequest.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
+		before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+		if _, err := fixture.lifecycle.Apply(context.Background(), desiredRequest); err == nil ||
+			!strings.Contains(err.Error(), "verify retained rollback release before apply") {
+			t.Fatalf("missing retained rollback confirmed apply error=%v", err)
+		}
+		if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+			t.Fatalf("missing retained rollback apply mutated target\n before=%+v\n after=%+v", before, after)
+		}
+		journalAfterApply, err := os.ReadFile(fixture.layout.JournalPath)
+		if err != nil || !bytes.Equal(journalAfterApply, journalBefore) {
+			t.Fatalf("missing retained rollback apply changed journal: equal=%v err=%v", bytes.Equal(journalAfterApply, journalBefore), err)
+		}
+		stateAfterApply, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil || !bytes.Equal(stateAfterApply, stateBefore) {
+			t.Fatalf("missing retained rollback apply changed state: equal=%v err=%v", bytes.Equal(stateAfterApply, stateBefore), err)
 		}
 	})
 

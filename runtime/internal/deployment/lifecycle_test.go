@@ -642,6 +642,73 @@ func TestApplyReattestsInitializationLeaseAtJournalAndStagingBoundaries(t *testi
 	})
 }
 
+func TestApplyPreservesArtifactStagedJournalWhenInitializationLeasePathChanges(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	request, _ := fixture.release(t, "v1.2.3", "initialize-attestation-evidence")
+	originalAcquire := fixture.lifecycle.acquireInstanceLease
+	var replacement *instance.InitializationLease
+	fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
+		lease, err := originalAcquire(stateDir, initializationLockPresent)
+		if err != nil {
+			return nil, err
+		}
+		return &testInitializationLease{
+			initialize: func(ctx context.Context, listeners []string) (config.Settings, error) {
+				journal, err := LoadJournal(fixture.layout)
+				if err != nil || journal.Phase != PhaseArtifactStaged {
+					return config.Settings{}, fmt.Errorf("initialize reached before artifact-staged checkpoint: journal=%+v err=%v", journal, err)
+				}
+				lockPath := filepath.Join(stateDir, ".instance.lock")
+				if err := os.Remove(lockPath); err != nil {
+					return config.Settings{}, err
+				}
+				if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+					return config.Settings{}, err
+				}
+				replacement, err = instance.AcquireInitializationLeaseWithLockPresence(stateDir, true)
+				if err != nil {
+					return config.Settings{}, err
+				}
+				return lease.Initialize(ctx, listeners)
+			},
+			created: lease.InitializationLockCreated(),
+			attest:  lease.AttestLockPath,
+			close:   lease.Close,
+		}, nil
+	}
+	stageBefore, supportBefore, initializeBefore, removeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls, fixture.removeCalls
+
+	_, err := applyConfirmed(t, fixture.lifecycle, request)
+	if replacement == nil {
+		t.Fatal("replacement initialization lock was not acquired before Initialize")
+	}
+	if closeErr := replacement.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || !strings.Contains(err.Error(), "leased initialization lock path changed") {
+		t.Fatalf("initialization attestation error=%v", err)
+	}
+	journal, err := LoadJournal(fixture.layout)
+	if err != nil || journal.Phase != PhaseArtifactStaged {
+		t.Fatalf("initialization attestation lost recovery journal=%+v err=%v", journal, err)
+	}
+	if fixture.stageCalls-stageBefore != 1 || fixture.supportStageCalls-supportBefore != 2 || fixture.initializeCalls-initializeBefore != 1 {
+		t.Fatalf("initialization attestation stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+	}
+	if fixture.removeCalls != removeBefore {
+		t.Fatalf("initialization attestation ran artifact rollback: remove calls=%d", fixture.removeCalls-removeBefore)
+	}
+	if _, err := LoadState(fixture.layout); !errors.Is(err, ErrNoDeploymentState) {
+		t.Fatalf("initialization attestation created deployment state: %v", err)
+	}
+	paths := config.ForStateDir(fixture.layout.StateDir)
+	for _, path := range []string{paths.InstallMarker, paths.Config, paths.InstanceSecret, paths.Database} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("initialization attestation mutated instance path %s: %v", path, err)
+		}
+	}
+}
+
 func TestApplyResumesReviewedDatabaseStatesUnderInitializationLease(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
