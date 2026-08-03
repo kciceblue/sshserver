@@ -9,12 +9,49 @@ cryptography, Keychain behavior, credential custody, or storage semantics.
 
 ## Invocation and deployment binding
 
-For a lifecycle-managed installation, the client retains a deployment locator
-from the verified lifecycle request/result context: one exact immutable binary
-path plus the canonical home, install-root, and state-directory paths. Before
-each new channel, on the same host-key-verified SSH generation used for
-forwarding, it invokes that exact locator with this argument vector and no
-stdin:
+Every successful `deploy apply` result, including an exact idempotent retry or
+`deploy recover`, and every successful `deploy rollback` result contains one
+credential-free `deployment_locator` object:
+
+```json
+{
+  "version": "1",
+  "lifecycle_binary_path": "/home/alice/.local/share/jat/sshserver-deployment/versions/v1.2.3/sshserver-linux-amd64",
+  "home_dir": "/home/alice",
+  "install_root": "/home/alice/.local/share/jat/sshserver-deployment",
+  "state_dir": "/home/alice/.local/state/jat/sshserver",
+  "release": "v1.2.3",
+  "os": "linux",
+  "architecture": "amd64",
+  "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "binary_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "binary_bytes": 12345
+}
+```
+
+The server constructs all fields from the validated deployment layout and the
+committed active release. `lifecycle_binary_path` is the immutable installed
+binary, never the upload/source path or `PATH` lookup. The object is absent from
+errors, uninstall results, and recovery-required status results; no partial
+locator is emitted. It contains no authentication material, instance secret,
+enrollment grant or token, device/instance/vault/host identifier, service
+definition, endpoint port, or transaction data. Absolute paths can reveal the
+remote account name and remain ordinary host metadata, not credentials.
+
+A copied or pasted locator is untrusted input. Its presence does not prove
+which host, account, process, or release produced it. The client accepts it only
+inside the selected host profile after host-key verification and SSH
+authentication, strict V1 decoding, exact comparison of release/target,
+manifest digest, binary digest, and byte count with the locally pinned release
+manifest, canonical validation of every path relationship, and no-follow SFTP
+revalidation of the remote regular file's exact size and SHA-256 before
+execution. The host binding is retained separately and the receipt never
+stores an SSH credential.
+
+For a lifecycle-managed installation, the client retains that accepted locator.
+Before each new channel, on the same host-key-verified SSH generation used for
+forwarding, it invokes the exact lifecycle binary and layout with this argument
+vector and no stdin:
 
 ```text
 <absolute-verified-lifecycle-binary> deploy status \

@@ -53,11 +53,31 @@ type ApplyRequest struct {
 	NoticePath      string
 }
 
+// DeploymentLocator is the credential-free handoff receipt for invoking one
+// immutable lifecycle binary on the exact layout which produced an ApplyResult.
+// It is routing and release metadata, not proof that copied output came from a
+// selected host; clients must revalidate it through their host-key-verified SSH
+// session and pinned release metadata before execution.
+type DeploymentLocator struct {
+	Version             string `json:"version"`
+	LifecycleBinaryPath string `json:"lifecycle_binary_path"`
+	HomeDir             string `json:"home_dir"`
+	InstallRoot         string `json:"install_root"`
+	StateDir            string `json:"state_dir"`
+	Release             string `json:"release"`
+	OS                  string `json:"os"`
+	Architecture        string `json:"architecture"`
+	ManifestSHA256      string `json:"manifest_sha256"`
+	BinarySHA256        string `json:"binary_sha256"`
+	BinaryBytes         int64  `json:"binary_bytes"`
+}
+
 type ApplyResult struct {
-	Status        string              `json:"status"`
-	State         DeploymentState     `json:"state"`
-	Foreground    *ForegroundFallback `json:"foreground,omitempty"`
-	TransactionID string              `json:"transaction_id,omitempty"`
+	Status            string              `json:"status"`
+	DeploymentLocator DeploymentLocator   `json:"deployment_locator"`
+	State             DeploymentState     `json:"state"`
+	Foreground        *ForegroundFallback `json:"foreground,omitempty"`
+	TransactionID     string              `json:"transaction_id,omitempty"`
 }
 
 type StatusResult struct {
@@ -451,10 +471,14 @@ func (lifecycle *Lifecycle) runRollback(ctx context.Context, journal *Deployment
 		if err != nil {
 			return ApplyResult{}, err
 		}
+		result, err := lifecycle.resultForState(state, lifecycle.foregroundFor(journal), journal.TransactionID)
+		if err != nil {
+			return ApplyResult{}, err
+		}
 		if err := RemoveJournal(lifecycle.layout); err != nil {
 			return ApplyResult{}, err
 		}
-		return lifecycle.resultForState(state, lifecycle.foregroundFor(journal), journal.TransactionID), nil
+		return result, nil
 	}
 	desired := *journal.Desired
 	if err := lifecycle.verifyDesired(ctx, desired); err != nil {
@@ -516,10 +540,14 @@ func (lifecycle *Lifecycle) runRollback(ctx context.Context, journal *Deployment
 	if err := lifecycle.checkpoint(journal, PhaseStateSaved); err != nil {
 		return ApplyResult{}, err
 	}
+	result, err := lifecycle.resultForState(state, lifecycle.foregroundFor(journal), journal.TransactionID)
+	if err != nil {
+		return ApplyResult{}, err
+	}
 	if err := RemoveJournal(lifecycle.layout); err != nil {
 		return ApplyResult{}, err
 	}
-	return lifecycle.resultForState(state, lifecycle.foregroundFor(journal), journal.TransactionID), nil
+	return result, nil
 }
 
 func (lifecycle *Lifecycle) committedRollbackState(journal DeploymentJournal) DeploymentState {
@@ -745,7 +773,7 @@ func (lifecycle *Lifecycle) validateIdempotentApply(ctx context.Context, state D
 			return ApplyResult{}, err
 		}
 	}
-	return lifecycle.resultForState(state, availability.Foreground, ""), nil
+	return lifecycle.resultForState(state, availability.Foreground, "")
 }
 
 func (lifecycle *Lifecycle) runApply(ctx context.Context, journal *DeploymentJournal) (ApplyResult, error) {
@@ -754,10 +782,14 @@ func (lifecycle *Lifecycle) runApply(ctx context.Context, journal *DeploymentJou
 		if err != nil {
 			return ApplyResult{}, err
 		}
+		result, err := lifecycle.resultForState(state, lifecycle.foregroundFor(journal), journal.TransactionID)
+		if err != nil {
+			return ApplyResult{}, err
+		}
 		if err := RemoveJournal(lifecycle.layout); err != nil {
 			return ApplyResult{}, err
 		}
-		return lifecycle.resultForState(state, lifecycle.foregroundFor(journal), journal.TransactionID), nil
+		return result, nil
 	}
 	desired := *journal.Desired
 	if !applyPhaseReached(journal.Phase, PhaseArtifactStaged) {
@@ -849,10 +881,14 @@ func (lifecycle *Lifecycle) runApply(ctx context.Context, journal *DeploymentJou
 	if err := lifecycle.checkpoint(journal, PhaseStateSaved); err != nil {
 		return ApplyResult{}, err
 	}
+	result, err := lifecycle.resultForState(state, lifecycle.foregroundFor(journal), journal.TransactionID)
+	if err != nil {
+		return ApplyResult{}, err
+	}
 	if err := RemoveJournal(lifecycle.layout); err != nil {
 		return ApplyResult{}, err
 	}
-	return lifecycle.resultForState(state, lifecycle.foregroundFor(journal), journal.TransactionID), nil
+	return result, nil
 }
 
 func (lifecycle *Lifecycle) verifyDesired(ctx context.Context, desired InstalledRelease) error {
@@ -1110,12 +1146,63 @@ func (lifecycle *Lifecycle) foregroundFor(journal *DeploymentJournal) *Foregroun
 	}
 }
 
-func (lifecycle *Lifecycle) resultForState(state DeploymentState, foreground *ForegroundFallback, transactionID string) ApplyResult {
+func (lifecycle *Lifecycle) resultForState(state DeploymentState, foreground *ForegroundFallback, transactionID string) (ApplyResult, error) {
+	locator, err := deploymentLocatorForState(lifecycle.layout, state)
+	if err != nil {
+		return ApplyResult{}, err
+	}
 	status := "active"
 	if state.Status == StatusForeground {
 		status = "foreground_required"
 	}
-	return ApplyResult{Status: status, State: state, Foreground: foreground, TransactionID: transactionID}
+	return ApplyResult{
+		Status:            status,
+		DeploymentLocator: locator,
+		State:             state,
+		Foreground:        foreground,
+		TransactionID:     transactionID,
+	}, nil
+}
+
+func deploymentLocatorForState(layout Layout, state DeploymentState) (DeploymentLocator, error) {
+	rebuilt, err := NewLayout(layout.HomeDir, layout.InstallRoot, layout.StateDir)
+	if err != nil {
+		return DeploymentLocator{}, fmt.Errorf("validate deployment locator layout: %w", err)
+	}
+	if rebuilt != layout {
+		return DeploymentLocator{}, errors.New("deployment locator layout contains inconsistent derived paths")
+	}
+	if err := state.Validate(layout); err != nil {
+		return DeploymentLocator{}, fmt.Errorf("validate deployment locator state: %w", err)
+	}
+	if state.Active == nil || (state.Status != StatusActive && state.Status != StatusForeground) {
+		return DeploymentLocator{}, errors.New("deployment locator requires an active or foreground release")
+	}
+	active := *state.Active
+	if err := requireStrictDescendant(layout.VersionsDir, active.BinaryPath, "lifecycle binary"); err != nil {
+		return DeploymentLocator{}, err
+	}
+	expectedPath, err := layout.BinaryPath(active.Release, Target{OS: active.OS, Architecture: active.Architecture})
+	if err != nil {
+		return DeploymentLocator{}, err
+	}
+	if active.BinaryPath != expectedPath || active.BinaryBytes <= 0 || active.BinaryBytes > maxArtifactBytes ||
+		!hexDigestPattern.MatchString(active.ManifestSHA256) || !hexDigestPattern.MatchString(active.BinarySHA256) {
+		return DeploymentLocator{}, errors.New("deployment locator active release metadata is invalid")
+	}
+	return DeploymentLocator{
+		Version:             "1",
+		LifecycleBinaryPath: active.BinaryPath,
+		HomeDir:             layout.HomeDir,
+		InstallRoot:         layout.InstallRoot,
+		StateDir:            layout.StateDir,
+		Release:             active.Release,
+		OS:                  active.OS,
+		Architecture:        active.Architecture,
+		ManifestSHA256:      active.ManifestSHA256,
+		BinarySHA256:        active.BinarySHA256,
+		BinaryBytes:         active.BinaryBytes,
+	}, nil
 }
 
 func applyPhaseReached(current, target Phase) bool {

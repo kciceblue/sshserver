@@ -4,6 +4,7 @@ package deployment
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -25,6 +26,7 @@ func TestApplyTransactionCommitsExactNativeReleaseAndIsIdempotent(t *testing.T) 
 	if result.Status != "active" || result.State.Status != StatusActive || result.State.Active == nil || *result.State.Active != desired {
 		t.Fatalf("apply result = %+v", result)
 	}
+	assertDeploymentLocator(t, result.DeploymentLocator, fixture.layout, desired)
 	if result.State.Generation != 1 || result.State.Previous != nil || result.Foreground != nil {
 		t.Fatalf("unexpected first generation = %+v", result.State)
 	}
@@ -44,6 +46,7 @@ func TestApplyTransactionCommitsExactNativeReleaseAndIsIdempotent(t *testing.T) 
 	if second.State.Generation != 1 || fixture.stageCalls != 2 || fixture.initializeCalls != 1 {
 		t.Fatalf("idempotent result=%+v stage/init=%d/%d", second, fixture.stageCalls, fixture.initializeCalls)
 	}
+	assertDeploymentLocator(t, second.DeploymentLocator, fixture.layout, desired)
 	for _, call := range fixture.manager.calls[beforeCalls:] {
 		if call == "install" || call == "activate" || call == "stop" || call == "remove" {
 			t.Fatalf("idempotent apply mutated service manager: %v", fixture.manager.calls[beforeCalls:])
@@ -54,6 +57,7 @@ func TestApplyTransactionCommitsExactNativeReleaseAndIsIdempotent(t *testing.T) 
 func TestVerifiedLocatorSurvivesRepeatedUpgradesAndStatusRefreshesNewestActivePath(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	var installed []InstalledRelease
+	var newestLocator DeploymentLocator
 	for index, version := range []string{"v1.2.3", "v1.2.4", "v1.2.5"} {
 		request, release := fixture.release(t, version, fmt.Sprint(index))
 		result, err := fixture.lifecycle.Apply(context.Background(), request)
@@ -63,6 +67,8 @@ func TestVerifiedLocatorSurvivesRepeatedUpgradesAndStatusRefreshesNewestActivePa
 		if result.State.Active == nil || *result.State.Active != release {
 			t.Fatalf("upgrade %s active state=%+v", version, result.State.Active)
 		}
+		assertDeploymentLocator(t, result.DeploymentLocator, fixture.layout, release)
+		newestLocator = result.DeploymentLocator
 		installed = append(installed, release)
 	}
 	if fixture.removeCalls != 0 {
@@ -82,6 +88,7 @@ func TestVerifiedLocatorSurvivesRepeatedUpgradesAndStatusRefreshesNewestActivePa
 		status.State.Active == nil || status.State.Active.BinaryPath != installed[len(installed)-1].BinaryPath {
 		t.Fatalf("refreshed newest status=%+v err=%v", status, err)
 	}
+	assertDeploymentLocator(t, newestLocator, fixture.layout, installed[len(installed)-1])
 	if _, err := fixture.lifecycle.Uninstall(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +133,7 @@ func TestApplyTransactionResumesAfterEveryDurablePhase(t *testing.T) {
 			if result.State.Active == nil || *result.State.Active != desired || result.State.Status != StatusActive {
 				t.Fatalf("resumed result=%+v", result)
 			}
+			assertDeploymentLocator(t, result.DeploymentLocator, fixture.layout, desired)
 			if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
 				t.Fatalf("resumed journal error=%v", err)
 			}
@@ -150,8 +158,12 @@ func TestApplyFailureRollsBackExactPriorReleaseAndPreservesInstance(t *testing.T
 
 	secondRequest, _ := fixture.release(t, "v1.2.4", "d")
 	fixture.manager.failures["activate"] = 1
-	if _, err := fixture.lifecycle.Apply(context.Background(), secondRequest); err == nil || !strings.Contains(err.Error(), "activate") {
+	failed, err := fixture.lifecycle.Apply(context.Background(), secondRequest)
+	if err == nil || !strings.Contains(err.Error(), "activate") {
 		t.Fatalf("failed upgrade error = %v", err)
+	}
+	if failed.DeploymentLocator != (DeploymentLocator{}) {
+		t.Fatalf("failed apply returned deployment locator: %+v", failed.DeploymentLocator)
 	}
 	state, err := LoadState(fixture.layout)
 	if err != nil {
@@ -187,6 +199,7 @@ func TestApplyForegroundFallbackIsStructuredAndNeverClaimsActivation(t *testing.
 		!result.Foreground.Required || !result.Foreground.Supervised {
 		t.Fatalf("foreground result=%+v", result)
 	}
+	assertDeploymentLocator(t, result.DeploymentLocator, fixture.layout, desired)
 	wantCommand := []string{desired.BinaryPath, "serve", "--state-dir", fixture.layout.StateDir}
 	if fmt.Sprint(result.Foreground.Command) != fmt.Sprint(wantCommand) {
 		t.Fatalf("foreground command=%q want=%q", result.Foreground.Command, wantCommand)
@@ -282,6 +295,16 @@ func TestDeploymentStatusDistinguishesRunningStoppedAndRecovery(t *testing.T) {
 		if err != nil || status.Status != "recovery_required" || !status.RecoveryRequired || status.Journal == nil {
 			t.Fatalf("recovery status=%+v err=%v", status, err)
 		}
+		assertJSONHasNoDeploymentLocator(t, status)
+	})
+
+	t.Run("uninstalled", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		status, err := fixture.lifecycle.Status(context.Background())
+		if err != nil || status.Status != "uninstalled" {
+			t.Fatalf("uninstalled status=%+v err=%v", status, err)
+		}
+		assertJSONHasNoDeploymentLocator(t, status)
 	})
 }
 
@@ -303,6 +326,7 @@ func TestRollbackSwitchesToVerifiedPreviousRelease(t *testing.T) {
 		result.State.Previous == nil || *result.State.Previous != second {
 		t.Fatalf("rollback state=%+v", result.State)
 	}
+	assertDeploymentLocator(t, result.DeploymentLocator, fixture.layout, first)
 	if !fixture.manager.active || fixture.manager.current != identityFor(first) {
 		t.Fatalf("rollback runtime=%+v active=%v", fixture.manager.current, fixture.manager.active)
 	}
@@ -348,6 +372,7 @@ func TestRollbackResumesEveryDurablePhase(t *testing.T) {
 			if result.State.Active == nil || *result.State.Active != first || result.State.Previous == nil || *result.State.Previous != second {
 				t.Fatalf("resumed rollback=%+v", result)
 			}
+			assertDeploymentLocator(t, result.DeploymentLocator, fixture.layout, first)
 		})
 	}
 }
@@ -363,8 +388,12 @@ func TestRollbackFailureRestoresCurrentRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture.manager.failures["activate"] = 1
-	if _, err := fixture.lifecycle.Rollback(context.Background()); err == nil || !strings.Contains(err.Error(), "activate") {
+	failed, err := fixture.lifecycle.Rollback(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "activate") {
 		t.Fatalf("rollback failure=%v", err)
+	}
+	if failed.DeploymentLocator != (DeploymentLocator{}) {
+		t.Fatalf("failed rollback returned deployment locator: %+v", failed.DeploymentLocator)
 	}
 	state, err := LoadState(fixture.layout)
 	if err != nil {
@@ -397,6 +426,7 @@ func TestUninstallRemovesRuntimeAndPreservesProtectedInstance(t *testing.T) {
 		result.State.Active != nil || result.State.Previous == nil || *result.State.Previous != release {
 		t.Fatalf("uninstall result=%+v", result)
 	}
+	assertJSONHasNoDeploymentLocator(t, result)
 	if fixture.manager.active || fixture.removeCalls != 1 {
 		t.Fatalf("manager active=%v remove calls=%d", fixture.manager.active, fixture.removeCalls)
 	}
@@ -415,6 +445,7 @@ func TestUninstallRemovesRuntimeAndPreservesProtectedInstance(t *testing.T) {
 	if second.State.Generation != 2 || fixture.removeCalls != 1 {
 		t.Fatalf("idempotent uninstall=%+v remove calls=%d", second, fixture.removeCalls)
 	}
+	assertJSONHasNoDeploymentLocator(t, second)
 }
 
 func TestUninstallResumesEveryDurablePhase(t *testing.T) {
@@ -511,6 +542,96 @@ func TestUninstallArtifactFailureRequiresResumeWithoutDataLoss(t *testing.T) {
 	result, err := fixture.lifecycle.Uninstall(context.Background())
 	if err != nil || result.State.Status != StatusUninstalled {
 		t.Fatalf("resumed uninstall=%+v err=%v", result, err)
+	}
+}
+
+func TestDeploymentLocatorRejectsInvalidLayoutAndActiveMetadata(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	request, desired := fixture.release(t, "v1.2.3", "locator")
+	result, err := fixture.lifecycle.Apply(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDeploymentLocator(t, result.DeploymentLocator, fixture.layout, desired)
+
+	invalidLayout := fixture.layout
+	invalidLayout.VersionsDir = filepath.Join(fixture.layout.InstallRoot, "other-versions")
+	if locator, err := deploymentLocatorForState(invalidLayout, result.State); err == nil || locator != (DeploymentLocator{}) {
+		t.Fatalf("inconsistent layout locator=%+v err=%v", locator, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*InstalledRelease)
+	}{
+		{name: "upload path", mutate: func(active *InstalledRelease) { active.BinaryPath = request.ArtifactPath }},
+		{name: "uppercase manifest digest", mutate: func(active *InstalledRelease) { active.ManifestSHA256 = strings.ToUpper(active.ManifestSHA256) }},
+		{name: "zero binary bytes", mutate: func(active *InstalledRelease) { active.BinaryBytes = 0 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := result.State
+			active := *state.Active
+			test.mutate(&active)
+			state.Active = &active
+			if locator, err := deploymentLocatorForState(fixture.layout, state); err == nil || locator != (DeploymentLocator{}) {
+				t.Fatalf("invalid active metadata locator=%+v err=%v", locator, err)
+			}
+		})
+	}
+}
+
+func assertDeploymentLocator(t *testing.T, got DeploymentLocator, layout Layout, active InstalledRelease) {
+	t.Helper()
+	want := DeploymentLocator{
+		Version:             "1",
+		LifecycleBinaryPath: active.BinaryPath,
+		HomeDir:             layout.HomeDir,
+		InstallRoot:         layout.InstallRoot,
+		StateDir:            layout.StateDir,
+		Release:             active.Release,
+		OS:                  active.OS,
+		Architecture:        active.Architecture,
+		ManifestSHA256:      active.ManifestSHA256,
+		BinarySHA256:        active.BinarySHA256,
+		BinaryBytes:         active.BinaryBytes,
+	}
+	if got != want {
+		t.Fatalf("deployment locator=%+v want=%+v", got, want)
+	}
+	payload, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil {
+		t.Fatal(err)
+	}
+	exactKeys := []string{
+		"version", "lifecycle_binary_path", "home_dir", "install_root", "state_dir",
+		"release", "os", "architecture", "manifest_sha256", "binary_sha256", "binary_bytes",
+	}
+	if len(object) != len(exactKeys) {
+		t.Fatalf("deployment locator keys=%v", object)
+	}
+	for _, key := range exactKeys {
+		if _, ok := object[key]; !ok {
+			t.Fatalf("deployment locator is missing %q: %s", key, payload)
+		}
+	}
+}
+
+func assertJSONHasNoDeploymentLocator(t *testing.T, value any) {
+	t.Helper()
+	payload, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := object["deployment_locator"]; ok {
+		t.Fatalf("unexpected deployment locator: %s", payload)
 	}
 }
 

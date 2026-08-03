@@ -204,10 +204,74 @@ func TestMutatingDeployCommandsKeepIndependentLayoutOverrides(t *testing.T) {
 }
 
 func TestDeployApplyRequiresExactPinnedInputs(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{"deploy", "apply"})
-	if code == 0 || !strings.Contains(stderr.String(), "requires --manifest") || stdout.Len() != 0 {
-		t.Fatalf("deploy apply code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	for _, operation := range []string{"apply", "recover"} {
+		t.Run(operation, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{"deploy", operation})
+			if code == 0 || !strings.Contains(stderr.String(), "requires --manifest") || stdout.Len() != 0 {
+				t.Fatalf("deploy %s code=%d stdout=%q stderr=%q", operation, code, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestDeployApplyResultWritesOneCredentialFreeLocatorLine(t *testing.T) {
+	locator := deployment.DeploymentLocator{
+		Version:             "1",
+		LifecycleBinaryPath: "/home/alice/.local/share/jat/sshserver-deployment/versions/v1.2.3/sshserver-linux-amd64",
+		HomeDir:             "/home/alice",
+		InstallRoot:         "/home/alice/.local/share/jat/sshserver-deployment",
+		StateDir:            "/home/alice/.local/state/jat/sshserver",
+		Release:             "v1.2.3",
+		OS:                  "linux",
+		Architecture:        "amd64",
+		ManifestSHA256:      strings.Repeat("a", 64),
+		BinarySHA256:        strings.Repeat("b", 64),
+		BinaryBytes:         12345,
+	}
+	var stdout bytes.Buffer
+	runner := Runner{Stdout: &stdout, Stderr: io.Discard}
+	if err := runner.writeApplyResult(deployment.ApplyResult{
+		Status:            "active",
+		DeploymentLocator: locator,
+		State: deployment.DeploymentState{
+			StateVersion: deployment.DeploymentStateVersion,
+			Generation:   1,
+			Status:       deployment.StatusActive,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(stdout.String(), "\n") != 1 || !strings.HasSuffix(stdout.String(), "\n") {
+		t.Fatalf("deploy result is not exact one-line JSON: %q", stdout.String())
+	}
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	var encodedLocator map[string]json.RawMessage
+	if err := json.Unmarshal(result["deployment_locator"], &encodedLocator); err != nil {
+		t.Fatal(err)
+	}
+	exactKeys := []string{
+		"version", "lifecycle_binary_path", "home_dir", "install_root", "state_dir",
+		"release", "os", "architecture", "manifest_sha256", "binary_sha256", "binary_bytes",
+	}
+	if len(encodedLocator) != len(exactKeys) {
+		t.Fatalf("deployment locator keys=%v", encodedLocator)
+	}
+	for _, key := range exactKeys {
+		if _, ok := encodedLocator[key]; !ok {
+			t.Fatalf("deployment locator missing %q: %s", key, stdout.Bytes())
+		}
+	}
+	for _, forbidden := range []string{
+		"instance_secret", "enrollment_grant", "device_token", "bearer", "password",
+		"service_definition", "transaction_id", "instance_id", "vault_id", "host_id", "endpoint_port",
+	} {
+		if _, ok := encodedLocator[forbidden]; ok {
+			t.Fatalf("deployment locator exposes forbidden field %q", forbidden)
+		}
 	}
 }
 
