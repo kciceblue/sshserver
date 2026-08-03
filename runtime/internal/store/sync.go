@@ -173,6 +173,11 @@ func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Respo
 			return api.Response{}, api.NewError("internal_error", true)
 		}
 		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO revision_acceptance_origins (revision_id, accepted_uptime_ms)
+			VALUES (?, ?)`, item.revision.RevisionID, encodedUptime[:]); err != nil {
+			return api.Response{}, api.NewError("internal_error", true)
+		}
+		if _, err := transaction.ExecContext(ctx, `
 			INSERT INTO collection_candidates (record_id, accepted_uptime_ms, revision_id)
 			VALUES (?, ?, ?)`, item.revision.RecordID, encodedUptime[:], item.revision.RevisionID); err != nil {
 			return api.Response{}, api.NewError("internal_error", true)

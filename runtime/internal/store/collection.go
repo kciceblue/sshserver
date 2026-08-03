@@ -45,6 +45,52 @@ type pendingUptimeCheckpoint struct {
 	next time.Time
 }
 
+const collectionHeadsSQL = `
+		SELECT octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
+		       r.content_hash, length(r.collection_witness_authenticator),
+		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
+		       r.tombstone,
+		       r.accepted_uptime_ms, r.accepted_uptime_ms,
+		       octet_length(a.accepted_uptime_ms),
+		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END,
+		       r.change_cursor
+		FROM record_heads h JOIN record_revisions r ON r.revision_id = h.revision_id
+		LEFT JOIN revision_acceptance_origins a ON a.revision_id = r.revision_id
+		WHERE h.record_id = ?
+		ORDER BY h.revision_id LIMIT 33`
+
+const collectionCandidatesSQL = `
+		SELECT octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
+		       r.content_hash, length(r.collection_witness_authenticator),
+		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
+		       r.tombstone,
+		       q.accepted_uptime_ms, r.accepted_uptime_ms,
+		       octet_length(a.accepted_uptime_ms),
+		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END,
+		       r.change_cursor
+		FROM collection_candidates q
+		JOIN record_revisions r
+		  ON r.revision_id = q.revision_id AND r.record_id = q.record_id
+		LEFT JOIN revision_acceptance_origins a ON a.revision_id = r.revision_id
+		WHERE q.record_id = ? AND q.accepted_uptime_ms <= ? AND r.retained = 1
+		ORDER BY q.accepted_uptime_ms, q.revision_id LIMIT ?`
+
 // CheckpointUptime durably accounts only positive elapsed daemon-monotonic
 // time. Lost time after an abrupt crash can delay collection but can never
 // accelerate the 90-day retention floor.
@@ -330,22 +376,8 @@ func loadCollectionRecordWork(ctx context.Context, transaction *sql.Tx, recordID
 	if err != nil || barrier == 0 {
 		return 0, nil, nil, api.NewError("internal_error", true)
 	}
-	heads, protocolErr := loadCollectionRevisionRows(ctx, transaction, `
-		SELECT octet_length(r.revision_id),
-		       CASE WHEN typeof(r.revision_id) = 'text'
-		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
-		       octet_length(r.record_id),
-		       CASE WHEN typeof(r.record_id) = 'text'
-		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
-		       length(r.vector_json),
-		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
-		       r.content_hash, length(r.collection_witness_authenticator),
-		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
-		       r.tombstone,
-		       r.accepted_uptime_ms, r.change_cursor
-		FROM record_heads h JOIN record_revisions r ON r.revision_id = h.revision_id
-		WHERE h.record_id = ?
-		ORDER BY h.revision_id LIMIT 33`, maxUUIDBytes, maxUUIDBytes, maxVectorBytes, recordID)
+	heads, protocolErr := loadCollectionRevisionRows(ctx, transaction, collectionHeadsSQL,
+		maxUUIDBytes, maxUUIDBytes, maxVectorBytes, recordID)
 	if protocolErr != nil || len(heads) > 32 {
 		if protocolErr != nil {
 			return 0, nil, nil, protocolErr
@@ -357,25 +389,8 @@ func loadCollectionRecordWork(ctx context.Context, transaction *sql.Tx, recordID
 		return barrier, heads, nil, nil
 	}
 	cutoff := EncodeUint64(accumulatedUptimeMS - minimumMS)
-	candidates, protocolErr := loadCollectionRevisionRows(ctx, transaction, `
-		SELECT octet_length(r.revision_id),
-		       CASE WHEN typeof(r.revision_id) = 'text'
-		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
-		       octet_length(r.record_id),
-		       CASE WHEN typeof(r.record_id) = 'text'
-		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
-		       length(r.vector_json),
-		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
-		       r.content_hash, length(r.collection_witness_authenticator),
-		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
-		       r.tombstone,
-		       r.accepted_uptime_ms, r.change_cursor
-		FROM collection_candidates q
-		JOIN record_revisions r
-		  ON r.revision_id = q.revision_id AND r.record_id = q.record_id
-		 AND r.accepted_uptime_ms = q.accepted_uptime_ms
-		WHERE q.record_id = ? AND q.accepted_uptime_ms <= ? AND r.retained = 1
-		ORDER BY q.accepted_uptime_ms, q.revision_id LIMIT ?`, maxUUIDBytes, maxUUIDBytes, maxVectorBytes, recordID, cutoff[:], collectionCandidateBatch)
+	candidates, protocolErr := loadCollectionRevisionRows(ctx, transaction, collectionCandidatesSQL,
+		maxUUIDBytes, maxUUIDBytes, maxVectorBytes, recordID, cutoff[:], collectionCandidateBatch)
 	if protocolErr != nil {
 		return 0, nil, nil, protocolErr
 	}
@@ -392,14 +407,16 @@ func loadCollectionRevisionRows(ctx context.Context, transaction *sql.Tx, statem
 	for rows.Next() {
 		var revision collectionRevision
 		var revisionID, recordID sql.NullString
-		var vectorBody, acceptedBytes, cursorBytes, contentHash, authenticator []byte
+		var vectorBody, indexedAcceptedBytes, revisionAcceptedBytes, originAcceptedBytes, cursorBytes, contentHash, authenticator []byte
 		var revisionIDLength, recordIDLength, vectorLength int64
-		var authenticatorLength sql.NullInt64
-		if rows.Scan(&revisionIDLength, &revisionID, &recordIDLength, &recordID, &vectorLength, &vectorBody, &contentHash, &authenticatorLength, &authenticator, &revision.tombstone, &acceptedBytes, &cursorBytes) != nil ||
+		var authenticatorLength, originAcceptedLength sql.NullInt64
+		if rows.Scan(&revisionIDLength, &revisionID, &recordIDLength, &recordID, &vectorLength, &vectorBody, &contentHash, &authenticatorLength, &authenticator, &revision.tombstone, &indexedAcceptedBytes, &revisionAcceptedBytes, &originAcceptedLength, &originAcceptedBytes, &cursorBytes) != nil ||
 			revisionIDLength != maxUUIDBytes || !boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || validateUUID(revisionID.String) != nil ||
 			recordIDLength != maxUUIDBytes || !boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || validateUUID(recordID.String) != nil || len(contentHash) != 32 ||
 			!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || !boundedOptionalBytes(authenticatorLength, authenticator, 32) ||
-			authenticatorLength.Valid && authenticatorLength.Int64 != 32 {
+			authenticatorLength.Valid && authenticatorLength.Int64 != 32 ||
+			!originAcceptedLength.Valid || originAcceptedLength.Int64 != 8 || len(originAcceptedBytes) != 8 ||
+			!bytes.Equal(indexedAcceptedBytes, revisionAcceptedBytes) || !bytes.Equal(revisionAcceptedBytes, originAcceptedBytes) {
 			return nil, api.NewError("internal_error", true)
 		}
 		revision.revisionID = revisionID.String
@@ -412,7 +429,7 @@ func loadCollectionRevisionRows(ctx context.Context, transaction *sql.Tx, statem
 		if err != nil {
 			return nil, api.NewError("internal_error", true)
 		}
-		accepted, acceptedErr := DecodeUint64(acceptedBytes)
+		accepted, acceptedErr := DecodeUint64(originAcceptedBytes)
 		cursor, cursorErr := DecodeUint64(cursorBytes)
 		if acceptedErr != nil || cursorErr != nil {
 			return nil, api.NewError("internal_error", true)

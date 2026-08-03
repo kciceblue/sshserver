@@ -313,6 +313,13 @@ func (store *Store) initialize(ctx context.Context) error {
 		if err := migratePriorFullSchemaV1(ctx, transaction); err != nil {
 			return err
 		}
+		if err := migrateRevisionAcceptanceOriginsV1(ctx, transaction); err != nil {
+			return err
+		}
+	} else if kind == schemaPriorAcceptanceOrigin {
+		if err := migrateRevisionAcceptanceOriginsV1(ctx, transaction); err != nil {
+			return err
+		}
 	}
 
 	if createdSchema {

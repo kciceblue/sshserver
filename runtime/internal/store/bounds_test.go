@@ -2280,6 +2280,7 @@ func TestStartupRejectsPermanentVectorIndexEqualVectorDuplicate(t *testing.T) {
 				revision.RevisionID, recordID, revision.AuthorDeviceID, counter[:], vectorBody,
 				contentHash[:], protocolFixtureTime.UnixMilli(), zero[:], cursor[:], boolToInt(undominated),
 			}},
+			{"INSERT INTO revision_acceptance_origins (revision_id, accepted_uptime_ms) VALUES (?, ?)", []any{revision.RevisionID, zero[:]}},
 			{"INSERT INTO record_vector_index (record_id, vector_hash, revision_id) VALUES (?, ?, ?)", []any{recordID, vectorHash[:], revision.RevisionID}},
 			{"INSERT INTO collection_candidates (record_id, accepted_uptime_ms, revision_id) VALUES (?, ?, ?)", []any{recordID, zero[:], revision.RevisionID}},
 			{"INSERT INTO change_origins (cursor, kind) VALUES (?, 'record_revision')", []any{cursor[:]}},
@@ -2374,6 +2375,10 @@ func TestHistoricalFrontierRejectsCollectedThirtyThirdSiblingBeforeResolution(t 
 			transaction.Rollback()
 			t.Fatal(err)
 		}
+		if _, err := transaction.Exec("INSERT INTO revision_acceptance_origins (revision_id, accepted_uptime_ms) VALUES (?, ?)", revisionID, zero[:]); err != nil {
+			transaction.Rollback()
+			t.Fatal(err)
+		}
 		if _, err := transaction.Exec("INSERT INTO change_origins (cursor, kind) VALUES (?, 'record_revision')", cursor[:]); err != nil {
 			transaction.Rollback()
 			t.Fatal(err)
@@ -2420,6 +2425,7 @@ func TestHistoricalFrontierRejectsCollectedThirtyThirdSiblingBeforeResolution(t 
 		query string
 		args  []any
 	}{
+		{"INSERT INTO revision_acceptance_origins (revision_id, accepted_uptime_ms) VALUES (?, ?)", []any{resolutionID, zero[:]}},
 		{"INSERT INTO record_vector_index (record_id, vector_hash, revision_id) VALUES (?, ?, ?)", []any{recordID, resolutionVectorHash[:], resolutionID}},
 		{"INSERT INTO record_heads (record_id, revision_id) VALUES (?, ?)", []any{recordID, resolutionID}},
 		{"INSERT INTO collection_records (record_id, barrier_cursor) VALUES (?, ?)", []any{recordID, cursor34[:]}},

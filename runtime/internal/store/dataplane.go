@@ -389,6 +389,22 @@ const receiptFingerprintCandidateQuery = `
 	SELECT receipt_sequence FROM operation_receipts
 	WHERE request_fingerprint = ? LIMIT 2`
 
+const receiptDeviceAliasProbeQuery = `
+	SELECT 1 FROM operation_receipts
+	WHERE device_id > ? AND device_id < ?
+	UNION ALL
+	SELECT 1 FROM operation_receipts
+	WHERE device_id >= ? AND device_id < ?
+	LIMIT 1`
+
+const receiptRequestAliasProbeQuery = `
+	SELECT 1 FROM operation_receipts
+	WHERE request_id > ? AND request_id < ?
+	UNION ALL
+	SELECT 1 FROM operation_receipts
+	WHERE request_id >= ? AND request_id < ?
+	LIMIT 1`
+
 const receiptCandidateValidationQuery = `
 	SELECT r.receipt_sequence,
 	       octet_length(r.device_id),
@@ -419,6 +435,20 @@ func preflightOperationReceiptKeys(ctx context.Context, transaction *sql.Tx, dev
 	}
 	deviceTextLower, deviceTextUpper, deviceBlobLower, deviceBlobUpper := receiptKeyPrefixBounds(deviceID)
 	requestTextLower, requestTextUpper, requestBlobLower, requestBlobUpper := receiptKeyPrefixBounds(requestID)
+	// These independent ranges make simultaneous device/request corruption
+	// visible: the TEXT arm excludes the canonical key while retaining every
+	// byte-suffixed alias, and the BLOB arm includes the wrong-storage-class
+	// equivalent. Any returned row is corrupt regardless of operation scope.
+	if protocolErr := rejectReceiptKeyAliases(ctx, transaction, receiptDeviceAliasProbeQuery,
+		deviceTextLower, deviceTextUpper, deviceBlobLower, deviceBlobUpper,
+	); protocolErr != nil {
+		return protocolErr
+	}
+	if protocolErr := rejectReceiptKeyAliases(ctx, transaction, receiptRequestAliasProbeQuery,
+		requestTextLower, requestTextUpper, requestBlobLower, requestBlobUpper,
+	); protocolErr != nil {
+		return protocolErr
+	}
 	candidates := make(map[int64]receiptKeyCandidateSource, receiptRequestCandidateLimit+receiptFingerprintCandidateLimit)
 	if protocolErr := collectReceiptKeyCandidates(ctx, transaction, candidates, receiptLogicalKeyCandidate, receiptRequestCandidateLimit,
 		receiptDeviceRequestCandidateQuery,
@@ -445,6 +475,15 @@ func preflightOperationReceiptKeys(ctx context.Context, transaction *sql.Tx, dev
 		}
 	}
 	return nil
+}
+
+func rejectReceiptKeyAliases(ctx context.Context, transaction *sql.Tx, query string, arguments ...any) *api.Error {
+	var present int
+	err := transaction.QueryRowContext(ctx, query, arguments...).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return api.NewError("internal_error", true)
 }
 
 func collectReceiptKeyCandidates(ctx context.Context, transaction *sql.Tx, candidates map[int64]receiptKeyCandidateSource, source receiptKeyCandidateSource, limit int, query string, arguments ...any) *api.Error {

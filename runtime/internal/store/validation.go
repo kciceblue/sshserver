@@ -56,6 +56,9 @@ func validatePersistentState(ctx context.Context, query schemaQueryer, identity 
 	if err != nil {
 		return err
 	}
+	if err := validatePersistentRevisionAcceptanceOrigins(ctx, query); err != nil {
+		return err
+	}
 	if err := validatePersistentHistorySequence(ctx, query, devices); err != nil {
 		return err
 	}
@@ -785,6 +788,9 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		       CASE WHEN length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
 		       r.tombstone,
 		       r.content_hash, r.received_at_ms, r.accepted_uptime_ms,
+		       octet_length(a.accepted_uptime_ms),
+		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END,
 		       r.change_cursor, r.collected_generation, r.retained, r.undominated,
 		       length(o.revision_json),
 		       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END,
@@ -792,6 +798,7 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		       CASE WHEN typeof(p.kind) = 'text'
 		                  AND p.kind = 'record_revision' THEN p.kind END
 		FROM record_revisions r
+		LEFT JOIN revision_acceptance_origins a ON a.revision_id = r.revision_id
 		LEFT JOIN revision_objects o USING (content_hash)
 		LEFT JOIN changes c
 		  ON c.cursor = r.change_cursor AND c.kind = 'record_revision'
@@ -847,18 +854,19 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 	for rows.Next() {
 		var revisionID, recordID, authorID sql.NullString
 		var revisionIDLength, recordIDLength, authorIDLength int64
-		var counterBytes, vectorBody, witness, hashBytes, uptimeBytes, cursorBytes, collectedBytes, objectBody, matchingChange []byte
+		var counterBytes, vectorBody, witness, hashBytes, uptimeBytes, originUptimeBytes, cursorBytes, collectedBytes, objectBody, matchingChange []byte
 		var vectorLength int64
-		var witnessLength sql.NullInt64
+		var witnessLength, originUptimeLength sql.NullInt64
 		var objectLength sql.NullInt64
 		var originKind sql.NullString
 		var receivedAt int64
 		var tombstone, retained, undominated int
-		if rows.Scan(&revisionIDLength, &revisionID, &recordIDLength, &recordID, &authorIDLength, &authorID, &counterBytes, &vectorLength, &vectorBody, &witnessLength, &witness, &tombstone, &hashBytes, &receivedAt, &uptimeBytes, &cursorBytes, &collectedBytes, &retained, &undominated, &objectLength, &objectBody, &matchingChange, &originKind) != nil ||
+		if rows.Scan(&revisionIDLength, &revisionID, &recordIDLength, &recordID, &authorIDLength, &authorID, &counterBytes, &vectorLength, &vectorBody, &witnessLength, &witness, &tombstone, &hashBytes, &receivedAt, &uptimeBytes, &originUptimeLength, &originUptimeBytes, &cursorBytes, &collectedBytes, &retained, &undominated, &objectLength, &objectBody, &matchingChange, &originKind) != nil ||
 			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength != maxUUIDBytes || validateUUID(revisionID.String) != nil ||
 			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
 			!boundedRequiredText(authorIDLength, authorID, maxUUIDBytes) || validateUUID(authorID.String) != nil || len(hashBytes) != 32 ||
 			!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || !boundedOptionalBytes(witnessLength, witness, 32) || witnessLength.Valid && witnessLength.Int64 != 32 ||
+			!originUptimeLength.Valid || originUptimeLength.Int64 != 8 || len(originUptimeBytes) != 8 || !bytes.Equal(uptimeBytes, originUptimeBytes) ||
 			tombstone < 0 || tombstone > 1 || retained < 0 || retained > 1 || undominated < 0 || undominated > 1 ||
 			retained == 0 && undominated != 0 ||
 			validateTimestamp(formatTimestamp(receivedAt)) != nil {
@@ -969,6 +977,48 @@ func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devic
 		return nil, err
 	}
 	return historicalCounters, nil
+}
+
+// validatePersistentRevisionAcceptanceOrigins performs the reverse half of the
+// one-to-one check without retaining an unbounded key set: every provenance row
+// is streamed in primary-key order and must own one canonical permanent
+// revision with the same age.
+func validatePersistentRevisionAcceptanceOrigins(ctx context.Context, query schemaQueryer) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(a.revision_id),
+		       CASE WHEN typeof(a.revision_id) = 'text'
+		                  AND octet_length(a.revision_id) = ? THEN a.revision_id END,
+		       octet_length(a.accepted_uptime_ms),
+		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END,
+		       octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       r.accepted_uptime_ms
+		FROM revision_acceptance_origins a
+		LEFT JOIN record_revisions r ON r.revision_id = a.revision_id
+		ORDER BY a.revision_id`, maxUUIDBytes, maxUUIDBytes)
+	if err != nil {
+		return invalidPersistentState("read revision acceptance origins")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var originRevisionID, revisionID sql.NullString
+		var originRevisionIDLength, originUptimeLength int64
+		var revisionIDLength sql.NullInt64
+		var originUptimeBytes, revisionUptimeBytes []byte
+		if rows.Scan(&originRevisionIDLength, &originRevisionID, &originUptimeLength, &originUptimeBytes, &revisionIDLength, &revisionID, &revisionUptimeBytes) != nil ||
+			!boundedRequiredText(originRevisionIDLength, originRevisionID, maxUUIDBytes) || originRevisionIDLength != maxUUIDBytes || validateUUID(originRevisionID.String) != nil ||
+			originUptimeLength != 8 || len(originUptimeBytes) != 8 || decodeUint64Error(originUptimeBytes) != nil ||
+			!boundedOptionalText(revisionIDLength, revisionID, maxUUIDBytes) || !revisionIDLength.Valid || revisionIDLength.Int64 != maxUUIDBytes ||
+			validateUUID(revisionID.String) != nil || revisionID.String != originRevisionID.String || !bytes.Equal(revisionUptimeBytes, originUptimeBytes) {
+			return invalidPersistentState("invalid revision acceptance origin")
+		}
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return invalidPersistentState("read revision acceptance origins")
+	}
+	return nil
 }
 
 func validatePersistentCollectionGenerationSequence(ctx context.Context, query schemaQueryer, collectionGeneration uint64) error {
@@ -1210,25 +1260,30 @@ func validatePersistentCollectionQueues(ctx context.Context, query schemaQueryer
 		       octet_length(r.record_id),
 		       CASE WHEN typeof(r.record_id) = 'text'
 		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
-		       r.accepted_uptime_ms, r.retained
+		       r.accepted_uptime_ms, r.retained,
+		       octet_length(a.accepted_uptime_ms),
+		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END
 		FROM collection_candidates q
 		LEFT JOIN record_revisions r ON r.revision_id = q.revision_id
+		LEFT JOIN revision_acceptance_origins a ON a.revision_id = q.revision_id
 		ORDER BY q.record_id, q.accepted_uptime_ms, q.revision_id`, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes)
 	if err != nil {
 		return invalidPersistentState("read collection candidate queue")
 	}
 	for candidateRows.Next() {
 		var recordID, revisionID sql.NullString
-		var uptimeBytes, revisionUptime []byte
+		var uptimeBytes, revisionUptime, originUptime []byte
 		var revisionRecord sql.NullString
 		var recordIDLength, revisionIDLength int64
 		var revisionRecordLength sql.NullInt64
-		var retained sql.NullInt64
-		if candidateRows.Scan(&recordIDLength, &recordID, &uptimeBytes, &revisionIDLength, &revisionID, &revisionRecordLength, &revisionRecord, &revisionUptime, &retained) != nil ||
+		var retained, originUptimeLength sql.NullInt64
+		if candidateRows.Scan(&recordIDLength, &recordID, &uptimeBytes, &revisionIDLength, &revisionID, &revisionRecordLength, &revisionRecord, &revisionUptime, &retained, &originUptimeLength, &originUptime) != nil ||
 			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
 			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength != maxUUIDBytes || validateUUID(revisionID.String) != nil || decodeUint64Error(uptimeBytes) != nil ||
 			!boundedOptionalText(revisionRecordLength, revisionRecord, maxUUIDBytes) || !revisionRecordLength.Valid || validateUUID(revisionRecord.String) != nil ||
-			revisionRecord.String != recordID.String || !bytes.Equal(uptimeBytes, revisionUptime) || !retained.Valid || retained.Int64 != 1 {
+			revisionRecord.String != recordID.String || !bytes.Equal(uptimeBytes, revisionUptime) || !retained.Valid || retained.Int64 != 1 ||
+			!originUptimeLength.Valid || originUptimeLength.Int64 != 8 || len(originUptime) != 8 || !bytes.Equal(revisionUptime, originUptime) {
 			candidateRows.Close()
 			return invalidPersistentState("invalid collection candidate queue")
 		}

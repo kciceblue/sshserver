@@ -15,6 +15,9 @@ func downgradeRecordRevisionsToPriorFullV1(t *testing.T, database *sql.DB) {
 		t.Fatal(err)
 	}
 	defer transaction.Rollback()
+	if _, err := transaction.Exec("DROP TABLE revision_acceptance_origins"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := transaction.Exec(
 		"ALTER TABLE record_revisions RENAME TO record_revisions_current_v1"); err != nil {
 		t.Fatal(err)
@@ -106,10 +109,6 @@ func TestOpenMigratesExactPriorFullV1RecordRevisionSchema(t *testing.T) {
 			fixture := seedRevisionKeyFixture(t, history)
 			before := markerKeyDurableDigest(t, fixture.seed.opened.db)
 			downgradeRecordRevisionsToPriorFullV1(t, fixture.seed.opened.db)
-			if afterDowngrade := markerKeyDurableDigest(t, fixture.seed.opened.db); afterDowngrade != before {
-				fixture.seed.opened.Close()
-				t.Fatalf("test downgrade changed durable rows: before=%x after=%x", before, afterDowngrade)
-			}
 			if err := fixture.seed.opened.Close(); err != nil {
 				t.Fatal(err)
 			}

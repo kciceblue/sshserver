@@ -133,6 +133,15 @@ const createRecordRevisionsPriorFullV1 = `CREATE TABLE record_revisions (
 			CHECK ((retained = 0) = (collected_generation IS NOT NULL))
 		) STRICT`
 
+// revision_acceptance_origins is the durable, admission-time source of truth
+// for the collection retention clock. The copies on record_revisions and
+// collection_candidates remain query/index material, but collection and
+// startup validation require all three values to agree.
+const createRevisionAcceptanceOriginsV1 = `CREATE TABLE revision_acceptance_origins (
+			revision_id TEXT PRIMARY KEY CHECK (length(revision_id) = 36),
+			accepted_uptime_ms BLOB NOT NULL CHECK (length(accepted_uptime_ms) = 8)
+		) STRICT`
+
 const createCollectionRecordsV1 = `CREATE TABLE collection_records (
 			record_id TEXT PRIMARY KEY CHECK (length(record_id) = 36),
 			barrier_cursor BLOB NOT NULL CHECK (length(barrier_cursor) = 8)
@@ -286,6 +295,7 @@ var fullSchemaTables = map[string]string{
 	"record_revisions":            createRecordRevisionsV1,
 	"record_heads":                createRecordHeadsV1,
 	"record_vector_index":         createRecordVectorIndexV1,
+	"revision_acceptance_origins": createRevisionAcceptanceOriginsV1,
 	"revision_objects":            createRevisionObjectsV1,
 	"runtime_state":               createRuntimeStateV1,
 	"self_revocation_receipts":    createSelfRevocationReceiptsV1,
@@ -296,9 +306,22 @@ var fullSchemaTables = map[string]string{
 	"vault_envelope":              createVaultEnvelopeV1,
 }
 
-var priorFullSchemaTables = func() map[string]string {
-	tables := make(map[string]string, len(fullSchemaTables))
+// priorAcceptanceOriginSchemaTables is the exact full-schema fingerprint from
+// immediately before durable acceptance-age provenance was added. It already
+// has the record_id/revision_id lookup constraint on record_revisions.
+var priorAcceptanceOriginSchemaTables = func() map[string]string {
+	tables := make(map[string]string, len(fullSchemaTables)-1)
 	for name, statement := range fullSchemaTables {
+		if name != "revision_acceptance_origins" {
+			tables[name] = statement
+		}
+	}
+	return tables
+}()
+
+var priorFullSchemaTables = func() map[string]string {
+	tables := make(map[string]string, len(priorAcceptanceOriginSchemaTables))
+	for name, statement := range priorAcceptanceOriginSchemaTables {
 		tables[name] = statement
 	}
 	tables["record_revisions"] = createRecordRevisionsPriorFullV1
@@ -316,6 +339,7 @@ const (
 	schemaEmpty schemaKind = iota
 	schemaLegacy
 	schemaPriorFull
+	schemaPriorAcceptanceOrigin
 	schemaFull
 )
 
@@ -347,6 +371,9 @@ func inspectSchemaState(ctx context.Context, database schemaQueryer) (schemaKind
 	}
 	if schemaTablesEqual(tables, fullSchemaTables) {
 		return schemaFull, userVersion, nil
+	}
+	if schemaTablesEqual(tables, priorAcceptanceOriginSchemaTables) {
+		return schemaPriorAcceptanceOrigin, userVersion, nil
 	}
 	if schemaTablesEqual(tables, priorFullSchemaTables) {
 		return schemaPriorFull, userVersion, nil
@@ -424,6 +451,7 @@ func createSchemaV1(ctx context.Context, transaction *sql.Tx) error {
 		createVaultEnvelopeV1,
 		createRevisionObjectsV1,
 		createRecordRevisionsV1,
+		createRevisionAcceptanceOriginsV1,
 		createRecordHeadsV1,
 		createRecordVectorIndexV1,
 		createCollectionRecordsV1,
@@ -457,6 +485,7 @@ func migrateLegacySchemaV1(ctx context.Context, transaction *sql.Tx) error {
 		createVaultEnvelopeV1,
 		createRevisionObjectsV1,
 		createRecordRevisionsV1,
+		createRevisionAcceptanceOriginsV1,
 		createRecordHeadsV1,
 		createRecordVectorIndexV1,
 		createCollectionRecordsV1,
@@ -512,6 +541,51 @@ func migratePriorFullSchemaV1(ctx context.Context, transaction *sql.Tx) error {
 	}
 	if _, err := transaction.ExecContext(ctx, "DROP TABLE record_revisions_prior_full_v1"); err != nil {
 		return fmt.Errorf("migrate prior full V1 schema: remove prior table: %w", err)
+	}
+	return nil
+}
+
+// migrateRevisionAcceptanceOriginsV1 handles only the two exact, known V1
+// fingerprints that predate the provenance table. Their two mutable age copies
+// cannot be trusted as migration input: a coherent lowering was accepted by
+// the old validator. Rebase every revision and retained queue entry to the
+// current accumulated uptime before seeding provenance. This may delay
+// collection by up to another retention period but can never accelerate it.
+func migrateRevisionAcceptanceOriginsV1(ctx context.Context, transaction *sql.Tx) error {
+	var currentBytes []byte
+	var currentLength int64
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT octet_length(accumulated_uptime_ms),
+		       CASE WHEN typeof(accumulated_uptime_ms) = 'blob'
+		                  AND octet_length(accumulated_uptime_ms) = 8
+		            THEN accumulated_uptime_ms END
+		FROM runtime_state WHERE singleton = 1`,
+	).Scan(&currentLength, &currentBytes); err != nil {
+		return fmt.Errorf("migrate revision acceptance origins: read current uptime: %w", err)
+	}
+	if currentLength != 8 || len(currentBytes) != 8 {
+		return fmt.Errorf("migrate revision acceptance origins: invalid current uptime: %w", ErrUnexpectedSchema)
+	}
+	current, err := DecodeUint64(currentBytes)
+	if err != nil {
+		return fmt.Errorf("migrate revision acceptance origins: decode current uptime: %w", err)
+	}
+	encodedCurrent := EncodeUint64(current)
+	if _, err := transaction.ExecContext(ctx, `
+		UPDATE record_revisions SET accepted_uptime_ms = ?`, encodedCurrent[:]); err != nil {
+		return fmt.Errorf("migrate revision acceptance origins: rebase revisions: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		UPDATE collection_candidates SET accepted_uptime_ms = ?`, encodedCurrent[:]); err != nil {
+		return fmt.Errorf("migrate revision acceptance origins: rebase candidates: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, createRevisionAcceptanceOriginsV1); err != nil {
+		return fmt.Errorf("migrate revision acceptance origins: create provenance: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO revision_acceptance_origins (revision_id, accepted_uptime_ms)
+		SELECT revision_id, ? FROM record_revisions`, encodedCurrent[:]); err != nil {
+		return fmt.Errorf("migrate revision acceptance origins: seed provenance: %w", err)
 	}
 	return nil
 }

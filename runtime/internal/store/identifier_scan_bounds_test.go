@@ -228,6 +228,7 @@ func TestOwnedCollectionTextScansRejectMalformedStorage(t *testing.T) {
 				database := openIdentifierScanFixture(t)
 				mustIdentifierScanExec(t, database, "CREATE TABLE collection_records (record_id, barrier_cursor)")
 				mustIdentifierScanExec(t, database, "CREATE TABLE record_heads (record_id, revision_id)")
+				mustIdentifierScanExec(t, database, "CREATE TABLE revision_acceptance_origins (revision_id, accepted_uptime_ms)")
 				mustIdentifierScanExec(t, database, `
 					CREATE TABLE record_revisions (
 						revision_id, record_id, vector_json, content_hash,
@@ -243,6 +244,9 @@ func TestOwnedCollectionTextScansRejectMalformedStorage(t *testing.T) {
 						collection_witness_authenticator, tombstone,
 						accepted_uptime_ms, change_cursor
 					) VALUES (?, ?, ?, ?, NULL, 0, ?, ?)`, test.revisionID, test.recordID, []byte("[]"), make([]byte, 32), one[:], one[:])
+				mustIdentifierScanExec(t, database,
+					"INSERT INTO revision_acceptance_origins (revision_id, accepted_uptime_ms) VALUES (?, ?)",
+					test.revisionID, one[:])
 				transaction := beginIdentifierScanFixture(t, database)
 				defer transaction.Rollback()
 				if _, _, _, protocolErr := loadCollectionRecordWork(context.Background(), transaction, validRecordID, 0); protocolErr == nil || protocolErr.Code != "internal_error" {

@@ -196,11 +196,30 @@ func TestOperationReceiptKeyPreflightUsesBoundedIndexes(t *testing.T) {
 	deviceTextLower, deviceTextUpper, deviceBlobLower, deviceBlobUpper := receiptKeyPrefixBounds(deviceID)
 	requestTextLower, requestTextUpper, requestBlobLower, requestBlobUpper := receiptKeyPrefixBounds(requestID)
 	for _, test := range []struct {
-		name      string
-		query     string
-		arguments []any
-		want      []string
+		name             string
+		query            string
+		arguments        []any
+		want             []string
+		coveringSearches int
 	}{
+		{
+			name:  "independent device aliases",
+			query: receiptDeviceAliasProbeQuery,
+			arguments: []any{
+				deviceTextLower, deviceTextUpper, deviceBlobLower, deviceBlobUpper,
+			},
+			want:             []string{"USING COVERING INDEX", "(device_id>? AND device_id<?)"},
+			coveringSearches: 2,
+		},
+		{
+			name:  "independent request aliases",
+			query: receiptRequestAliasProbeQuery,
+			arguments: []any{
+				requestTextLower, requestTextUpper, requestBlobLower, requestBlobUpper,
+			},
+			want:             []string{"USING COVERING INDEX", "(request_id>? AND request_id<?)"},
+			coveringSearches: 2,
+		},
 		{
 			name:  "device then request prefix",
 			query: receiptDeviceRequestCandidateQuery,
@@ -208,7 +227,8 @@ func TestOperationReceiptKeyPreflightUsesBoundedIndexes(t *testing.T) {
 				deviceID, requestTextLower, requestTextUpper,
 				deviceID, requestBlobLower, requestBlobUpper,
 			},
-			want: []string{"USING COVERING INDEX", "(device_id=? AND request_id>? AND request_id<?)"},
+			want:             []string{"USING COVERING INDEX", "(device_id=? AND request_id>? AND request_id<?)"},
+			coveringSearches: 2,
 		},
 		{
 			name:  "request then device prefix",
@@ -217,13 +237,15 @@ func TestOperationReceiptKeyPreflightUsesBoundedIndexes(t *testing.T) {
 				requestID, deviceTextLower, deviceTextUpper,
 				requestID, deviceBlobLower, deviceBlobUpper,
 			},
-			want: []string{"USING COVERING INDEX", "(request_id=? AND device_id>? AND device_id<?)"},
+			want:             []string{"USING COVERING INDEX", "(request_id=? AND device_id>? AND device_id<?)"},
+			coveringSearches: 2,
 		},
 		{
-			name:      "fingerprint",
-			query:     receiptFingerprintCandidateQuery,
-			arguments: []any{make([]byte, 32)},
-			want:      []string{"USING COVERING INDEX", "(request_fingerprint=?)"},
+			name:             "fingerprint",
+			query:            receiptFingerprintCandidateQuery,
+			arguments:        []any{make([]byte, 32)},
+			want:             []string{"USING COVERING INDEX", "(request_fingerprint=?)"},
+			coveringSearches: 1,
 		},
 		{
 			name:  "candidate retention mapping",
@@ -236,14 +258,92 @@ func TestOperationReceiptKeyPreflightUsesBoundedIndexes(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			plan := receiptKeyQueryPlan(t, opened.db, test.query, test.arguments...)
-			if strings.Contains(plan, "SCAN operation_receipts") || strings.Contains(plan, "SCAN operation_receipt_retention") {
+			if strings.Contains(plan, "SCAN operation_receipts") || strings.Contains(plan, "SCAN operation_receipt_retention") || strings.Contains(plan, "AUTOMATIC") {
 				t.Fatalf("unbounded receipt-key plan:\n%s", plan)
+			}
+			if searches := strings.Count(plan, "USING COVERING INDEX"); searches != test.coveringSearches {
+				t.Fatalf("receipt-key covering searches=%d, want=%d:\n%s", searches, test.coveringSearches, plan)
 			}
 			for _, want := range test.want {
 				if !strings.Contains(plan, want) {
 					t.Fatalf("receipt-key plan missing %q:\n%s", want, plan)
 				}
 			}
+		})
+	}
+}
+
+func corruptReceiptDeviceAndRequestAliases(t *testing.T, database *sql.DB, operation, deviceID, requestID string, blob bool) {
+	t.Helper()
+	if blob {
+		writeReceiptKeyWrongType(t, database, `
+			UPDATE operation_receipts
+			SET device_id = CAST(? AS BLOB), request_id = CAST(? AS BLOB)
+			WHERE operation = ? AND device_id = ? AND request_id = ?`,
+			deviceID, requestID, operation, deviceID, requestID)
+		return
+	}
+	if _, err := database.Exec(`
+		UPDATE operation_receipts SET device_id = ?, request_id = ?
+		WHERE operation = ? AND device_id = ? AND request_id = ?`,
+		deviceID+"\x00alias", requestID+"\x00alias", operation, deviceID, requestID,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOperationReceiptKeyPreflightRejectsPairedDeviceAndRequestAliases(t *testing.T) {
+	for _, blob := range []bool{false, true} {
+		form := "NUL-suffixed TEXT"
+		if blob {
+			form = "BLOB-equivalent"
+		}
+		t.Run("sync/"+form, func(t *testing.T) {
+			seed := seedBoundedPersistence(t, boundedSeedOptions{})
+			defer seed.opened.Close()
+			corruptReceiptDeviceAndRequestAliases(t, seed.opened.db, "sync", seed.deviceID, seed.sync.RequestID, blob)
+			before := readReceiptKeyPreflightState(t, seed.opened.db, seed.deviceID)
+			changed := boundedSyncCall(seed, seed.sync.RequestID, "0", nil)
+			expectReceiptKeyPreflightError(t, seed.opened, changed, "internal_error")
+			after := readReceiptKeyPreflightState(t, seed.opened.db, seed.deviceID)
+			assertReceiptKeyPreflightStateUnchanged(t, before, after)
+		})
+
+		t.Run("vault envelope/"+form, func(t *testing.T) {
+			seed := seedBoundedPersistence(t, boundedSeedOptions{})
+			defer seed.opened.Close()
+			requestID := "e1000000-0000-4000-8000-000000000004"
+			corruptReceiptDeviceAndRequestAliases(t, seed.opened.db, "vault-envelope", seed.deviceID, requestID, blob)
+			before := readReceiptKeyPreflightState(t, seed.opened.db, seed.deviceID)
+			changed := validationOwnerEnvelopeCall(t, seed.token, requestID)
+			expectReceiptKeyPreflightError(t, seed.opened, changed, "internal_error")
+			after := readReceiptKeyPreflightState(t, seed.opened.db, seed.deviceID)
+			assertReceiptKeyPreflightStateUnchanged(t, before, after)
+		})
+
+		t.Run("device revocation/"+form, func(t *testing.T) {
+			opened, _ := openDataPlane(t)
+			defer opened.Close()
+			managerID := "f7330000-0000-4000-8000-000000000001"
+			firstTargetID := "f7330000-0000-4000-8000-000000000002"
+			secondTargetID := "f7330000-0000-4000-8000-000000000003"
+			managerToken := tokenWithByte(0x76)
+			enrollDevice(t, opened, protocolFixtureTime, "f7330000-0000-4000-8000-000000000004", managerID, "f7330000-0000-4000-8000-000000000005", managerToken)
+			enrollDevice(t, opened, protocolFixtureTime, "f7330000-0000-4000-8000-000000000006", firstTargetID, "f7330000-0000-4000-8000-000000000007", tokenWithByte(0x77))
+			enrollDevice(t, opened, protocolFixtureTime, "f7330000-0000-4000-8000-000000000008", secondTargetID, "f7330000-0000-4000-8000-000000000009", tokenWithByte(0x78))
+			requestID := "f7330000-0000-4000-8000-00000000000a"
+			first := revocationCall(t, firstTargetID, requestID, managerToken, false, protocolFixtureTime.Add(time.Second))
+			if response, protocolErr := opened.HandleAPI(context.Background(), first); protocolErr != nil || response.Status != http.StatusOK {
+				t.Fatalf("seed revocation: response=%+v error=%v", response, protocolErr)
+			}
+			operation := "device-revocation/" + firstTargetID
+			corruptReceiptDeviceAndRequestAliases(t, opened.db, operation, managerID, requestID, blob)
+			before := readReceiptKeyPreflightState(t, opened.db, managerID, firstTargetID, secondTargetID)
+			changed := revocationCall(t, secondTargetID, requestID, managerToken, false, protocolFixtureTime.Add(2*time.Second))
+			changed.Body = append(changed.Body, '\n')
+			expectReceiptKeyPreflightError(t, opened, changed, "internal_error")
+			after := readReceiptKeyPreflightState(t, opened.db, managerID, firstTargetID, secondTargetID)
+			assertReceiptKeyPreflightStateUnchanged(t, before, after)
 		})
 	}
 }
