@@ -910,11 +910,14 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	if instanceLease.InitializationLockCreated() == confirmedPreview.Existing.InitializationLockPresent {
 		return ApplyResult{}, fmt.Errorf("initialization lock creation no longer matches the confirmed deployment preview: %w", ErrDeploymentPreviewConfirmationMismatch)
 	}
+	attestInstanceLease := func() error {
+		return attestConfirmedInitializationLease(instanceLease)
+	}
 	if err := lifecycle.verifyApplyConfirmationInputs(request, desired); err != nil {
 		return ApplyResult{}, err
 	}
 	instanceSnapshot := lockedConfirmationInstanceSnapshot(ctx, lifecycle.layout, confirmedPreview.Existing.InstanceState)
-	if err := attestConfirmedInitializationLease(instanceLease); err != nil {
+	if err := attestInstanceLease(); err != nil {
 		return ApplyResult{}, err
 	}
 	// Acquiring the lease necessarily leaves its structural lock present. Keep
@@ -935,7 +938,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	if err := PrepareLayout(lifecycle.layout); err != nil {
 		return ApplyResult{}, err
 	}
-	if err := attestConfirmedInitializationLease(instanceLease); err != nil {
+	if err := attestInstanceLease(); err != nil {
 		return ApplyResult{}, err
 	}
 
@@ -968,12 +971,15 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 			journal.SourcePath = request.ArtifactPath
 			journal.LicenseSourcePath = request.LicensePath
 			journal.NoticeSourcePath = request.NoticePath
+			if err := attestInstanceLease(); err != nil {
+				return ApplyResult{}, err
+			}
 			if err := SaveJournal(lifecycle.layout, journal); err != nil {
 				return ApplyResult{}, err
 			}
 		}
-		result, err := lifecycle.runApply(ctx, &journal, instanceLease.Initialize)
-		if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || journal.Phase == PhaseStateSaved {
+		result, err := lifecycle.runApply(ctx, &journal, instanceLease.Initialize, attestInstanceLease)
+		if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || journal.Phase == PhaseStateSaved {
 			return result, err
 		}
 		rollbackErr := lifecycle.restorePriorAfterFailedApply(ctx, journal)
@@ -1001,7 +1007,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 		return ApplyResult{}, errors.New("the active native user service manager is unavailable; refusing an implicit foreground transition")
 	}
 	if prior != nil && prior.Active != nil && *prior.Active == desired && prior.Manager == availability.Manager {
-		return lifecycle.validateIdempotentApply(ctx, *prior, availability, request)
+		return lifecycle.validateIdempotentApply(ctx, *prior, availability, request, attestInstanceLease)
 	}
 	transactionID, err := newTransactionID()
 	if err != nil {
@@ -1020,14 +1026,17 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 		Desired:           &desired,
 		PriorState:        prior,
 	}
+	if err := attestInstanceLease(); err != nil {
+		return ApplyResult{}, err
+	}
 	if err := SaveJournal(lifecycle.layout, journal); err != nil {
 		return ApplyResult{}, err
 	}
 	if err := lifecycle.injectCrash(PhasePlanned); err != nil {
 		return ApplyResult{}, err
 	}
-	result, err = lifecycle.runApply(ctx, &journal, instanceLease.Initialize)
-	if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || journal.Phase == PhaseStateSaved {
+	result, err = lifecycle.runApply(ctx, &journal, instanceLease.Initialize, attestInstanceLease)
+	if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || journal.Phase == PhaseStateSaved {
 		return result, err
 	}
 	rollbackErr := lifecycle.restorePriorAfterFailedApply(ctx, journal)
@@ -1085,9 +1094,18 @@ func (lifecycle *Lifecycle) verifyRecordedReleaseForApply(ctx context.Context, s
 	return fmt.Errorf("verify recorded active release before apply: %w", err)
 }
 
-func (lifecycle *Lifecycle) validateIdempotentApply(ctx context.Context, state DeploymentState, availability ManagerAvailability, request ApplyRequest) (ApplyResult, error) {
+func (lifecycle *Lifecycle) validateIdempotentApply(
+	ctx context.Context,
+	state DeploymentState,
+	availability ManagerAvailability,
+	request ApplyRequest,
+	attest func() error,
+) (ApplyResult, error) {
 	if state.Active == nil {
 		return ApplyResult{}, errors.New("idempotent deployment state has no active release")
+	}
+	if err := attest(); err != nil {
+		return ApplyResult{}, err
 	}
 	versionDir, err := PrepareVersionDirectory(lifecycle.layout, state.Active.Release)
 	if err != nil {
@@ -1129,6 +1147,7 @@ func (lifecycle *Lifecycle) runApply(
 	ctx context.Context,
 	journal *DeploymentJournal,
 	initialize func(context.Context, []string) (config.Settings, error),
+	attest func() error,
 ) (ApplyResult, error) {
 	if journal.Phase == PhaseStateSaved {
 		state, err := lifecycle.validateCommittedState(*journal)
@@ -1139,13 +1158,25 @@ func (lifecycle *Lifecycle) runApply(
 		if err != nil {
 			return ApplyResult{}, err
 		}
+		if err := attest(); err != nil {
+			return ApplyResult{}, err
+		}
 		if err := RemoveJournal(lifecycle.layout); err != nil {
 			return ApplyResult{}, err
 		}
 		return result, nil
 	}
+	checkpoint := func(phase Phase) error {
+		if err := attest(); err != nil {
+			return err
+		}
+		return lifecycle.checkpoint(journal, phase)
+	}
 	desired := *journal.Desired
 	if !applyPhaseReached(journal.Phase, PhaseArtifactStaged) {
+		if err := attest(); err != nil {
+			return ApplyResult{}, err
+		}
 		versionDir, err := PrepareVersionDirectory(lifecycle.layout, desired.Release)
 		if err != nil {
 			return ApplyResult{}, err
@@ -1163,7 +1194,7 @@ func (lifecycle *Lifecycle) runApply(
 		if err := lifecycle.verifyDesired(ctx, desired); err != nil {
 			return ApplyResult{}, err
 		}
-		if err := lifecycle.checkpoint(journal, PhaseArtifactStaged); err != nil {
+		if err := checkpoint(PhaseArtifactStaged); err != nil {
 			return ApplyResult{}, err
 		}
 	} else if err := lifecycle.verifyDesired(ctx, desired); err != nil {
@@ -1174,7 +1205,7 @@ func (lifecycle *Lifecycle) runApply(
 		if _, err := initialize(ctx, nil); err != nil {
 			return ApplyResult{}, err
 		}
-		if err := lifecycle.checkpoint(journal, PhaseInstanceReady); err != nil {
+		if err := checkpoint(PhaseInstanceReady); err != nil {
 			return ApplyResult{}, err
 		}
 	}
@@ -1182,7 +1213,7 @@ func (lifecycle *Lifecycle) runApply(
 		if err := lifecycle.stopPrior(ctx, journal.PriorState); err != nil {
 			return ApplyResult{}, err
 		}
-		if err := lifecycle.checkpoint(journal, PhasePriorServiceStopped); err != nil {
+		if err := checkpoint(PhasePriorServiceStopped); err != nil {
 			return ApplyResult{}, err
 		}
 	}
@@ -1200,7 +1231,7 @@ func (lifecycle *Lifecycle) runApply(
 				return ApplyResult{}, errors.New("service manager installed an unexpected definition path")
 			}
 		}
-		if err := lifecycle.checkpoint(journal, PhaseDefinitionInstalled); err != nil {
+		if err := checkpoint(PhaseDefinitionInstalled); err != nil {
 			return ApplyResult{}, err
 		}
 	}
@@ -1209,7 +1240,7 @@ func (lifecycle *Lifecycle) runApply(
 			if err := lifecycle.activateDesired(ctx, desired); err != nil {
 				return ApplyResult{}, err
 			}
-			if err := lifecycle.checkpoint(journal, PhaseActivated); err != nil {
+			if err := checkpoint(PhaseActivated); err != nil {
 				return ApplyResult{}, err
 			}
 		}
@@ -1217,25 +1248,31 @@ func (lifecycle *Lifecycle) runApply(
 			if err := lifecycle.waitForRunning(ctx, desired); err != nil {
 				return ApplyResult{}, err
 			}
-			if err := lifecycle.checkpoint(journal, PhaseHealthVerified); err != nil {
+			if err := checkpoint(PhaseHealthVerified); err != nil {
 				return ApplyResult{}, err
 			}
 		}
 	}
 	if !applyPhaseReached(journal.Phase, PhaseCommitting) {
-		if err := lifecycle.checkpoint(journal, PhaseCommitting); err != nil {
+		if err := checkpoint(PhaseCommitting); err != nil {
 			return ApplyResult{}, err
 		}
 	}
 	state := lifecycle.committedApplyState(*journal)
+	if err := attest(); err != nil {
+		return ApplyResult{}, err
+	}
 	if err := SaveState(lifecycle.layout, state); err != nil {
 		return ApplyResult{}, err
 	}
-	if err := lifecycle.checkpoint(journal, PhaseStateSaved); err != nil {
+	if err := checkpoint(PhaseStateSaved); err != nil {
 		return ApplyResult{}, err
 	}
 	result, err := lifecycle.resultForState(state, lifecycle.foregroundFor(journal), journal.TransactionID)
 	if err != nil {
+		return ApplyResult{}, err
+	}
+	if err := attest(); err != nil {
 		return ApplyResult{}, err
 	}
 	if err := RemoveJournal(lifecycle.layout); err != nil {

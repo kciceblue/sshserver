@@ -512,6 +512,136 @@ func TestApplyRejectsReplacementOfAcquiredInitializationLockBeforeJournal(t *tes
 	}
 }
 
+func TestApplyReattestsInitializationLeaseAtJournalAndStagingBoundaries(t *testing.T) {
+	installReplacementHook := func(
+		fixture *lifecycleFixture,
+		attestationCalls *int,
+		replacement **instance.InitializationLease,
+	) {
+		originalAcquire := fixture.lifecycle.acquireInstanceLease
+		fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
+			lease, err := originalAcquire(stateDir, initializationLockPresent)
+			if err != nil {
+				return nil, err
+			}
+			return replaceInitializationLockAtAttestation(lease, stateDir, 3, attestationCalls, replacement), nil
+		}
+	}
+	finishReplacement := func(t *testing.T, err error, attestationCalls int, replacement *instance.InitializationLease) {
+		t.Helper()
+		if replacement == nil {
+			t.Fatal("replacement initialization lock was not acquired at the mutation boundary")
+		}
+		if closeErr := replacement.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if attestationCalls != 3 || !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) ||
+			!strings.Contains(err.Error(), "leased initialization lock path changed") {
+			t.Fatalf("boundary attestation calls=%d error=%v", attestationCalls, err)
+		}
+	}
+
+	t.Run("new journal save", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		request, desired := fixture.release(t, "v1.2.3", "boundary-new-journal")
+		attestationCalls := 0
+		var replacement *instance.InitializationLease
+		installReplacementHook(fixture, &attestationCalls, &replacement)
+		stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+
+		_, err := applyConfirmed(t, fixture.lifecycle, request)
+		finishReplacement(t, err, attestationCalls, replacement)
+		if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+			t.Fatalf("new-journal boundary created journal: %v", err)
+		}
+		if _, err := LoadState(fixture.layout); !errors.Is(err, ErrNoDeploymentState) {
+			t.Fatalf("new-journal boundary created deployment state: %v", err)
+		}
+		if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+			t.Fatalf("new-journal boundary reached stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+		}
+		if _, err := os.Lstat(desired.BinaryPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("new-journal boundary published desired binary: %v", err)
+		}
+	})
+
+	for _, rebind := range []bool{false, true} {
+		name := "matching journal staging"
+		if rebind {
+			name = "existing journal rebind"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newLifecycleFixture(t, false)
+			request, desired := fixture.release(t, "v1.2.3", "boundary-existing-journal")
+			fixture.lifecycle.failAfterPhase = PhasePlanned
+			if _, err := applyConfirmed(t, fixture.lifecycle, request); !errors.Is(err, ErrInjectedDeploymentCrash) {
+				t.Fatalf("injected planned apply error=%v", err)
+			}
+			fixture.lifecycle.failAfterPhase = ""
+			if rebind {
+				alternate := filepath.Join(fixture.layout.HomeDir, "alternate-boundary-inputs")
+				request.ArtifactPath = filepath.Join(alternate, "sshserver")
+				request.LicensePath = filepath.Join(alternate, "LICENSE")
+				request.NoticePath = filepath.Join(alternate, "NOTICE")
+			}
+			journalBefore, err := os.ReadFile(fixture.layout.JournalPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attestationCalls := 0
+			var replacement *instance.InitializationLease
+			installReplacementHook(fixture, &attestationCalls, &replacement)
+			stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+
+			_, err = applyConfirmed(t, fixture.lifecycle, request)
+			finishReplacement(t, err, attestationCalls, replacement)
+			journalAfter, readErr := os.ReadFile(fixture.layout.JournalPath)
+			if readErr != nil || !bytes.Equal(journalAfter, journalBefore) {
+				t.Fatalf("%s changed journal bytes err=%v", name, readErr)
+			}
+			journal, loadErr := LoadJournal(fixture.layout)
+			if loadErr != nil || journal.Phase != PhasePlanned {
+				t.Fatalf("%s journal=%+v err=%v", name, journal, loadErr)
+			}
+			if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+				t.Fatalf("%s reached stage/support/init=%d/%d/%d", name, fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+			}
+			if _, err := os.Lstat(desired.BinaryPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s published desired binary: %v", name, err)
+			}
+		})
+	}
+
+	t.Run("idempotent staging", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		request, _ := fixture.release(t, "v1.2.3", "boundary-idempotent")
+		if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
+			t.Fatal(err)
+		}
+		stateBefore, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attestationCalls := 0
+		var replacement *instance.InitializationLease
+		installReplacementHook(fixture, &attestationCalls, &replacement)
+		stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+
+		_, err = applyConfirmed(t, fixture.lifecycle, request)
+		finishReplacement(t, err, attestationCalls, replacement)
+		if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+			t.Fatalf("idempotent boundary created journal: %v", err)
+		}
+		stateAfter, readErr := os.ReadFile(fixture.layout.StatePath)
+		if readErr != nil || !bytes.Equal(stateAfter, stateBefore) {
+			t.Fatalf("idempotent boundary changed state bytes err=%v", readErr)
+		}
+		if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+			t.Fatalf("idempotent boundary reached stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+		}
+	})
+}
+
 func TestApplyResumesReviewedDatabaseStatesUnderInitializationLease(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
@@ -1284,6 +1414,38 @@ type testInitializationLease struct {
 	created    bool
 	attest     func() error
 	close      func() error
+}
+
+func replaceInitializationLockAtAttestation(
+	lease instanceInitializationLease,
+	stateDir string,
+	targetCall int,
+	attestationCalls *int,
+	replacement **instance.InitializationLease,
+) instanceInitializationLease {
+	return &testInitializationLease{
+		initialize: lease.Initialize,
+		created:    lease.InitializationLockCreated(),
+		attest: func() error {
+			*attestationCalls = *attestationCalls + 1
+			if *attestationCalls == targetCall {
+				lockPath := filepath.Join(stateDir, ".instance.lock")
+				if err := os.Remove(lockPath); err != nil {
+					return err
+				}
+				if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+					return err
+				}
+				acquired, err := instance.AcquireInitializationLeaseWithLockPresence(stateDir, true)
+				if err != nil {
+					return err
+				}
+				*replacement = acquired
+			}
+			return lease.AttestLockPath()
+		},
+		close: lease.Close,
+	}
 }
 
 func (lease *testInitializationLease) Initialize(ctx context.Context, listeners []string) (config.Settings, error) {

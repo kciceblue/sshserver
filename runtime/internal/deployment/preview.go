@@ -503,6 +503,9 @@ func (lifecycle *Lifecycle) classifyJournalPreview(ctx context.Context, preview 
 		preview.Actions = []PreviewAction{}
 		return finishPreview(preview)
 	}
+	if err := lifecycle.verifyRecordedReleaseForApply(ctx, journal.PriorState, desired); err != nil {
+		return finishRecoveryUnavailable(preview, "installed_release_verification_failed_during_recovery")
+	}
 	if journal.Phase == PhaseStateSaved {
 		if preview.Existing.State == nil || lifecycle.validateCommittedStateValue(journal, *preview.Existing.State) != nil {
 			return finishRecoveryUnavailable(preview, "saved_deployment_state_does_not_match_recovering_transaction")

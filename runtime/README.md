@@ -76,19 +76,20 @@ the initialization lease in Apply order before the remaining layout repair,
 journal, or idempotent release work. Rollback and uninstall recovery plans
 likewise record bootstrap and lifecycle admission before full layout repair.
 A journal already checkpointed at `state_saved` is resumable only when the
-saved deployment state exactly matches that transaction. Discarding the result
-is therefore a complete cancellation.
+saved deployment state exactly matches that transaction and its prior rollback
+release remains verified. Discarding the result is therefore a complete
+cancellation.
 
 The transactional `deploy apply` and `deploy recover` require the SHA-256 of
 the exact canonical preview bytes, including their terminal newline. They
 rebuild that plan while holding the lifecycle and initialization locks and
 refuse before product mutation if any field or action changed. The leased
 initialization-lock path is re-attested against its flocked descriptor before
-journaling and initialization, so unlink or replacement fails closed. `deploy
-status`, `deploy rollback`, and `deploy uninstall` commands validate an exact
-pinned release,
-publish its binary and LICENSE/NOTICE without replacement, preserve protected
-instance state, and drive only the current user's native service manager.
+each journal mutation, release staging, and initialization, so unlink or
+replacement fails closed. `deploy status`, `deploy rollback`, and `deploy
+uninstall` commands validate an exact pinned release, publish its binary and
+LICENSE/NOTICE without replacement, preserve protected instance state, and
+drive only the current user's native service manager.
 Apply detects the manager before its first mutation and revalidates the exact
 outcome before deployment work. Recognized manager absence returns an explicit
 supervised-foreground command; a manager failure or changed preflight outcome

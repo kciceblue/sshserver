@@ -1040,6 +1040,49 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 		}
 	})
 
+	t.Run("state-saved recovery verifies prior rollback release", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		installedRequest, installed := fixture.release(t, "v1.2.3", "state-saved-prior-installed")
+		if _, err := applyConfirmed(t, fixture.lifecycle, installedRequest); err != nil {
+			t.Fatal(err)
+		}
+		upgrade, _ := fixture.release(t, "v1.2.4", "state-saved-prior-upgrade")
+		fixture.lifecycle.failAfterPhase = PhaseStateSaved
+		if _, err := applyConfirmed(t, fixture.lifecycle, upgrade); !errors.Is(err, ErrInjectedDeploymentCrash) {
+			t.Fatalf("injected state-saved upgrade error=%v", err)
+		}
+		fixture.lifecycle.failAfterPhase = ""
+		fixture.lifecycle.verifyPreviewRelease = func(_ context.Context, release InstalledRelease) error {
+			if release.Release == installed.Release {
+				return errors.New("damaged prior rollback release")
+			}
+			return nil
+		}
+
+		preview, err := fixture.lifecycle.Preview(context.Background(), upgrade.previewRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if preview.Classification != PreviewResumeOrRecoveryRequired || preview.ApplyAllowed ||
+			preview.BlockReason != "installed_release_verification_failed_during_recovery" || len(preview.Actions) != 0 ||
+			preview.Existing.Journal == nil || preview.Existing.Journal.Phase != PhaseStateSaved {
+			t.Fatalf("damaged prior-release recovery preview=%+v", preview)
+		}
+		canonical, err := preview.CanonicalBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		upgrade.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
+		before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+		if _, err := fixture.lifecycle.Apply(context.Background(), upgrade); err == nil ||
+			!strings.Contains(err.Error(), "verify recorded active release before apply") {
+			t.Fatalf("damaged prior-release confirmed apply error=%v", err)
+		}
+		if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+			t.Fatalf("damaged prior-release apply mutated target\n before=%+v\n after=%+v", before, after)
+		}
+	})
+
 	t.Run("different release requires matching recovery", func(t *testing.T) {
 		fixture := newLifecycleFixture(t, false)
 		first, _ := fixture.release(t, "v1.2.3", "recovery-first")
@@ -1376,7 +1419,9 @@ func TestDeploymentPreviewRetriesWhenFirstApplyCreatesLifecycleLock(t *testing.T
 			detectCalls++
 		}
 	}
-	if detectCalls != 2 || verificationCalls != 2 {
+	// The rebuilt journal snapshot verifies both the currently recorded release
+	// and the journal's prior rollback release before allowing recovery.
+	if detectCalls != 2 || verificationCalls != 3 {
 		t.Fatalf("preview did not discard and rebuild tentative snapshot: manager=%v verification_calls=%d", fixture.manager.calls, verificationCalls)
 	}
 }
