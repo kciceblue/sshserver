@@ -41,6 +41,10 @@ The command talks to an owner-only Unix socket in the protected state
 directory. It writes exactly one JSON object to standard output; the instance
 secret and five-minute, single-use enrollment grant are never accepted in
 arguments, environment variables, the HTTP API, or service-manager files.
+For an active managed binary, the explicit state directory must exactly match
+its deployment record and the request remains bound to that deployment. A
+directly initialized binary keeps the same explicit form without a deployment
+binding.
 
 Normal sync discovers a configurable loopback port without minting a grant by
 invoking the exact active deployed binary with `endpoint show --format=json`.

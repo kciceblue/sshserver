@@ -75,7 +75,8 @@ type ManagedActiveLease struct {
 
 // AcquireManagedActiveLease atomically revalidates the serving executable,
 // state directory, and request binding while holding the shared lifecycle
-// lock. Missing, stale, malformed, or non-managed state fails closed.
+// lock. A recovery journal, or missing, stale, malformed, or non-managed
+// state, fails closed.
 func AcquireManagedActiveLease(executable, stateDir string, expected ActiveExecutableBinding) (*ManagedActiveLease, error) {
 	location, err := locateDeploymentExecutable(executable)
 	if err != nil {
@@ -94,6 +95,11 @@ func AcquireManagedActiveLease(executable, stateDir string, expected ActiveExecu
 			cause = errors.Join(cause, fmt.Errorf("release managed enrollment lease: %w", closeErr))
 		}
 		return nil, cause
+	}
+	if _, err := LoadJournal(layout); err == nil {
+		return fail(errors.New("managed enrollment requires deployment recovery"))
+	} else if !errors.Is(err, ErrNoDeploymentJournal) {
+		return fail(fmt.Errorf("inspect managed enrollment journal: %w", err))
 	}
 	state, err := LoadState(layout)
 	if err != nil {

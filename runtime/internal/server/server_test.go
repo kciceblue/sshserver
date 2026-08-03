@@ -259,7 +259,7 @@ func TestRunWithAdminAcquiresListenersBeforeStartingBoot(t *testing.T) {
 	}
 }
 
-func TestManagedEnrollmentRejectsUpgradeBetweenCLIBindingAndGrantHandling(t *testing.T) {
+func TestManagedEnrollmentRejectsRecoveryAndUpgradeBetweenCLIBindingAndGrantHandling(t *testing.T) {
 	ctx := context.Background()
 	layout := managedEnrollmentLayout(t)
 	first := managedEnrollmentRelease(t, layout, "v1.2.3", "a")
@@ -338,6 +338,34 @@ func TestManagedEnrollmentRejectsUpgradeBetweenCLIBindingAndGrantHandling(t *tes
 	_, grantsBeforeRace, _ := readBootArtifacts(t, raw)
 	if grantsBeforeRace != grantsBefore+1 {
 		t.Fatalf("active managed enrollment changed grants from %d to %d", grantsBefore, grantsBeforeRace)
+	}
+	if err := deployment.SaveJournal(layout, deployment.DeploymentJournal{
+		StateVersion:      deployment.DeploymentStateVersion,
+		TransactionID:     strings.Repeat("c", 32),
+		Operation:         deployment.OperationApply,
+		Phase:             deployment.PhasePlanned,
+		Manager:           deployment.ManagerForeground,
+		SourcePath:        filepath.Join(layout.HomeDir, "inputs", "sshserver"),
+		LicenseSourcePath: filepath.Join(layout.HomeDir, "inputs", "LICENSE"),
+		NoticeSourcePath:  filepath.Join(layout.HomeDir, "inputs", "NOTICE"),
+		Desired:           &second,
+		PriorState:        &firstState,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var recoveryResponse bytes.Buffer
+	if err := handleAdminRequest(ctx, request, &recoveryResponse, settings, opened.Store, opened.Paths, first.BinaryPath); err == nil {
+		t.Fatal("managed enrollment unexpectedly created a response during deployment recovery")
+	}
+	if recoveryResponse.Len() != 0 {
+		t.Fatalf("managed enrollment during recovery exposed response bytes: %q", recoveryResponse.String())
+	}
+	_, grantsDuringRecovery, _ := readBootArtifacts(t, raw)
+	if grantsDuringRecovery != grantsBeforeRace {
+		t.Fatalf("managed enrollment during recovery changed grants from %d to %d", grantsBeforeRace, grantsDuringRecovery)
+	}
+	if err := deployment.RemoveJournal(layout); err != nil {
+		t.Fatal(err)
 	}
 
 	// This state switch is the deterministic external upgrade between the
