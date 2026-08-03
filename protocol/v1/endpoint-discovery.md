@@ -48,9 +48,15 @@ default.
 First-device enrollment uses the same freshly validated active binary. Its
 no-argument `enrollment create --format=json` resolves the protected state
 directory through that active deployment record as well; it does not consult
-ambient defaults for a managed executable. A concurrent upgrade makes the
-former active path fail closed before a grant is minted. Directly initialized
-binaries may use the explicit `--state-dir` form.
+ambient defaults for a managed executable. The private owner-only admin request
+binds the captured deployment generation, active binary path, and binary digest.
+At grant handling the serving binary revalidates that binding and state
+directory while holding the shared side of the deployment lifecycle lock
+through grant creation. Concurrent apply, recovery, rollback, or uninstall
+therefore makes one operation fail closed for a later retry; a stale binary
+cannot mint a grant. Directly initialized binaries may use the explicit `--state-dir`
+form and are accepted without a deployment binding only when the serving
+executable is outside a managed layout.
 
 Supported apply, recover, upgrade, and rollback operations retain immutable
 release binaries; explicit uninstall removes them. A locator captured before

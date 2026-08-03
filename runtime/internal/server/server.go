@@ -19,9 +19,15 @@ import (
 
 	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
+	"github.com/kciceblue/sshserver/runtime/internal/deployment"
 	"github.com/kciceblue/sshserver/runtime/internal/httpapi"
 	"github.com/kciceblue/sshserver/runtime/internal/store"
 )
+
+// A managed binding can contain a PATH_MAX-sized executable path whose JSON
+// escaping expands it. Keep that input bounded without truncating a valid
+// canonical Linux or macOS deployment path.
+const maxAdminRequestBytes = 32 * 1024
 
 func Run(ctx context.Context, settings config.Settings, readiness httpapi.Readiness) error {
 	if err := settings.Validate(); err != nil {
@@ -45,6 +51,10 @@ func RunWithAdmin(ctx context.Context, settings config.Settings, database *store
 	if database == nil {
 		return errors.New("data plane store is required")
 	}
+	executable, err := os.Executable()
+	if err != nil {
+		return errors.New("resolve serving executable")
+	}
 	handler, err := httpapi.New(settings, database)
 	if err != nil {
 		return err
@@ -67,7 +77,7 @@ func RunWithAdmin(ctx context.Context, settings config.Settings, database *store
 	defer cancel()
 	errCh := make(chan error, 2)
 	go func() { errCh <- serveHTTP(runCtx, httpListeners, handler) }()
-	go func() { errCh <- runAdmin(runCtx, adminListener, settings, database, paths) }()
+	go func() { errCh <- runAdmin(runCtx, adminListener, settings, database, paths, executable) }()
 	firstErr := <-errCh
 	cancel()
 	_ = adminListener.Close()
@@ -170,7 +180,7 @@ func (listener *ownedAdminListener) Close() error {
 	return listener.closeErr
 }
 
-func runAdmin(ctx context.Context, listener net.Listener, settings config.Settings, database *store.Store, paths config.Paths) error {
+func runAdmin(ctx context.Context, listener net.Listener, settings config.Settings, database *store.Store, paths config.Paths, executable string) error {
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
@@ -183,23 +193,86 @@ func runAdmin(ctx context.Context, listener net.Listener, settings config.Settin
 			}
 			return fmt.Errorf("accept enrollment command: %w", err)
 		}
-		if err := handleAdminConnection(ctx, connection, settings, database, paths); err != nil {
+		if err := handleAdminConnection(ctx, connection, settings, database, paths, executable); err != nil {
 			_, _ = io.WriteString(connection, `{"error":"bootstrap_failed"}`)
 		}
 		_ = connection.Close()
 	}
 }
 
-func handleAdminConnection(ctx context.Context, connection net.Conn, settings config.Settings, database *store.Store, paths config.Paths) error {
+type adminRequest struct {
+	Operation  string                              `json:"operation"`
+	DirectInit bool                                `json:"direct_init,omitempty"`
+	Deployment *deployment.ActiveExecutableBinding `json:"deployment,omitempty"`
+}
+
+// EncodeEnrollmentCreateRequest produces the canonical bounded request for
+// the owner-only admin socket. A nil binding is reserved for a directly
+// initialized, non-managed serving executable.
+func EncodeEnrollmentCreateRequest(binding *deployment.ActiveExecutableBinding) ([]byte, error) {
+	request := adminRequest{Operation: "enrollment_create"}
+	if binding == nil {
+		request.DirectInit = true
+	} else {
+		copy := *binding
+		copy.StateDir = ""
+		request.Deployment = &copy
+	}
+	return encodeAdminRequest(request)
+}
+
+func encodeAdminRequest(request adminRequest) ([]byte, error) {
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) == 0 || len(payload) > maxAdminRequestBytes {
+		return nil, errors.New("admin request exceeds its size boundary")
+	}
+	return payload, nil
+}
+
+func decodeAdminRequest(payload []byte) (adminRequest, error) {
+	if len(payload) == 0 || len(payload) > maxAdminRequestBytes {
+		return adminRequest{}, errors.New("admin request exceeds its size boundary")
+	}
+	var request adminRequest
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		return adminRequest{}, errors.New("invalid admin command")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return adminRequest{}, errors.New("invalid admin command")
+	}
+	canonical, err := encodeAdminRequest(request)
+	if err != nil || !bytes.Equal(payload, canonical) {
+		return adminRequest{}, errors.New("invalid admin command")
+	}
+	return request, nil
+}
+
+func handleAdminConnection(ctx context.Context, connection net.Conn, settings config.Settings, database *store.Store, paths config.Paths, executable string) error {
 	if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return err
 	}
-	request, err := io.ReadAll(io.LimitReader(connection, 257))
+	request, err := io.ReadAll(io.LimitReader(connection, maxAdminRequestBytes+1))
 	if err != nil {
 		return err
 	}
-	switch string(request) {
-	case `{"operation":"deployment_status"}`:
+	return handleAdminRequest(ctx, request, connection, settings, database, paths, executable)
+}
+
+func handleAdminRequest(ctx context.Context, payload []byte, response io.Writer, settings config.Settings, database *store.Store, paths config.Paths, executable string) error {
+	request, err := decodeAdminRequest(payload)
+	if err != nil {
+		return err
+	}
+	switch request.Operation {
+	case "deployment_status":
+		if request.DirectInit || request.Deployment != nil {
+			return errors.New("invalid admin command")
+		}
 		identity, err := buildinfo.ValidatedCurrent()
 		if err != nil {
 			return fmt.Errorf("validate compiled build identity: %w", err)
@@ -208,33 +281,64 @@ func handleAdminConnection(ctx context.Context, connection net.Conn, settings co
 		if err != nil {
 			return err
 		}
-		_, err = connection.Write(body)
+		_, err = response.Write(body)
 		return err
-	case `{"operation":"enrollment_create"}`:
-		return writeEnrollment(ctx, connection, settings, database, paths)
+	case "enrollment_create":
+		return handleEnrollmentRequest(ctx, response, request, settings, database, paths, executable)
 	default:
 		return errors.New("invalid admin command")
 	}
 }
 
-func writeEnrollment(ctx context.Context, connection net.Conn, settings config.Settings, database *store.Store, paths config.Paths) error {
+func handleEnrollmentRequest(ctx context.Context, response io.Writer, request adminRequest, settings config.Settings, database *store.Store, paths config.Paths, executable string) error {
+	if request.DirectInit == (request.Deployment != nil) {
+		return errors.New("invalid enrollment binding")
+	}
+	var lease *deployment.ManagedActiveLease
+	if request.Deployment != nil {
+		var err error
+		lease, err = deployment.AcquireManagedActiveLease(executable, paths.StateDir, *request.Deployment)
+		if err != nil {
+			return err
+		}
+	} else {
+		if _, err := deployment.ActiveExecutableForExecutable(executable); err == nil {
+			return errors.New("managed enrollment requires an active deployment binding")
+		} else if !errors.Is(err, deployment.ErrNotDeployedExecutable) {
+			return fmt.Errorf("validate direct enrollment executable: %w", err)
+		}
+	}
+	body, bodyErr := enrollmentResponse(ctx, settings, database, paths)
+	if lease != nil {
+		closeErr := lease.Close()
+		if bodyErr != nil || closeErr != nil {
+			return errors.Join(bodyErr, closeErr)
+		}
+	} else if bodyErr != nil {
+		return bodyErr
+	}
+	_, err := response.Write(body)
+	return err
+}
+
+func enrollmentResponse(ctx context.Context, settings config.Settings, database *store.Store, paths config.Paths) ([]byte, error) {
 	grant, err := database.CreateEnrollmentGrant(ctx, time.Now())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer clear(grant.Grant)
 	secret, err := config.ReadSecret(paths.InstanceSecret)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer clear(secret)
 	_, portText, err := net.SplitHostPort(settings.Listeners[0])
 	if err != nil {
-		return err
+		return nil, err
 	}
 	port, err := strconv.Atoi(portText)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	body, err := json.Marshal(struct {
 		ProtocolVersion string `json:"protocol_version"`
@@ -254,10 +358,9 @@ func writeEnrollment(ctx context.Context, connection net.Conn, settings config.S
 		LoopbackPort:    port,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = connection.Write(body)
-	return err
+	return body, nil
 }
 
 func runHTTP(ctx context.Context, addresses []string, handler http.Handler) error {

@@ -111,8 +111,11 @@ lifecycle request/result context. Before each new sync channel it runs:
   --state-dir <canonical-state-directory>
 ```
 
-All three layout flags must be supplied together. Exact-layout status parses
-them before consulting defaults and does not use ambient `HOME`,
+All three layout flags must be supplied together for this read-only status
+locator. Mutating apply, recover, rollback, and uninstall commands retain their
+independent per-flag override behavior and merge omitted fields from platform
+defaults. Exact-layout status parses its tuple before consulting defaults and
+does not use ambient `HOME`,
 `XDG_DATA_HOME`, `XDG_STATE_HOME`, or `XDG_CONFIG_HOME` to select or validate
 another deployment layout. The client accepts only a healthy running result
 with no recovery journal and issues the active-binary capability only from the
@@ -121,9 +124,12 @@ fully validated active release.
 The client uses that same refreshed active binary for
 `enrollment create --format=json`. With no explicit state argument, a managed
 binary resolves the protected state directory from the active deployment
-record and rejects a stale or inactive release before minting a grant. The
-explicit `--state-dir` form remains available for directly initialized,
-non-managed binaries and is parsed without first consulting ambient defaults.
+record and binds the private admin request to its generation, exact binary path,
+and artifact digest. The serving binary reloads that record while holding a
+shared lifecycle lock through grant creation, so a concurrent external upgrade
+or rollback cannot let a stale binary mint a grant. The explicit `--state-dir`
+form remains available for directly initialized, non-managed binaries and is
+parsed without first consulting ambient defaults.
 
 Apply, recover, upgrade, and rollback never remove an installed immutable
 release directory. This lets a locator retained before an equivalent one-line

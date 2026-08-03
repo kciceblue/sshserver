@@ -17,7 +17,18 @@ type deploymentLock struct {
 }
 
 func acquireDeploymentLock(layout Layout) (*deploymentLock, error) {
-	fd, err := unix.Open(layout.LockPath, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	return acquireDeploymentFileLock(layout, unix.O_CREAT, unix.LOCK_EX)
+}
+
+func acquireDeploymentSharedLock(layout Layout) (*deploymentLock, error) {
+	// An active deployment has already created the lifecycle lock. Refuse a
+	// missing file instead of manufacturing deployment metadata from the
+	// enrollment path.
+	return acquireDeploymentFileLock(layout, 0, unix.LOCK_SH)
+}
+
+func acquireDeploymentFileLock(layout Layout, openFlags, lockMode int) (*deploymentLock, error) {
+	fd, err := unix.Open(layout.LockPath, openFlags|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open deployment lock: %w", err)
 	}
@@ -30,7 +41,7 @@ func acquireDeploymentLock(layout Layout) (*deploymentLock, error) {
 		file.Close()
 		return nil, fmt.Errorf("validate deployment lock: %w", err)
 	}
-	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+	if err := unix.Flock(fd, lockMode|unix.LOCK_NB); err != nil {
 		file.Close()
 		if errors.Is(err, unix.EWOULDBLOCK) {
 			return nil, errors.New("another deployment lifecycle operation is already running")

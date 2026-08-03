@@ -97,6 +97,61 @@ func TestStateDirForExecutableRejectsNonDeploymentAndInactivePaths(t *testing.T)
 	}
 }
 
+func TestManagedActiveLeaseRevalidatesBindingAndBlocksLifecycleMutation(t *testing.T) {
+	layout := testLayout(t)
+	active := testInstalledRelease(t, layout, "v1.2.3", "a")
+	if err := os.MkdirAll(filepath.Dir(active.BinaryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(active.BinaryPath, []byte("test executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := DeploymentState{
+		StateVersion: DeploymentStateVersion,
+		Generation:   7,
+		Status:       StatusForeground,
+		Manager:      ManagerForeground,
+		StateDir:     layout.StateDir,
+		Active:       &active,
+	}
+	if err := SaveState(layout, state); err != nil {
+		t.Fatal(err)
+	}
+	created, err := acquireDeploymentLock(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := ActiveExecutableForExecutable(active.BinaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.Generation != state.Generation || binding.BinaryPath != active.BinaryPath ||
+		binding.BinarySHA256 != active.BinarySHA256 || binding.StateDir != layout.StateDir {
+		t.Fatalf("active binding = %+v", binding)
+	}
+	lease, err := AcquireManagedActiveLease(active.BinaryPath, layout.StateDir, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exclusive, err := acquireDeploymentLock(layout); err == nil {
+		exclusive.Close()
+		lease.Close()
+		t.Fatal("exclusive lifecycle lock succeeded while enrollment lease was held")
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stale := binding
+	stale.Generation--
+	if lease, err := AcquireManagedActiveLease(active.BinaryPath, layout.StateDir, stale); err == nil {
+		lease.Close()
+		t.Fatal("stale enrollment binding unexpectedly acquired a lease")
+	}
+}
+
 func TestStateDirForExecutableRejectsFIFODeploymentStateWithoutBlocking(t *testing.T) {
 	home := secureTestHome(t)
 	layout, err := NewLayout(home, filepath.Join(home, "deployment"), filepath.Join(home, "state"))

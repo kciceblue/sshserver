@@ -22,6 +22,7 @@ import (
 	"github.com/kciceblue/sshserver/runtime/internal/auth"
 	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
+	"github.com/kciceblue/sshserver/runtime/internal/deployment"
 	"github.com/kciceblue/sshserver/runtime/internal/instance"
 	serverpkg "github.com/kciceblue/sshserver/runtime/internal/server"
 )
@@ -154,6 +155,51 @@ func TestDeployStatusRejectsPartialExplicitLayoutWithoutConsultingDefaults(t *te
 		"--home-dir, --install-root, and --state-dir must be supplied together",
 	) {
 		t.Fatalf("partial deploy status code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestMutatingDeployCommandsKeepIndependentLayoutOverrides(t *testing.T) {
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	physicalHome, err := filepath.EvalSymlinks(userHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := os.MkdirTemp(physicalHome, ".sshserver-cli-flags-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	defaults, err := deployment.DefaultLayout()
+	if err != nil {
+		t.Fatal(err)
+	}
+	overrideState := filepath.Join(home, "independent-state-override")
+	for _, operation := range []string{"apply", "recover", "rollback", "uninstall"} {
+		t.Run(operation, func(t *testing.T) {
+			values, flags, err := (Runner{Stderr: io.Discard}).newDeploymentFlags("deploy " + operation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := flags.Parse([]string{"--state-dir", overrideState}); err != nil {
+				t.Fatal(err)
+			}
+			if values.homeDir != defaults.HomeDir || values.installRoot != defaults.InstallRoot || values.stateDir != overrideState {
+				t.Fatalf("merged %s layout = %+v, defaults=%+v", operation, values, defaults)
+			}
+			if _, err := values.lifecycle(); err != nil {
+				t.Fatalf("single-field %s override rejected: %v", operation, err)
+			}
+		})
 	}
 }
 

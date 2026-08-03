@@ -195,10 +195,7 @@ func wrapOptionalError(operation string, err error) error {
 }
 
 func (runner Runner) runDeployStatus(ctx context.Context, args []string) error {
-	values, flags, err := runner.newDeploymentFlags("deploy status")
-	if err != nil {
-		return err
-	}
+	values, flags := runner.newDeploymentStatusFlags("deploy status")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -269,34 +266,52 @@ type deploymentFlagValues struct {
 }
 
 func (runner Runner) newDeploymentFlags(name string) (*deploymentFlagValues, *flag.FlagSet, error) {
-	// Parse explicit layout values before consulting environment-derived
-	// defaults. A client retaining a verified lifecycle locator must be able to
-	// refresh status after XDG or HOME changes without touching ambient paths.
-	values := &deploymentFlagValues{}
+	// Mutating lifecycle commands preserve the original independent override
+	// behavior: each omitted layout field inherits its platform default.
+	layout, err := deployment.DefaultLayout()
+	if err != nil {
+		return nil, nil, err
+	}
+	values := &deploymentFlagValues{
+		homeDir:     layout.HomeDir,
+		installRoot: layout.InstallRoot,
+		stateDir:    layout.StateDir,
+	}
 	flags := runner.flagSet(name)
-	flags.StringVar(&values.homeDir, "home-dir", "", "physical current-user home directory (default: current user home)")
-	flags.StringVar(&values.installRoot, "install-root", "", "owner-only deployment root beneath home (default: platform data directory)")
-	flags.StringVar(&values.stateDir, "state-dir", "", "protected instance state directory beneath home (default: platform state directory)")
+	flags.StringVar(&values.homeDir, "home-dir", values.homeDir, "physical current-user home directory")
+	flags.StringVar(&values.installRoot, "install-root", values.installRoot, "owner-only deployment root beneath home")
+	flags.StringVar(&values.stateDir, "state-dir", values.stateDir, "protected instance state directory beneath home")
 	return values, flags, nil
 }
 
 func (values deploymentFlagValues) lifecycle() (*deployment.Lifecycle, error) {
-	layout, err := values.layout()
+	layout, err := deployment.NewLayout(values.homeDir, values.installRoot, values.stateDir)
 	if err != nil {
 		return nil, err
 	}
 	return deployment.NewNativeLifecycle(layout)
 }
 
+func (runner Runner) newDeploymentStatusFlags(name string) (*deploymentFlagValues, *flag.FlagSet) {
+	// Status parses a complete verified locator before consulting ambient
+	// defaults, so a retained all-three tuple survives HOME/XDG drift.
+	values := &deploymentFlagValues{}
+	flags := runner.flagSet(name)
+	flags.StringVar(&values.homeDir, "home-dir", "", "physical current-user home directory (default: current user home)")
+	flags.StringVar(&values.installRoot, "install-root", "", "owner-only deployment root beneath home (default: platform data directory)")
+	flags.StringVar(&values.stateDir, "state-dir", "", "protected instance state directory beneath home (default: platform state directory)")
+	return values, flags
+}
+
 func (values deploymentFlagValues) statusLifecycle() (*deployment.Lifecycle, error) {
-	layout, err := values.layout()
+	layout, err := values.statusLayout()
 	if err != nil {
 		return nil, err
 	}
 	return deployment.NewNativeStatusLifecycle(layout)
 }
 
-func (values deploymentFlagValues) layout() (deployment.Layout, error) {
+func (values deploymentFlagValues) statusLayout() (deployment.Layout, error) {
 	explicitCount := 0
 	for _, value := range []string{values.homeDir, values.installRoot, values.stateDir} {
 		if value != "" {
@@ -399,12 +414,13 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 	if format != "json" {
 		return errors.New("enrollment create supports only --format=json")
 	}
+	var deploymentBinding *deployment.ActiveExecutableBinding
 	if stateDir == "" {
 		executable, err := os.Executable()
 		if err != nil {
 			return errors.New("enrollment executable path is unavailable")
 		}
-		stateDir, err = stateDirForExecutable(executable)
+		stateDir, deploymentBinding, err = commandStateForExecutable(executable)
 		if err != nil {
 			return errors.New("enrollment instance state is unavailable")
 		}
@@ -417,7 +433,11 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 		return errors.New("enrollment service is unavailable")
 	}
 	defer connection.Close()
-	if _, err := io.WriteString(connection, `{"operation":"enrollment_create"}`); err != nil {
+	request, err := server.EncodeEnrollmentCreateRequest(deploymentBinding)
+	if err != nil {
+		return errors.New("enrollment service request failed")
+	}
+	if _, err := connection.Write(request); err != nil {
 		return errors.New("enrollment service request failed")
 	}
 	if unixConnection, ok := connection.(*net.UnixConn); ok {
@@ -527,14 +547,20 @@ func (runner Runner) runEndpointShow(args []string) error {
 }
 
 func stateDirForExecutable(executable string) (string, error) {
-	stateDir, err := deployment.StateDirForExecutable(executable)
+	stateDir, _, err := commandStateForExecutable(executable)
+	return stateDir, err
+}
+
+func commandStateForExecutable(executable string) (string, *deployment.ActiveExecutableBinding, error) {
+	binding, err := deployment.ActiveExecutableForExecutable(executable)
 	if err == nil {
-		return stateDir, nil
+		return binding.StateDir, &binding, nil
 	}
 	if !errors.Is(err, deployment.ErrNotDeployedExecutable) {
-		return "", err
+		return "", nil, err
 	}
-	return config.DefaultStateDir()
+	stateDir, err := config.DefaultStateDir()
+	return stateDir, nil, err
 }
 
 func discoverableIPv4LoopbackPort(listeners []string) (int, error) {
