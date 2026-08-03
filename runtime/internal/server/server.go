@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kciceblue/sshserver/runtime/internal/config"
@@ -43,26 +44,28 @@ func RunWithAdmin(ctx context.Context, settings config.Settings, database *store
 	if database == nil {
 		return errors.New("data plane store is required")
 	}
-	if err := database.StartBoot(ctx); err != nil {
-		return err
-	}
 	handler, err := httpapi.New(settings, database)
 	if err != nil {
 		return err
 	}
+	httpListeners, err := listenHTTP(ctx, settings.Listeners)
+	if err != nil {
+		return err
+	}
+	defer closeListeners(httpListeners)
 	adminListener, err := listenAdminSocket(paths.AdminSocket)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = adminListener.Close()
-		removeAdminSocket(paths.AdminSocket)
-	}()
+	defer adminListener.cleanup()
+	if err := database.StartBoot(ctx); err != nil {
+		return err
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errCh := make(chan error, 2)
-	go func() { errCh <- runHTTP(runCtx, settings.Listeners, handler) }()
+	go func() { errCh <- serveHTTP(runCtx, httpListeners, handler) }()
 	go func() { errCh <- runAdmin(runCtx, adminListener, settings, database, paths) }()
 	firstErr := <-errCh
 	cancel()
@@ -77,33 +80,93 @@ func RunWithAdmin(ctx context.Context, settings config.Settings, database *store
 	return errors.Join(secondErr, checkpointErr)
 }
 
-func listenAdminSocket(path string) (net.Listener, error) {
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+type ownedAdminListener struct {
+	*net.UnixListener
+	path      string
+	info      os.FileInfo
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func listenAdminSocket(path string) (*ownedAdminListener, error) {
+	if existing, err := os.Lstat(path); err == nil {
+		if existing.Mode()&os.ModeSymlink != 0 || existing.Mode()&os.ModeSocket == 0 {
 			return nil, errors.New("enrollment socket path is occupied by a non-socket")
 		}
-		if err := os.Remove(path); err != nil {
-			return nil, fmt.Errorf("remove stale enrollment socket: %w", err)
+		connection, dialErr := net.DialTimeout("unix", path, 250*time.Millisecond)
+		if dialErr == nil {
+			_ = connection.Close()
+			return nil, errors.New("enrollment socket is already active")
+		}
+		if !errors.Is(dialErr, syscall.ECONNREFUSED) && !errors.Is(dialErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("probe enrollment socket: %w", dialErr)
+		}
+		if errors.Is(dialErr, syscall.ECONNREFUSED) {
+			current, statErr := os.Lstat(path)
+			if statErr != nil {
+				if errors.Is(statErr, os.ErrNotExist) {
+					return listenNewAdminSocket(path)
+				}
+				return nil, fmt.Errorf("reinspect stale enrollment socket: %w", statErr)
+			}
+			if current.Mode()&os.ModeSymlink != 0 || current.Mode()&os.ModeSocket == 0 || !os.SameFile(existing, current) {
+				return nil, errors.New("enrollment socket changed during stale-socket inspection")
+			}
+			if err := os.Remove(path); err != nil {
+				return nil, fmt.Errorf("remove stale enrollment socket: %w", err)
+			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect enrollment socket: %w", err)
 	}
-	listener, err := net.Listen("unix", path)
+	return listenNewAdminSocket(path)
+}
+
+func listenNewAdminSocket(path string) (*ownedAdminListener, error) {
+	address, err := net.ResolveUnixAddr("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve enrollment socket: %w", err)
+	}
+	listener, err := net.ListenUnix("unix", address)
 	if err != nil {
 		return nil, fmt.Errorf("listen on enrollment socket: %w", err)
 	}
+	listener.SetUnlinkOnClose(false)
+	info, err := os.Lstat(path)
+	if err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("inspect new enrollment socket: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+		_ = listener.Close()
+		return nil, errors.New("new enrollment socket path is not a socket")
+	}
+	owned := &ownedAdminListener{UnixListener: listener, path: path, info: info}
 	if err := os.Chmod(path, 0o600); err != nil {
-		listener.Close()
-		removeAdminSocket(path)
+		owned.cleanup()
 		return nil, fmt.Errorf("protect enrollment socket: %w", err)
 	}
-	return listener, nil
+	return owned, nil
 }
 
-func removeAdminSocket(path string) {
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSocket != 0 && info.Mode()&os.ModeSymlink == 0 {
-		_ = os.Remove(path)
-	}
+func (listener *ownedAdminListener) cleanup() {
+	_ = listener.Close()
+}
+
+// Close removes this listener's pathname before closing the descriptor. That
+// ordering lets a successor bind immediately without a later cleanup removing
+// the successor's socket. The inode check protects a path already replaced by
+// another owner.
+func (listener *ownedAdminListener) Close() error {
+	listener.closeOnce.Do(func() {
+		if current, err := os.Lstat(listener.path); err == nil &&
+			current.Mode()&os.ModeSymlink == 0 && current.Mode()&os.ModeSocket != 0 &&
+			os.SameFile(listener.info, current) {
+			_ = os.Remove(listener.path)
+		}
+		listener.closeErr = listener.UnixListener.Close()
+	})
+	return listener.closeErr
 }
 
 func runAdmin(ctx context.Context, listener net.Listener, settings config.Settings, database *store.Store, paths config.Paths) error {
@@ -180,12 +243,20 @@ func handleAdminConnection(ctx context.Context, connection net.Conn, settings co
 }
 
 func runHTTP(ctx context.Context, addresses []string, handler http.Handler) error {
+	listeners, err := listenHTTP(ctx, addresses)
+	if err != nil {
+		return err
+	}
+	return serveHTTP(ctx, listeners, handler)
+}
+
+func listenHTTP(ctx context.Context, addresses []string) ([]net.Listener, error) {
 	listeners := make([]net.Listener, 0, len(addresses))
 	for _, address := range addresses {
 		host, _, err := net.SplitHostPort(address)
 		if err != nil {
 			closeListeners(listeners)
-			return err
+			return nil, err
 		}
 		network := "tcp4"
 		if net.ParseIP(host).To4() == nil {
@@ -194,11 +265,14 @@ func runHTTP(ctx context.Context, addresses []string, handler http.Handler) erro
 		listener, err := (&net.ListenConfig{}).Listen(ctx, network, address)
 		if err != nil {
 			closeListeners(listeners)
-			return fmt.Errorf("listen on %s: %w", address, err)
+			return nil, fmt.Errorf("listen on %s: %w", address, err)
 		}
 		listeners = append(listeners, listener)
 	}
+	return listeners, nil
+}
 
+func serveHTTP(ctx context.Context, listeners []net.Listener, handler http.Handler) error {
 	servers := make([]*http.Server, 0, len(listeners))
 	errCh := make(chan error, len(listeners))
 	var wait sync.WaitGroup
