@@ -118,6 +118,13 @@ another deployment layout. The client accepts only a healthy running result
 with no recovery journal and issues the active-binary capability only from the
 fully validated active release.
 
+The client uses that same refreshed active binary for
+`enrollment create --format=json`. With no explicit state argument, a managed
+binary resolves the protected state directory from the active deployment
+record and rejects a stale or inactive release before minting a grant. The
+explicit `--state-dir` form remains available for directly initialized,
+non-managed binaries and is parsed without first consulting ambient defaults.
+
 Apply, recover, upgrade, and rollback never remove an installed immutable
 release directory. This lets a locator retained before an equivalent one-line
 or other supported out-of-app upgrade report the newest active binary. Only

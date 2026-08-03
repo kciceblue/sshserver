@@ -385,13 +385,10 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] != "create" {
 		return errors.New("enrollment requires create")
 	}
-	stateDir, err := config.DefaultStateDir()
-	if err != nil {
-		return err
-	}
+	stateDir := ""
 	format := "json"
 	flags := runner.flagSet("enrollment create")
-	flags.StringVar(&stateDir, "state-dir", stateDir, "absolute protected state directory")
+	flags.StringVar(&stateDir, "state-dir", stateDir, "absolute protected state directory; managed binaries use their deployment record")
 	flags.StringVar(&format, "format", format, "output format (json)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
@@ -401,6 +398,16 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 	}
 	if format != "json" {
 		return errors.New("enrollment create supports only --format=json")
+	}
+	if stateDir == "" {
+		executable, err := os.Executable()
+		if err != nil {
+			return errors.New("enrollment executable path is unavailable")
+		}
+		stateDir, err = stateDirForExecutable(executable)
+		if err != nil {
+			return errors.New("enrollment instance state is unavailable")
+		}
 	}
 	if err := config.EnsureStateDirectory(stateDir); err != nil {
 		return err
@@ -493,7 +500,7 @@ func (runner Runner) runEndpointShow(args []string) error {
 		if err != nil {
 			return errors.New("endpoint executable path is unavailable")
 		}
-		stateDir, err = endpointStateDirForExecutable(executable)
+		stateDir, err = stateDirForExecutable(executable)
 		if err != nil {
 			return errors.New("endpoint instance state is unavailable")
 		}
@@ -519,7 +526,7 @@ func (runner Runner) runEndpointShow(args []string) error {
 	})
 }
 
-func endpointStateDirForExecutable(executable string) (string, error) {
+func stateDirForExecutable(executable string) (string, error) {
 	stateDir, err := deployment.StateDirForExecutable(executable)
 	if err == nil {
 		return stateDir, nil

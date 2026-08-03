@@ -246,14 +246,14 @@ func TestEndpointShowReportsDefaultAndCustomLoopbackPorts(t *testing.T) {
 	}
 }
 
-func TestEndpointStateDirForExecutableFallsBackOnlyOutsideDeployment(t *testing.T) {
+func TestCommandStateDirForExecutableFallsBackOnlyOutsideDeployment(t *testing.T) {
 	arbitrary := filepath.Join(t.TempDir(), "sshserver")
 	if err := os.WriteFile(arbitrary, []byte("test executable"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	defaultState := filepath.Join(t.TempDir(), "default-state")
 	t.Setenv("XDG_STATE_HOME", filepath.Dir(filepath.Dir(defaultState)))
-	resolved, err := endpointStateDirForExecutable(arbitrary)
+	resolved, err := stateDirForExecutable(arbitrary)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,6 +600,8 @@ func TestEnrollmentCreateUsesOwnerSocketAndBootstrapsRealHTTPDataPlane(t *testin
 	}()
 	waitForAdminSocket(t, opened.Paths.AdminSocket, errCh)
 	waitForRuntimeHealth(t, address)
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "missing-home"))
+	t.Setenv("XDG_STATE_HOME", "relative-state-home")
 
 	var stdout, stderr bytes.Buffer
 	runner := Runner{Stdout: &stdout, Stderr: &stderr}

@@ -45,6 +45,13 @@ or `XDG_DATA_HOME`. Missing, malformed, insecure, inactive, or mismatched
 deployment metadata fails closed rather than falling back to an ambient
 default.
 
+First-device enrollment uses the same freshly validated active binary. Its
+no-argument `enrollment create --format=json` resolves the protected state
+directory through that active deployment record as well; it does not consult
+ambient defaults for a managed executable. A concurrent upgrade makes the
+former active path fail closed before a grant is minted. Directly initialized
+binaries may use the explicit `--state-dir` form.
+
 Supported apply, recover, upgrade, and rollback operations retain immutable
 release binaries; explicit uninstall removes them. A locator captured before
 an equivalent one-line or other supported out-of-app upgrade can therefore
