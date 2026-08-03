@@ -93,6 +93,24 @@ func TestSystemdManagerExactLifecycleArgv(t *testing.T) {
 	assertNoForbiddenManagerCommands(t, runner.calls)
 }
 
+func TestSystemdManagerHonorsXDGConfigHome(t *testing.T) {
+	home := secureTestHome(t)
+	configHome := filepath.Join(home, "xdg-config")
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	adapter, err := NewServiceManagerAdapter("linux", home, &mockManagerRunner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(configHome, "systemd", "user", "com.kciceblue.sshserver.service")
+	if adapter.DefinitionPath() != want {
+		t.Fatalf("definition path=%q, want=%q", adapter.DefinitionPath(), want)
+	}
+	if installed, err := adapter.InstallDefinition([]byte("definition\n")); err != nil || installed != want {
+		t.Fatalf("install definition path=%q error=%v", installed, err)
+	}
+	assertProtectedDefinition(t, want, "definition\n")
+}
+
 func TestLaunchdManagerExactLifecycleArgv(t *testing.T) {
 	home := secureTestHome(t)
 	uid := strconv.Itoa(os.Geteuid())
@@ -330,6 +348,14 @@ func TestManagerConstructorRejectsUnsafeInputs(t *testing.T) {
 	if _, err := NewServiceManagerAdapter("linux", home, nil); err == nil {
 		t.Fatal("nil runner accepted")
 	}
+	for _, configHome := range []string{"relative/config", home + "/config/../config", filepath.Dir(home)} {
+		t.Run("xdg "+configHome, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", configHome)
+			if _, err := NewServiceManagerAdapter("linux", home, &mockManagerRunner{}); err == nil {
+				t.Fatalf("unsafe XDG_CONFIG_HOME %q accepted", configHome)
+			}
+		})
+	}
 }
 
 func TestManagerCommandBufferBoundsHostileOutput(t *testing.T) {
@@ -369,6 +395,9 @@ func TestExecCommandRunnerReportsOutputOverflow(t *testing.T) {
 
 func mustManagerAdapter(t *testing.T, platform, home string, runner CommandRunner) ServiceManagerAdapter {
 	t.Helper()
+	if platform == "linux" {
+		t.Setenv("XDG_CONFIG_HOME", "")
+	}
 	adapter, err := NewServiceManagerAdapter(platform, home, runner)
 	if err != nil {
 		t.Fatal(err)

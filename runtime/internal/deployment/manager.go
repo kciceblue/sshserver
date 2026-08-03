@@ -142,7 +142,14 @@ func NewServiceManagerAdapter(platform, homeDir string, runner CommandRunner) (S
 	}
 	if platform == "linux" {
 		adapter.commandName = "systemctl"
-		adapter.definitionPath = filepath.Join(homeDir, ".config", "systemd", "user", service.Label+".service")
+		configHome := os.Getenv("XDG_CONFIG_HOME")
+		if configHome == "" {
+			configHome = filepath.Join(homeDir, ".config")
+		}
+		if err := validateAbsoluteCanonicalPath(configHome); err != nil {
+			return ServiceManagerAdapter{}, fmt.Errorf("validate XDG configuration home: %w", err)
+		}
+		adapter.definitionPath = filepath.Join(configHome, "systemd", "user", service.Label+".service")
 		adapter.target = service.Label + ".service"
 	} else {
 		adapter.commandName = "launchctl"

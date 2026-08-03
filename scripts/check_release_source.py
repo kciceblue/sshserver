@@ -13,6 +13,11 @@ import sys
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
+def is_generated_release_output(path: bytes) -> bool:
+    """Allow only the release output tree, which is never a Go build input."""
+    return path == b"dist" or path.startswith(b"dist/")
+
+
 def git(root: Path, *arguments: str) -> bytes:
     completed = subprocess.run(
         ("git", "-C", str(root), *arguments),
@@ -53,6 +58,14 @@ def validate_release_source(root: Path, revision: str) -> list[str]:
             "-z",
             "--untracked-files=all",
         )
+        ignored = git(
+            canonical_root,
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        )
     except (OSError, UnicodeError, ValueError) as error:
         return [str(error)]
 
@@ -63,6 +76,16 @@ def validate_release_source(root: Path, revision: str) -> list[str]:
     if status:
         entries = [item for item in status.split(b"\0") if item]
         errors.append(f"release source worktree is not clean ({len(entries)} status entries)")
+    ignored_inputs = [
+        item
+        for item in ignored.split(b"\0")
+        if item and not is_generated_release_output(item)
+    ]
+    if ignored_inputs:
+        errors.append(
+            "release source worktree contains ignored inputs "
+            f"({len(ignored_inputs)} ignored entries outside dist/)"
+        )
     return errors
 
 
