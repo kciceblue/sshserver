@@ -36,6 +36,15 @@ func (lease *InitializationLease) InitializationLockCreated() bool {
 	return lease != nil && lease.lock != nil && lease.lock.created
 }
 
+// AttestLockPath proves that the initialization-lock path still names the
+// exact descriptor carrying this lease's flock.
+func (lease *InitializationLease) AttestLockPath() error {
+	if lease == nil || lease.lock == nil {
+		return errors.New("initialization lease is closed")
+	}
+	return lease.lock.attestPathIdentity()
+}
+
 func AcquireInitializationLease(stateDir string) (*InitializationLease, error) {
 	return acquireInitializationLease(stateDir, nil)
 }
@@ -69,6 +78,9 @@ func acquireInitializationLease(stateDir string, lockPresent *bool) (*Initializa
 func (lease *InitializationLease) Initialize(ctx context.Context, requestedListeners []string) (config.Settings, error) {
 	if lease == nil || lease.lock == nil {
 		return config.Settings{}, errors.New("initialization lease is closed")
+	}
+	if err := lease.AttestLockPath(); err != nil {
+		return config.Settings{}, fmt.Errorf("attest initialization lease: %w", err)
 	}
 	return initializeWithLease(ctx, lease.stateDir, requestedListeners)
 }
@@ -276,6 +288,13 @@ func OpenForServe(ctx context.Context, stateDir string) (*Instance, error) {
 			return nil, errors.Join(err, fmt.Errorf("release server lock: %w", closeErr))
 		}
 		return nil, err
+	}
+	if err := lock.attestPathIdentity(); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("attest server lock after opening instance: %w", err),
+			opened.Close(),
+			lock.Close(),
+		)
 	}
 	opened.lock = lock
 	return opened, nil

@@ -37,6 +37,7 @@ type serviceController interface {
 type instanceInitializationLease interface {
 	Initialize(context.Context, []string) (config.Settings, error)
 	InitializationLockCreated() bool
+	AttestLockPath() error
 	Close() error
 }
 
@@ -720,6 +721,17 @@ func lockedConfirmationInstanceSnapshot(ctx context.Context, layout Layout, conf
 	return current
 }
 
+func attestConfirmedInitializationLease(lease instanceInitializationLease) error {
+	if err := lease.AttestLockPath(); err != nil {
+		return fmt.Errorf(
+			"leased initialization lock path changed after confirmation (%v): %w",
+			err,
+			ErrDeploymentPreviewConfirmationMismatch,
+		)
+	}
+	return nil
+}
+
 func onlyInitializationLockPresent(stateDir string) bool {
 	directory, err := openVerifiedDirectory(stateDir, true)
 	if err != nil {
@@ -902,6 +914,9 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 		return ApplyResult{}, err
 	}
 	instanceSnapshot := lockedConfirmationInstanceSnapshot(ctx, lifecycle.layout, confirmedPreview.Existing.InstanceState)
+	if err := attestConfirmedInitializationLease(instanceLease); err != nil {
+		return ApplyResult{}, err
+	}
 	// Acquiring the lease necessarily leaves its structural lock present. Keep
 	// the final confirmation bound to the pre-acquisition presence recorded in
 	// the user's exact plan, just as the missing state-directory normalization
@@ -918,6 +933,9 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	}
 	preMutationAvailability = cloneManagerAvailability(finalPreview.Manager)
 	if err := PrepareLayout(lifecycle.layout); err != nil {
+		return ApplyResult{}, err
+	}
+	if err := attestConfirmedInitializationLease(instanceLease); err != nil {
 		return ApplyResult{}, err
 	}
 

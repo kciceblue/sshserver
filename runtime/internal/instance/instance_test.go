@@ -56,6 +56,38 @@ func TestInitializationLeaseSerializesValidationThroughInitialize(t *testing.T) 
 	}
 }
 
+func TestInitializationLeaseRejectsUnlinkedOrReplacedLockPath(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	lease, err := AcquireInitializationLease(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	if err := lease.AttestLockPath(); err != nil {
+		t.Fatalf("initial lease attestation: %v", err)
+	}
+
+	lockPath := filepath.Join(stateDir, ".instance.lock")
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := AcquireInitializationLeaseWithLockPresence(stateDir, true)
+	if err != nil {
+		t.Fatalf("replacement lock was not independently acquirable: %v", err)
+	}
+	defer replacement.Close()
+
+	if err := lease.AttestLockPath(); err == nil || !strings.Contains(err.Error(), "leased") {
+		t.Fatalf("orphaned lease attestation error=%v", err)
+	}
+	if _, err := lease.Initialize(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "attest initialization lease") {
+		t.Fatalf("orphaned lease initialize error=%v", err)
+	}
+}
+
 func TestInitializeIsIdempotentAndKeepsSecretOutsideDatabase(t *testing.T) {
 	ctx := context.Background()
 	stateDir := filepath.Join(t.TempDir(), "state")

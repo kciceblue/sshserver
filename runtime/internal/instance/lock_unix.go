@@ -12,6 +12,7 @@ import (
 
 type fileLock struct {
 	file    *os.File
+	path    string
 	created bool
 }
 
@@ -83,7 +84,40 @@ func acquireNamedLockMode(stateDir, name, busyMessage string, mode lockOpenMode)
 		}
 		return nil, fmt.Errorf("lock instance: %w", err)
 	}
-	return &fileLock{file: file, created: created}, nil
+	lock := &fileLock{file: file, path: path, created: created}
+	if err := lock.attestPathIdentity(); err != nil {
+		if closeErr := lock.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("release unattested instance lock: %w", closeErr))
+		}
+		return nil, err
+	}
+	return lock, nil
+}
+
+// attestPathIdentity proves that the protected path still names the exact
+// descriptor carrying the flock. A same-user unlink or replacement otherwise
+// leaves the lock held on an orphaned inode while a second process can lock the
+// replacement path.
+func (lock *fileLock) attestPathIdentity() error {
+	if lock == nil || lock.file == nil || lock.path == "" {
+		return errors.New("instance lock is closed")
+	}
+	descriptorInfo, err := lock.file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat leased instance lock: %w", err)
+	}
+	pathInfo, err := os.Lstat(lock.path)
+	if err != nil {
+		return fmt.Errorf("stat leased instance lock path: %w", err)
+	}
+	if !os.SameFile(descriptorInfo, pathInfo) {
+		return errors.New("instance lock path no longer names the leased descriptor")
+	}
+	stat, ok := descriptorInfo.Sys().(*syscall.Stat_t)
+	if !ok || !descriptorInfo.Mode().IsRegular() || stat.Uid != uint32(os.Geteuid()) || uint64(stat.Nlink) != 1 || descriptorInfo.Mode().Perm()&0o077 != 0 {
+		return errors.New("leased instance lock must remain an owner-only, single-link regular file")
+	}
+	return nil
 }
 
 func (lock *fileLock) Close() error {

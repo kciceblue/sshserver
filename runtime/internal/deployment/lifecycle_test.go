@@ -3,6 +3,7 @@
 package deployment
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -414,6 +415,100 @@ func TestApplyDoesNotRecreateRemovedConfirmedInitializationLock(t *testing.T) {
 	state, err := LoadState(fixture.layout)
 	if err != nil || state.Active == nil || state.Active.Release != installed.Release {
 		t.Fatalf("removed initialization-lock race changed deployment state=%+v err=%v", state, err)
+	}
+}
+
+func TestApplyRejectsReplacementOfAcquiredInitializationLockBeforeJournal(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		lockPresent bool
+	}{
+		{name: "new lock", lockPresent: false},
+		{name: "preexisting lock", lockPresent: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newLifecycleFixture(t, false)
+			var request ApplyRequest
+			var desired InstalledRelease
+			var stateBefore []byte
+			priorRelease := ""
+			if testCase.lockPresent {
+				installedRequest, installed := fixture.release(t, "v1.2.3", "initialization-lock-replacement-installed")
+				if _, err := applyConfirmed(t, fixture.lifecycle, installedRequest); err != nil {
+					t.Fatal(err)
+				}
+				priorRelease = installed.Release
+				stateBytes, readErr := os.ReadFile(fixture.layout.StatePath)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				stateBefore = stateBytes
+				request, desired = fixture.release(t, "v1.2.4", "initialization-lock-replacement-upgrade")
+			} else {
+				request, desired = fixture.release(t, "v1.2.3", "initialization-lock-replacement-fresh")
+			}
+
+			initializationLock := filepath.Join(fixture.layout.StateDir, ".instance.lock")
+			originalAcquire := fixture.lifecycle.acquireInstanceLease
+			var replacement *instance.InitializationLease
+			fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
+				lease, err := originalAcquire(stateDir, initializationLockPresent)
+				if err != nil {
+					return nil, err
+				}
+				if initializationLockPresent != testCase.lockPresent {
+					lease.Close()
+					return nil, fmt.Errorf("preview initialization lock presence=%t, want %t", initializationLockPresent, testCase.lockPresent)
+				}
+				if err := os.Remove(initializationLock); err != nil {
+					lease.Close()
+					return nil, err
+				}
+				if err := os.WriteFile(initializationLock, nil, 0o600); err != nil {
+					lease.Close()
+					return nil, err
+				}
+				replacement, err = instance.AcquireInitializationLeaseWithLockPresence(stateDir, true)
+				if err != nil {
+					lease.Close()
+					return nil, fmt.Errorf("acquire replacement initialization lock: %w", err)
+				}
+				return lease, nil
+			}
+			stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+
+			_, err := applyConfirmed(t, fixture.lifecycle, request)
+			if replacement == nil {
+				t.Fatal("replacement initialization lock was not acquired")
+			}
+			if closeErr := replacement.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			if !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || !strings.Contains(err.Error(), "leased initialization lock path changed") {
+				t.Fatalf("replaced initialization-lock apply error=%v", err)
+			}
+			if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+				t.Fatalf("replaced initialization lock reached stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+			}
+			if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+				t.Fatalf("replaced initialization-lock race created journal: %v", err)
+			}
+			if _, err := os.Lstat(desired.BinaryPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("replaced initialization-lock race published desired binary: %v", err)
+			}
+			state, err := LoadState(fixture.layout)
+			if testCase.lockPresent {
+				if err != nil || state.Active == nil || state.Active.Release != priorRelease {
+					t.Fatalf("replaced initialization-lock race changed deployment state=%+v err=%v", state, err)
+				}
+				stateAfter, err := os.ReadFile(fixture.layout.StatePath)
+				if err != nil || !bytes.Equal(stateAfter, stateBefore) {
+					t.Fatalf("replaced initialization-lock race changed deployment state bytes err=%v", err)
+				}
+			} else if !errors.Is(err, ErrNoDeploymentState) {
+				t.Fatalf("fresh replaced initialization-lock race created deployment state=%+v err=%v", state, err)
+			}
+		})
 	}
 }
 
@@ -1187,6 +1282,7 @@ type lifecycleFixture struct {
 type testInitializationLease struct {
 	initialize func(context.Context, []string) (config.Settings, error)
 	created    bool
+	attest     func() error
 	close      func() error
 }
 
@@ -1196,6 +1292,10 @@ func (lease *testInitializationLease) Initialize(ctx context.Context, listeners 
 
 func (lease *testInitializationLease) InitializationLockCreated() bool {
 	return lease.created
+}
+
+func (lease *testInitializationLease) AttestLockPath() error {
+	return lease.attest()
 }
 
 func (lease *testInitializationLease) Close() error {
@@ -1247,6 +1347,7 @@ func newLifecycleFixture(t *testing.T, foreground bool) *lifecycleFixture {
 				return lease.Initialize(ctx, listeners)
 			},
 			created: lease.InitializationLockCreated(),
+			attest:  lease.AttestLockPath,
 			close:   lease.Close,
 		}, nil
 	}

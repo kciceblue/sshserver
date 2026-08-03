@@ -82,8 +82,11 @@ is therefore a complete cancellation.
 The transactional `deploy apply` and `deploy recover` require the SHA-256 of
 the exact canonical preview bytes, including their terminal newline. They
 rebuild that plan while holding the lifecycle and initialization locks and
-refuse before product mutation if any field or action changed. `deploy status`, `deploy
-rollback`, and `deploy uninstall` commands validate an exact pinned release,
+refuse before product mutation if any field or action changed. The leased
+initialization-lock path is re-attested against its flocked descriptor before
+journaling and initialization, so unlink or replacement fails closed. `deploy
+status`, `deploy rollback`, and `deploy uninstall` commands validate an exact
+pinned release,
 publish its binary and LICENSE/NOTICE without replacement, preserve protected
 instance state, and drive only the current user's native service manager.
 Apply detects the manager before its first mutation and revalidates the exact
