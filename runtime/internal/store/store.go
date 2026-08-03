@@ -18,7 +18,7 @@ import (
 	"github.com/kciceblue/sshserver/runtime/internal/auth"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/uuidv4"
-	_ "github.com/ncruces/go-sqlite3/driver"
+	sqliteDriver "github.com/ncruces/go-sqlite3/driver"
 	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
@@ -42,14 +42,8 @@ type Store struct {
 }
 
 func Open(ctx context.Context, path string, identity Identity) (*Store, error) {
-	if _, err := uuidv4.Parse(identity.InstanceID); err != nil {
-		return nil, fmt.Errorf("instance ID: %w", err)
-	}
-	if _, err := uuidv4.Parse(identity.VaultID); err != nil {
-		return nil, fmt.Errorf("vault ID: %w", err)
-	}
-	if identity.InstanceID == identity.VaultID {
-		return nil, errors.New("instance and vault IDs must differ")
+	if err := validateIdentityInput(identity); err != nil {
+		return nil, err
 	}
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("database path must be absolute")
@@ -91,6 +85,258 @@ func Open(ctx context.Context, path string, identity Identity) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+// ValidateExisting performs the same exact-schema, instance-identity, and
+// persistent-content validation as startup without issuing SQL writes or
+// intentionally creating or migrating source state. An active WAL reader may
+// transiently update SQLite's shared-memory lock state; raced replacement of
+// any database/WAL/SHM path is detected and rejected before acceptance.
+// Deployment preview/apply use this before journaling a resumable instance so
+// malformed or foreign state cannot become a partially applied transaction.
+func ValidateExisting(ctx context.Context, path string, identity Identity) error {
+	return validateExisting(ctx, path, identity, nil)
+}
+
+func validateExisting(ctx context.Context, path string, identity Identity, beforeOpen func()) (returnErr error) {
+	if err := validateIdentityInput(identity); err != nil {
+		return err
+	}
+	if !filepath.IsAbs(path) {
+		return errors.New("database path must be absolute")
+	}
+	if err := config.ValidateProtectedFile(path, 0o600); err != nil {
+		return fmt.Errorf("validate database file: %w", err)
+	}
+	if err := validateSQLiteFiles(path); err != nil {
+		return err
+	}
+	walPresent, err := existingPath(path + "-wal")
+	if err != nil {
+		return fmt.Errorf("inspect SQLite WAL: %w", err)
+	}
+	shmPresent, err := existingPath(path + "-shm")
+	if err != nil {
+		return fmt.Errorf("inspect SQLite shared memory: %w", err)
+	}
+	journalPresent, err := existingPath(path + "-journal")
+	if err != nil {
+		return fmt.Errorf("inspect SQLite rollback journal: %w", err)
+	}
+	if walPresent != shmPresent {
+		return errors.New("read-only SQLite validation requires a complete WAL/shared-memory pair")
+	}
+	if journalPresent {
+		return errors.New("read-only SQLite validation refuses a pending rollback journal")
+	}
+	var closedSnapshot os.FileInfo
+	activeSnapshots := make(map[string]os.FileInfo)
+	if !walPresent {
+		closedSnapshot, err = os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("snapshot closed SQLite database: %w", err)
+		}
+	} else {
+		for _, activePath := range []string{path, path + "-wal", path + "-shm"} {
+			activeSnapshots[activePath], err = os.Lstat(activePath)
+			if err != nil {
+				return fmt.Errorf("snapshot active SQLite file %s: %w", filepath.Base(activePath), err)
+			}
+		}
+	}
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+
+	dsnURL := &url.URL{Scheme: "file", Path: path}
+	query := dsnURL.Query()
+	query.Set("mode", "ro")
+	if !walPresent {
+		// With no journal sidecars, the closed database is a complete immutable
+		// snapshot. This suppresses SQLite's otherwise surprising creation of
+		// empty WAL/SHM files while opening a WAL-mode database read-only. The
+		// exact file and absence of sidecars are rechecked below so a racing
+		// writer cannot make the immutable assumption stale and be accepted.
+		query.Set("immutable", "1")
+	}
+	for _, pragma := range []string{
+		"busy_timeout(5000)",
+		"foreign_keys(1)",
+		"query_only(1)",
+		"trusted_schema(0)",
+	} {
+		query.Add("_pragma", pragma)
+	}
+	dsnURL.RawQuery = query.Encode()
+	database, err := sql.Open("sqlite3", dsnURL.String())
+	if err != nil {
+		return fmt.Errorf("open SQLite read-only: %w", err)
+	}
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+	defer func() {
+		if closeErr := database.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close read-only SQLite validation: %w", closeErr))
+		}
+	}()
+	if err := database.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping SQLite read-only: %w", err)
+	}
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("reserve read-only SQLite connection: %w", err)
+	}
+	defer func() {
+		if closeErr := connection.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("release read-only SQLite connection: %w", closeErr))
+		}
+	}()
+	transaction, err := connection.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin read-only SQLite validation: %w", err)
+	}
+	defer transaction.Rollback()
+	var integrity string
+	if err := transaction.QueryRowContext(ctx, "PRAGMA quick_check(1)").Scan(&integrity); err != nil {
+		return fmt.Errorf("check SQLite integrity: %w", err)
+	}
+	if integrity != "ok" {
+		return fmt.Errorf("check SQLite integrity: %s", integrity)
+	}
+	kind, version, err := inspectSchemaState(ctx, transaction)
+	if err != nil {
+		return err
+	}
+	migratable := false
+	switch kind {
+	case schemaEmpty:
+		if version != 0 {
+			return ErrUnexpectedSchema
+		}
+	case schemaFull:
+		if version != SchemaVersion {
+			return ErrUnexpectedSchema
+		}
+		if err := validateIdentity(ctx, transaction, identity); err != nil {
+			return err
+		}
+		if err := validatePersistentState(ctx, transaction, identity); err != nil {
+			return fmt.Errorf("validate persistent state read-only: %w", err)
+		}
+	case schemaLegacy, schemaPriorFull, schemaPriorAcceptanceOrigin:
+		if version != SchemaVersion {
+			return ErrUnexpectedSchema
+		}
+		migratable = true
+	default:
+		return ErrUnexpectedSchema
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit read-only SQLite validation: %w", err)
+	}
+	if migratable {
+		if err := validateMigratableCopy(ctx, connection, identity); err != nil {
+			return err
+		}
+	}
+	if closedSnapshot != nil {
+		current, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("recheck closed SQLite database: %w", err)
+		}
+		if !os.SameFile(closedSnapshot, current) || closedSnapshot.Size() != current.Size() ||
+			!closedSnapshot.ModTime().Equal(current.ModTime()) {
+			return errors.New("closed SQLite database changed during read-only validation")
+		}
+		for _, sidecar := range []string{path + "-wal", path + "-shm", path + "-journal"} {
+			present, err := existingPath(sidecar)
+			if err != nil {
+				return fmt.Errorf("recheck SQLite sidecar: %w", err)
+			}
+			if present {
+				return errors.New("SQLite sidecar appeared during read-only validation")
+			}
+		}
+	} else {
+		for _, activePath := range []string{path, path + "-wal", path + "-shm"} {
+			if err := config.ValidateProtectedFile(activePath, 0o600); err != nil {
+				return fmt.Errorf("recheck active SQLite file %s: %w", filepath.Base(activePath), err)
+			}
+			current, err := os.Lstat(activePath)
+			if err != nil {
+				return fmt.Errorf("recheck active SQLite file %s: %w", filepath.Base(activePath), err)
+			}
+			if !os.SameFile(activeSnapshots[activePath], current) {
+				return fmt.Errorf("active SQLite file %s was replaced during read-only validation", filepath.Base(activePath))
+			}
+		}
+		journalPresent, err := existingPath(path + "-journal")
+		if err != nil {
+			return fmt.Errorf("recheck SQLite rollback journal: %w", err)
+		}
+		if journalPresent {
+			return errors.New("SQLite rollback journal appeared during read-only validation")
+		}
+	}
+	return nil
+}
+
+func validateMigratableCopy(ctx context.Context, source *sql.Conn, identity Identity) (returnErr error) {
+	temporaryRoot, err := os.MkdirTemp("", "jat-store-validation-")
+	if err != nil {
+		return fmt.Errorf("create private migration-validation directory: %w", err)
+	}
+	defer func() {
+		if removeErr := os.RemoveAll(temporaryRoot); removeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove migration-validation directory: %w", removeErr))
+		}
+	}()
+	destination := filepath.Join(temporaryRoot, "server.db")
+	destinationURL := (&url.URL{Scheme: "file", Path: destination}).String()
+	if err := source.Raw(func(raw any) error {
+		connection, ok := raw.(sqliteDriver.Conn)
+		if !ok {
+			return errors.New("SQLite driver does not expose the reviewed backup interface")
+		}
+		return connection.Raw().Backup("main", destinationURL)
+	}); err != nil {
+		return fmt.Errorf("copy migratable SQLite snapshot: %w", err)
+	}
+	if err := os.Chmod(destination, 0o600); err != nil {
+		return fmt.Errorf("protect migratable SQLite snapshot: %w", err)
+	}
+	opened, err := Open(ctx, destination, identity)
+	if err != nil {
+		return fmt.Errorf("validate migratable SQLite snapshot: %w", err)
+	}
+	if err := opened.Close(); err != nil {
+		return fmt.Errorf("close migrated SQLite validation snapshot: %w", err)
+	}
+	return nil
+}
+
+func validateIdentityInput(identity Identity) error {
+	if _, err := uuidv4.Parse(identity.InstanceID); err != nil {
+		return fmt.Errorf("instance ID: %w", err)
+	}
+	if _, err := uuidv4.Parse(identity.VaultID); err != nil {
+		return fmt.Errorf("vault ID: %w", err)
+	}
+	if identity.InstanceID == identity.VaultID {
+		return errors.New("instance and vault IDs must differ")
+	}
+	return nil
+}
+
+func existingPath(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (store *Store) Close() error {

@@ -10,6 +10,37 @@ import (
 	"testing"
 )
 
+func TestInitializationLeaseSerializesValidationThroughInitialize(t *testing.T) {
+	ctx := context.Background()
+	stateDir := filepath.Join(t.TempDir(), "state")
+	lease, err := AcquireInitializationLease(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Initialize(ctx, stateDir, nil); err == nil || !strings.Contains(err.Error(), "another initialization is already running") {
+		lease.Close()
+		t.Fatalf("parallel initializer error=%v", err)
+	}
+	settings, err := lease.Initialize(ctx, nil)
+	if err != nil {
+		lease.Close()
+		t.Fatal(err)
+	}
+	if settings.InstanceID == "" || settings.VaultID == "" {
+		lease.Close()
+		t.Fatalf("lease initialization settings=%+v", settings)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lease.Initialize(ctx, nil); err == nil || !strings.Contains(err.Error(), "lease is closed") {
+		t.Fatalf("closed lease initialize error=%v", err)
+	}
+	if _, err := Initialize(ctx, stateDir, nil); err != nil {
+		t.Fatalf("initializer after lease release: %v", err)
+	}
+}
+
 func TestInitializeIsIdempotentAndKeepsSecretOutsideDatabase(t *testing.T) {
 	ctx := context.Background()
 	stateDir := filepath.Join(t.TempDir(), "state")

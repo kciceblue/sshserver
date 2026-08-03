@@ -106,6 +106,63 @@ func (layout Layout) BinaryPath(release string, target Target) (string, error) {
 }
 
 func PrepareLayout(layout Layout) error {
+	if err := validateLayoutShape(layout); err != nil {
+		return err
+	}
+	verifiedHome, err := openVerifiedDirectory(layout.HomeDir, true)
+	if err != nil {
+		return fmt.Errorf("validate home directory: %w", err)
+	}
+	defer verifiedHome.Close()
+	homeFD := int(verifiedHome.Fd())
+	for _, entry := range []struct {
+		name   string
+		target string
+	}{
+		{name: "install root", target: layout.InstallRoot},
+		{name: "versions directory", target: layout.VersionsDir},
+		{name: "state directory", target: layout.StateDir},
+	} {
+		name, target := entry.name, entry.target
+		relative, _ := filepath.Rel(layout.HomeDir, target)
+		if err := ensureDirectoryBelow(homeFD, relative); err != nil {
+			return fmt.Errorf("prepare %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// ValidateLayoutReadOnly proves that every existing layout component has the
+// ownership, type, and permission properties required by PrepareLayout while
+// allowing absent descendants which apply would create. It never creates or
+// changes a filesystem object.
+func ValidateLayoutReadOnly(layout Layout) error {
+	if err := validateLayoutShape(layout); err != nil {
+		return err
+	}
+	verifiedHome, err := openVerifiedDirectory(layout.HomeDir, true)
+	if err != nil {
+		return fmt.Errorf("validate home directory: %w", err)
+	}
+	defer verifiedHome.Close()
+	for _, entry := range []struct {
+		name   string
+		target string
+	}{
+		{name: "install root", target: layout.InstallRoot},
+		{name: "versions directory", target: layout.VersionsDir},
+		{name: "state directory", target: layout.StateDir},
+	} {
+		name, target := entry.name, entry.target
+		relative, _ := filepath.Rel(layout.HomeDir, target)
+		if err := validateExistingDirectoryBelow(int(verifiedHome.Fd()), relative); err != nil {
+			return fmt.Errorf("validate prospective %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func validateLayoutShape(layout Layout) error {
 	if os.Geteuid() == 0 {
 		return errors.New("refusing user-scoped deployment as root")
 	}
@@ -116,21 +173,33 @@ func PrepareLayout(layout Layout) error {
 	if rebuilt != layout {
 		return errors.New("deployment layout contains inconsistent derived paths")
 	}
-	verifiedHome, err := openVerifiedDirectory(layout.HomeDir, true)
+	return nil
+}
+
+func validateExistingDirectoryBelow(rootFD int, relative string) error {
+	components := strings.Split(filepath.ToSlash(relative), "/")
+	currentFD, err := unix.Dup(rootFD)
 	if err != nil {
-		return fmt.Errorf("validate home directory: %w", err)
+		return err
 	}
-	defer verifiedHome.Close()
-	homeFD := int(verifiedHome.Fd())
-	for name, target := range map[string]string{
-		"install root":       layout.InstallRoot,
-		"versions directory": layout.VersionsDir,
-		"state directory":    layout.StateDir,
-	} {
-		relative, _ := filepath.Rel(layout.HomeDir, target)
-		if err := ensureDirectoryBelow(homeFD, relative); err != nil {
-			return fmt.Errorf("prepare %s: %w", name, err)
+	defer func() { _ = unix.Close(currentFD) }()
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." || strings.ContainsRune(component, '\x00') {
+			return errors.New("directory path contains an unsafe component")
 		}
+		nextFD, openErr := unix.Openat(currentFD, component, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+		if errors.Is(openErr, unix.ENOENT) {
+			return nil
+		}
+		if openErr != nil {
+			return openErr
+		}
+		if err := validateDirectoryFD(nextFD); err != nil {
+			unix.Close(nextFD)
+			return err
+		}
+		unix.Close(currentFD)
+		currentFD = nextFD
 	}
 	return nil
 }

@@ -386,7 +386,11 @@ func (adapter ServiceManagerAdapter) runProbe(ctx context.Context, command strin
 	if adapter.platform == "linux" {
 		return adapter.runner.Run(ctx, command, "--user", "show-environment")
 	}
-	return adapter.runner.Run(ctx, command, "print", adapter.domain)
+	// `launchctl print gui/<uid>` dumps every service in the domain and can
+	// exceed the bounded command-output contract on an otherwise healthy Mac.
+	// `print-disabled` is a read-only domain query with the same missing-domain
+	// failure classification and a bounded override listing.
+	return adapter.runner.Run(ctx, command, "print-disabled", adapter.domain)
 }
 
 func (adapter ServiceManagerAdapter) runRequired(ctx context.Context, command, operation string, args ...string) error {

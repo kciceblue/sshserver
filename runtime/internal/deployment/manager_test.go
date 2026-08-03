@@ -148,7 +148,7 @@ func TestLaunchdManagerExactLifecycleArgv(t *testing.T) {
 	domain := "gui/" + uid
 	target := domain + "/com.kciceblue.sshserver"
 	wantCalls := []managerCall{
-		{name: "/bin/launchctl", args: []string{"print", domain}},
+		{name: "/bin/launchctl", args: []string{"print-disabled", domain}},
 		{name: "/bin/launchctl", args: []string{"bootstrap", domain, wantDefinition}},
 		{name: "/bin/launchctl", args: []string{"kickstart", "-k", target}},
 		{name: "/bin/launchctl", args: []string{"print", target}},

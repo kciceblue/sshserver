@@ -140,6 +140,273 @@ func TestStoreIdentityAndFutureSchemaFailClosed(t *testing.T) {
 	}
 }
 
+func TestValidateExistingIsReadOnlyAndRejectsForeignOrMalformedState(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "server.db")
+	opened, err := Open(ctx, path, testIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	beforeEntries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateExisting(ctx, path, testIdentity); err != nil {
+		t.Fatalf("read-only validation: %v", err)
+	}
+	afterEntries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterEntries) != len(beforeEntries) || !bytes.Equal(after, before) {
+		t.Fatalf("read-only validation mutated database tree: entries %d -> %d bytes_equal=%t", len(beforeEntries), len(afterEntries), bytes.Equal(after, before))
+	}
+	for index := range beforeEntries {
+		if beforeEntries[index].Name() != afterEntries[index].Name() {
+			t.Fatalf("read-only validation changed database entries: %q -> %q", beforeEntries[index].Name(), afterEntries[index].Name())
+		}
+	}
+
+	mismatch := testIdentity
+	mismatch.VaultID = "00000000-0000-4000-8000-000000000004"
+	if err := ValidateExisting(ctx, path, mismatch); !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("read-only identity mismatch error=%v", err)
+	}
+
+	raw, err := sql.Open("sqlite3", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, "PRAGMA ignore_check_constraints = ON; UPDATE runtime_state SET server_cursor = X'00' WHERE singleton = 1"); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateExisting(ctx, path, testIdentity); !errors.Is(err, ErrUnexpectedSchema) {
+		t.Fatalf("read-only malformed-state error=%v", err)
+	}
+
+	missing := filepath.Join(root, "missing.db")
+	if err := ValidateExisting(ctx, missing, testIdentity); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing read-only validation error=%v", err)
+	}
+	if _, err := os.Lstat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only validation created missing database: %v", err)
+	}
+}
+
+func TestValidateExistingReadsProtectedActiveWALWithoutCreatingFiles(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "server.db")
+	opened, err := Open(ctx, path, testIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if err := opened.CreateDevice(ctx, "00000000-0000-4000-8000-000000000003", tokenWithByte(0x31), auth.FixedScopes(), protocolFixtureTime); err != nil {
+		t.Fatal(err)
+	}
+	beforeEntries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beforeEntries) != 3 {
+		t.Fatalf("active WAL entries=%d want database/WAL/SHM", len(beforeEntries))
+	}
+	beforePayloads := make(map[string][]byte, len(beforeEntries))
+	for _, entry := range beforeEntries {
+		payload, err := os.ReadFile(filepath.Join(root, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforePayloads[entry.Name()] = payload
+	}
+	if err := ValidateExisting(ctx, path, testIdentity); err != nil {
+		t.Fatalf("validate active WAL read-only: %v", err)
+	}
+	afterEntries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterEntries) != len(beforeEntries) {
+		t.Fatalf("active WAL validation changed entry count %d -> %d", len(beforeEntries), len(afterEntries))
+	}
+	for index := range beforeEntries {
+		if beforeEntries[index].Name() != afterEntries[index].Name() {
+			t.Fatalf("active WAL validation changed entry %q -> %q", beforeEntries[index].Name(), afterEntries[index].Name())
+		}
+		info, err := afterEntries[index].Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&^0o600 != 0 {
+			t.Fatalf("active WAL validation broadened %s to %04o", afterEntries[index].Name(), info.Mode().Perm())
+		}
+		payload, err := os.ReadFile(filepath.Join(root, afterEntries[index].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// SQLite read locking may update the ephemeral SHM wal-index while an
+		// active writer exists. The database and committed WAL stay byte-exact.
+		if afterEntries[index].Name() != "server.db-shm" && !bytes.Equal(payload, beforePayloads[afterEntries[index].Name()]) {
+			t.Fatalf("active WAL validation changed %s contents", afterEntries[index].Name())
+		}
+	}
+}
+
+func TestValidateExistingRejectsActiveWALSidecarReplacementRace(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "server.db")
+	opened, err := Open(ctx, path, testIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if err := opened.CreateDevice(ctx, "00000000-0000-4000-8000-000000000004", tokenWithByte(0x41), auth.FixedScopes(), protocolFixtureTime); err != nil {
+		t.Fatal(err)
+	}
+	databaseBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = validateExisting(ctx, path, testIdentity, func() {
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if removeErr := os.Remove(path + suffix); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				t.Fatalf("remove raced SQLite sidecar: %v", removeErr)
+			}
+		}
+	})
+	if err == nil {
+		t.Fatal("active WAL sidecar replacement race was accepted")
+	}
+	databaseAfter, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(databaseAfter, databaseBefore) {
+		t.Fatal("active WAL sidecar race changed the durable database file")
+	}
+}
+
+func TestValidateExistingAcceptsExactResumableSchemaStatesWithoutMigratingSource(t *testing.T) {
+	ctx := context.Background()
+	for _, testCase := range []struct {
+		name    string
+		prepare func(*testing.T, string)
+	}{
+		{
+			name: "empty database after protected-file creation",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "reviewed legacy schema",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				raw, err := sql.Open("sqlite3", "file:"+path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, statement := range []string{createInstanceMetadataV1, createDevicesV1, "PRAGMA user_version = 1"} {
+					if _, err := raw.ExecContext(ctx, statement); err != nil {
+						raw.Close()
+						t.Fatal(err)
+					}
+				}
+				if _, err := raw.ExecContext(ctx, `
+					INSERT INTO instance_metadata (
+						singleton, instance_id, vault_id, protocol_major, storage_schema
+					) VALUES (1, ?, ?, '1', '1')`, testIdentity.InstanceID, testIdentity.VaultID); err != nil {
+					raw.Close()
+					t.Fatal(err)
+				}
+				if err := raw.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "reviewed prior acceptance-origin schema",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				opened, err := Open(ctx, path, testIdentity)
+				if err != nil {
+					t.Fatal(err)
+				}
+				dropRevisionAcceptanceOriginsForMigration(t, opened.db)
+				if err := opened.Close(); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "reviewed prior full schema",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				opened, err := Open(ctx, path, testIdentity)
+				if err != nil {
+					t.Fatal(err)
+				}
+				downgradeRecordRevisionsToPriorFullV1(t, opened.db)
+				if err := opened.Close(); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "server.db")
+			testCase.prepare(t, path)
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeEntries, err := os.ReadDir(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateExisting(ctx, path, testIdentity); err != nil {
+				t.Fatalf("validate resumable schema: %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			afterEntries, err := os.ReadDir(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, before) || len(afterEntries) != len(beforeEntries) {
+				t.Fatalf("resumable validation migrated source: bytes_equal=%t entries=%d->%d", bytes.Equal(after, before), len(beforeEntries), len(afterEntries))
+			}
+		})
+	}
+}
+
 func TestStoreRejectsUnexpectedOrIncompleteSchemas(t *testing.T) {
 	ctx := context.Background()
 	unrelatedPath := filepath.Join(t.TempDir(), "unrelated.db")
@@ -416,6 +683,9 @@ func TestLegacyMigrationRejectsMalformedDurableDeviceRows(t *testing.T) {
 			}
 			if err := os.Chmod(path, 0o600); err != nil {
 				t.Fatal(err)
+			}
+			if err := ValidateExisting(ctx, path, testIdentity); !errors.Is(err, ErrUnexpectedSchema) {
+				t.Fatalf("malformed legacy read-only validation error = %v", err)
 			}
 			if _, err := Open(ctx, path, testIdentity); !errors.Is(err, ErrUnexpectedSchema) {
 				t.Fatalf("malformed legacy row error = %v", err)

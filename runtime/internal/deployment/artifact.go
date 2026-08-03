@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	debugbuildinfo "debug/buildinfo"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 )
 
 const (
@@ -80,6 +83,146 @@ func VerifyStagedReleaseFile(path string, expectedBytes int64, expectedSHA256 st
 		return errors.New("release support file must be LICENSE or NOTICE")
 	}
 	return verifyStagedFile(path, expectedBytes, expectedSHA256, maxReleaseFileBytes, 0o400)
+}
+
+// VerifyArtifactSource proves that an installer input is the exact release
+// artifact selected by the manifest without executing or copying it. It takes
+// one bounded in-memory snapshot from a no-follow descriptor, verifies that
+// snapshot's digest, then performs frozen-attestation and Go build-metadata
+// inspection only against those immutable bytes. Preview therefore remains
+// genuinely read-only and an in-place source rewrite cannot make hashing and
+// semantic inspection observe different content.
+func VerifyArtifactSource(path string, expected InstalledRelease) error {
+	expectation, err := parseArtifactExpectation(expected.BinaryBytes, expected.BinarySHA256)
+	if err != nil {
+		return err
+	}
+	source, initial, err := openVerifiedArtifactSource(path, expectation.bytes)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	snapshot, err := readVerifiedSourceSnapshot(source, initial, expectation, "artifact")
+	if err != nil {
+		return err
+	}
+
+	identity := buildinfo.Identity{
+		Release:         expected.Release,
+		SourceRevision:  expected.SourceRevision,
+		BuildToolchain:  expected.BuildToolchain,
+		BuildIdentity:   expected.BuildIdentity,
+		ProtocolVersion: expected.ProtocolVersion,
+		StorageSchema:   expected.StorageSchema,
+	}
+	attestation, err := buildinfo.Encode(identity)
+	if err != nil {
+		return fmt.Errorf("construct expected artifact attestation: %w", err)
+	}
+	if !bytes.Contains(snapshot, []byte(attestation)) {
+		return errors.New("artifact does not contain its exact frozen release attestation")
+	}
+	metadata, err := debugbuildinfo.Read(bytes.NewReader(snapshot))
+	if err != nil {
+		return fmt.Errorf("read artifact Go build metadata: %w", err)
+	}
+	if err := validateArtifactBuildMetadata(metadata, expected); err != nil {
+		return err
+	}
+	return nil
+}
+
+// VerifyReleaseFileSource applies the same immutable installer-input checks to
+// LICENSE and NOTICE while performing no target-layout mutation.
+func VerifyReleaseFileSource(path string, expectedBytes int64, expectedSHA256 string) error {
+	expectation, err := parseArtifactExpectation(expectedBytes, expectedSHA256)
+	if err != nil {
+		return err
+	}
+	if expectedBytes > maxReleaseFileBytes {
+		return errors.New("release support-file size expectation is outside the supported boundary")
+	}
+	source, initial, err := openVerifiedArtifactSource(path, expectation.bytes)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	_, err = readVerifiedSourceSnapshot(source, initial, expectation, "release support-file")
+	return err
+}
+
+func readVerifiedSourceSnapshot(
+	source *os.File,
+	initial unix.Stat_t,
+	expectation artifactExpectation,
+	kind string,
+) ([]byte, error) {
+	if source == nil {
+		return nil, fmt.Errorf("%s source descriptor is required", kind)
+	}
+	var snapshot bytes.Buffer
+	snapshot.Grow(int(expectation.bytes))
+	hash := sha256.New()
+	read, err := io.Copy(
+		io.MultiWriter(&snapshot, hash),
+		io.NewSectionReader(source, 0, expectation.bytes+1),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("hash %s source: %w", kind, err)
+	}
+	if read != expectation.bytes || !bytes.Equal(hash.Sum(nil), expectation.digest[:]) {
+		return nil, fmt.Errorf("%s SHA-256 does not match the release manifest", kind)
+	}
+	final, err := statFile(source)
+	if err != nil {
+		return nil, fmt.Errorf("reinspect %s source descriptor: %w", kind, err)
+	}
+	if err := validateOwnedRegularFile(final, 0, false); err != nil || final.Size != expectation.bytes || !sameArtifactIdentity(initial, final) {
+		return nil, fmt.Errorf("%s source descriptor changed during preview verification", kind)
+	}
+	return snapshot.Bytes(), nil
+}
+
+func validateArtifactBuildMetadata(metadata *debugbuildinfo.BuildInfo, expected InstalledRelease) error {
+	if metadata == nil || metadata.GoVersion != expected.BuildToolchain {
+		return errors.New("artifact Go toolchain does not match the pinned release")
+	}
+	const runtimeModule = "github.com/kciceblue/sshserver/runtime"
+	if metadata.Path != runtimeModule+"/cmd/sshserver" || metadata.Main.Path != runtimeModule || metadata.Main.Replace != nil {
+		return errors.New("artifact is not the exact local sshserver runtime module")
+	}
+	settings := make(map[string]string, len(metadata.Settings))
+	for _, setting := range metadata.Settings {
+		if _, duplicate := settings[setting.Key]; duplicate {
+			return fmt.Errorf("artifact build metadata repeats %s", setting.Key)
+		}
+		settings[setting.Key] = setting.Value
+	}
+	for key, want := range map[string]string{
+		"-buildmode":  "exe",
+		"-compiler":   "gc",
+		"-trimpath":   "true",
+		"CGO_ENABLED": "0",
+		"GOOS":        expected.OS,
+		"GOARCH":      expected.Architecture,
+	} {
+		if settings[key] != want {
+			return fmt.Errorf("artifact build metadata %s=%q, want %q", key, settings[key], want)
+		}
+	}
+	baselineKey, baselineValue := "GOAMD64", "v1"
+	if expected.Architecture == "arm64" {
+		baselineKey, baselineValue = "GOARM64", "v8.0"
+	}
+	if settings[baselineKey] != baselineValue {
+		return fmt.Errorf("artifact build metadata %s=%q, want %q", baselineKey, settings[baselineKey], baselineValue)
+	}
+	for _, forbidden := range []string{"-overlay", "-tags", "GOEXPERIMENT", "GOFLAGS"} {
+		if _, present := settings[forbidden]; present {
+			return fmt.Errorf("artifact build metadata contains forbidden setting %s", forbidden)
+		}
+	}
+	return nil
 }
 
 func verifyStagedFile(path string, expectedBytes int64, expectedSHA256 string, maximumBytes int64, finalMode os.FileMode) error {

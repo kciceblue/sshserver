@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -57,6 +58,168 @@ func TestVersionJSONReportsExactBuildIdentity(t *testing.T) {
 	}
 	if identity != expected {
 		t.Fatalf("identity=%+v want=%+v", identity, expected)
+	}
+}
+
+func TestDeployPreviewCLIIsCanonicalAndNeverMutatesTargetLayout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real release-binary preview is disabled in short mode")
+	}
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	physicalHome, err := filepath.EvalSymlinks(userHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := os.MkdirTemp(physicalHome, ".sshserver-cli-preview-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	upload := filepath.Join(home, "upload")
+	if err := os.Mkdir(upload, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installRoot := filepath.Join(home, "deployment")
+	stateDir := filepath.Join(home, "state")
+
+	goVersion := exec.Command("go", "env", "GOVERSION")
+	goVersion.Env = cliGoEnvironment("GOENV=off", "GOTOOLCHAIN=local")
+	goVersionOutput, err := goVersion.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolchain := strings.TrimSpace(string(goVersionOutput))
+	release := "v0.0.0-preview-cli-test"
+	sourceRevision := strings.Repeat("a", 40)
+	target := deployment.Target{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+	buildIdentity, err := deployment.DeriveBuildIdentity(release, sourceRevision, toolchain, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestation, err := buildinfo.Encode(buildinfo.Identity{
+		Release: release, SourceRevision: sourceRevision, BuildToolchain: toolchain, BuildIdentity: buildIdentity,
+		ProtocolVersion: config.ProtocolMajor, StorageSchema: config.StorageSchema,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactPath := filepath.Join(upload, "sshserver")
+	runtimeRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command(
+		"go", "build", "-mod=readonly", "-buildmode=exe", "-buildvcs=true", "-tags=", "-trimpath",
+		"-ldflags=-X github.com/kciceblue/sshserver/runtime/internal/buildinfo.EncodedIdentity="+attestation,
+		"-o", artifactPath, "./cmd/sshserver",
+	)
+	build.Dir = runtimeRoot
+	build.Env = cliGoEnvironment(
+		"GOENV=off", "GOWORK=off", "GOFLAGS=", "GOEXPERIMENT=", "GOTOOLCHAIN=local", "CGO_ENABLED=0",
+		"GOOS="+target.OS, "GOARCH="+target.Architecture, "GOAMD64=v1", "GOARM64=v8.0",
+	)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build preview CLI artifact: %v\n%s", err, output)
+	}
+	if err := os.Chmod(artifactPath, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	artifactPayload, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	licensePayload := []byte("Apache-2.0 preview CLI license fixture\n")
+	noticePayload := []byte("preview CLI notice fixture\n")
+	licensePath := writeCLIProtectedInput(t, upload, "LICENSE", licensePayload, 0o400)
+	noticePath := writeCLIProtectedInput(t, upload, "NOTICE", noticePayload, 0o400)
+	manifest := deployment.ReleaseManifest{
+		ManifestVersion: deployment.ManifestVersion,
+		Release:         release, SourceRevision: sourceRevision, BuildToolchain: toolchain,
+		ProtocolVersion: config.ProtocolMajor, StorageSchema: config.StorageSchema,
+		DownloadOrigin: "https://downloads.example.test",
+		ReleaseFiles: []deployment.ReleaseFile{
+			{Name: "LICENSE", URL: cliReleaseURL(release, "LICENSE"), Bytes: int64(len(licensePayload)), SHA256: deployment.SHA256Hex(licensePayload)},
+			{Name: "NOTICE", URL: cliReleaseURL(release, "NOTICE"), Bytes: int64(len(noticePayload)), SHA256: deployment.SHA256Hex(noticePayload)},
+		},
+	}
+	for _, supported := range deployment.SupportedTargets() {
+		identity, err := deployment.DeriveBuildIdentity(release, sourceRevision, toolchain, supported)
+		if err != nil {
+			t.Fatal(err)
+		}
+		artifact := deployment.ReleaseArtifact{
+			OS: supported.OS, Architecture: supported.Architecture, BuildIdentity: identity,
+			URL:   cliReleaseURL(release, "sshserver-"+supported.OS+"-"+supported.Architecture),
+			Bytes: 1, SHA256: strings.Repeat("f", 64),
+		}
+		if supported == target {
+			artifact.Bytes = int64(len(artifactPayload))
+			artifact.SHA256 = deployment.SHA256Hex(artifactPayload)
+		}
+		manifest.Artifacts = append(manifest.Artifacts, artifact)
+	}
+	manifestPayload, err := manifest.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := writeCLIProtectedInput(t, upload, "release-manifest.json", manifestPayload, 0o400)
+	manifestSHA256 := deployment.SHA256Hex(manifestPayload)
+	args := []string{
+		"deploy", "preview", "--home-dir", home, "--install-root", installRoot, "--state-dir", stateDir,
+		"--manifest", manifestPath, "--manifest-sha256", manifestSHA256, "--artifact", artifactPath,
+		"--license", licensePath, "--notice", noticePath,
+	}
+	run := func() ([]byte, string, int) {
+		var stdout, stderr bytes.Buffer
+		code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), args)
+		return append([]byte(nil), stdout.Bytes()...), stderr.String(), code
+	}
+	first, firstStderr, firstCode := run()
+	second, secondStderr, secondCode := run()
+	if firstCode != 0 || secondCode != 0 || firstStderr != "" || secondStderr != "" || !bytes.Equal(first, second) {
+		t.Fatalf("preview runs code=%d/%d stderr=%q/%q equal=%t", firstCode, secondCode, firstStderr, secondStderr, bytes.Equal(first, second))
+	}
+	preview, err := deployment.ParseDeploymentPreview(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Classification != deployment.PreviewFresh || !preview.ApplyAllowed || preview.Target.OS != target.OS ||
+		preview.Target.Architecture != target.Architecture || preview.Paths.HomeDir != home || preview.Paths.InstallRoot != installRoot ||
+		preview.Paths.StateDir != stateDir || !preview.Assertions.Network.LoopbackOnly {
+		t.Fatalf("CLI preview=%+v", preview)
+	}
+	for _, path := range []string{installRoot, stateDir, filepath.Join(installRoot, ".deployment.lock"), preview.Paths.ServiceDefinition} {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("preview CLI created %s: %v", path, err)
+		}
+	}
+
+	badArtifact := writeCLIProtectedInput(t, upload, "bad-sshserver", append(append([]byte(nil), artifactPayload...), 0), 0o500)
+	badArgs := append([]string(nil), args...)
+	for index := range badArgs {
+		if badArgs[index] == artifactPath {
+			badArgs[index] = badArtifact
+		}
+	}
+	var badStdout, badStderr bytes.Buffer
+	badCode := (Runner{Stdout: &badStdout, Stderr: &badStderr}).Run(context.Background(), badArgs)
+	if badCode == 0 || badStdout.Len() != 0 || !strings.Contains(badStderr.String(), "artifact source size") {
+		t.Fatalf("bad preview code=%d stdout=%q stderr=%q", badCode, badStdout.String(), badStderr.String())
+	}
+	for _, path := range []string{installRoot, stateDir} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed preview CLI created %s: %v", path, err)
+		}
 	}
 }
 
@@ -185,7 +348,7 @@ func TestMutatingDeployCommandsKeepIndependentLayoutOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	overrideState := filepath.Join(home, "independent-state-override")
-	for _, operation := range []string{"apply", "recover", "rollback", "uninstall"} {
+	for _, operation := range []string{"preview", "apply", "recover", "rollback", "uninstall"} {
 		t.Run(operation, func(t *testing.T) {
 			values, flags, err := (Runner{Stderr: io.Discard}).newDeploymentFlags("deploy " + operation)
 			if err != nil {
@@ -205,7 +368,7 @@ func TestMutatingDeployCommandsKeepIndependentLayoutOverrides(t *testing.T) {
 }
 
 func TestDeployApplyRequiresExactPinnedInputs(t *testing.T) {
-	for _, operation := range []string{"apply", "recover"} {
+	for _, operation := range []string{"preview", "apply", "recover"} {
 		t.Run(operation, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{"deploy", operation})
@@ -273,6 +436,80 @@ func TestDeployApplyResultWritesOneCredentialFreeLocatorLine(t *testing.T) {
 		if _, ok := encodedLocator[forbidden]; ok {
 			t.Fatalf("deployment locator exposes forbidden field %q", forbidden)
 		}
+	}
+}
+
+func TestDeployPreviewWriterEmitsDeterministicCanonicalJSON(t *testing.T) {
+	home := "/home/alice"
+	installRoot := filepath.Join(home, "deployment")
+	stateDir := filepath.Join(home, "state")
+	releaseDir := filepath.Join(installRoot, "versions", "v1.2.3")
+	binaryPath := filepath.Join(releaseDir, "sshserver-linux-amd64")
+	buildIdentity, err := deployment.DeriveBuildIdentity(
+		"v1.2.3",
+		strings.Repeat("a", 40),
+		"go1.25.0",
+		deployment.Target{OS: "linux", Architecture: "amd64"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := deployment.DeploymentPreview{
+		Version:        deployment.DeploymentPreviewVersion,
+		Classification: deployment.PreviewBlocked,
+		ApplyAllowed:   false,
+		BlockReason:    "installed_release_verification_failed",
+		Release: deployment.PreviewReleaseIdentity{
+			Release: "v1.2.3", SourceRevision: strings.Repeat("a", 40), BuildToolchain: "go1.25.0",
+			BuildIdentity: buildIdentity, ProtocolVersion: "1", StorageSchema: "1",
+		},
+		Target: deployment.PreviewTargetIdentity{OS: "linux", Architecture: "amd64"},
+		Inputs: deployment.PreviewInputs{
+			Manifest: deployment.PreviewManifestIdentity{Path: filepath.Join(home, "upload", "manifest.json"), Bytes: 100, SHA256: strings.Repeat("c", 64)},
+			Artifact: deployment.PreviewArtifactIdentity{SourcePath: filepath.Join(home, "upload", "sshserver"), URL: "https://downloads.example.test/releases/v1.2.3/sshserver-linux-amd64", Bytes: 200, SHA256: strings.Repeat("d", 64)},
+			License:  deployment.PreviewSupportFileIdentity{SourcePath: filepath.Join(home, "upload", "LICENSE"), URL: "https://downloads.example.test/releases/v1.2.3/LICENSE", Bytes: 300, SHA256: strings.Repeat("e", 64)},
+			Notice:   deployment.PreviewSupportFileIdentity{SourcePath: filepath.Join(home, "upload", "NOTICE"), URL: "https://downloads.example.test/releases/v1.2.3/NOTICE", Bytes: 400, SHA256: strings.Repeat("f", 64)},
+		},
+		Paths: deployment.PreviewPaths{
+			HomeDir: home, InstallRoot: installRoot, VersionsDir: filepath.Join(installRoot, "versions"), ReleaseDir: releaseDir,
+			StateDir: stateDir, BinaryPath: binaryPath, LicensePath: filepath.Join(releaseDir, "LICENSE"), NoticePath: filepath.Join(releaseDir, "NOTICE"),
+			DeploymentState: filepath.Join(installRoot, "deployment.json"), DeploymentJournal: filepath.Join(installRoot, "deployment-journal.json"),
+			LifecycleLock: filepath.Join(installRoot, ".deployment.lock"), AdminSocket: filepath.Join(stateDir, ".enrollment.sock"),
+		},
+		Manager: deployment.ManagerAvailability{
+			Manager: deployment.ManagerForeground,
+			Foreground: &deployment.ForegroundFallback{
+				Required: true, Reason: "user_service_manager_unavailable",
+				Command: []string{binaryPath, "serve", "--state-dir", stateDir}, Supervised: true,
+			},
+		},
+		Existing: deployment.PreviewExisting{InstanceState: "missing"},
+		Actions:  []deployment.PreviewAction{},
+		Assertions: deployment.PreviewAssertions{
+			Data: deployment.PreviewDataAssertions{
+				PreserveStateDirectory: true, PreserveInstanceIDs: true, PreserveDatabase: true,
+				PreserveDeviceRegistry: true, PreserveInstanceSecret: true,
+			},
+			Network: deployment.PreviewNetworkAssertions{LoopbackOnly: true, Listeners: []string{"127.0.0.1:37421", "[::1]:37421"}},
+			Scope:   deployment.PreviewScopeAssertions{CurrentUserOnly: true},
+		},
+	}
+	var first, second bytes.Buffer
+	if err := (Runner{Stdout: &first, Stderr: io.Discard}).writePreviewResult(preview); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Runner{Stdout: &second, Stderr: io.Discard}).writePreviewResult(preview); err != nil {
+		t.Fatal(err)
+	}
+	if first.String() != second.String() || strings.Count(first.String(), "\n") != 1 {
+		t.Fatalf("preview output is not deterministic one-line JSON: %q / %q", first.String(), second.String())
+	}
+	parsed, err := deployment.ParseDeploymentPreview(first.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(parsed, preview) {
+		t.Fatalf("preview changed after CLI round trip\n got=%+v\nwant=%+v", parsed, preview)
 	}
 }
 
@@ -629,6 +866,38 @@ func snapshotStateTree(t *testing.T, root string) map[string]stateTreeEntry {
 		t.Fatal(err)
 	}
 	return entries
+}
+
+func writeCLIProtectedInput(t *testing.T, directory, name string, payload []byte, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(directory, name)
+	if err := os.WriteFile(path, payload, mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func cliReleaseURL(release, name string) string {
+	return "https://downloads.example.test/releases/" + release + "/" + name
+}
+
+func cliGoEnvironment(overrides ...string) []string {
+	replaced := make(map[string]bool, len(overrides))
+	for _, override := range overrides {
+		key, _, _ := strings.Cut(override, "=")
+		replaced[key] = true
+	}
+	environment := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if !replaced[key] {
+			environment = append(environment, entry)
+		}
+	}
+	return append(environment, overrides...)
 }
 
 func assertEndpointShowFails(t *testing.T, stateDir, want string) {

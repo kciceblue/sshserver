@@ -631,3 +631,48 @@ func TestStageOpenedArtifactCopiesFromHeldSourceDescriptor(t *testing.T) {
 	}
 	assertNoArtifactTemporary(t, fixture.destination)
 }
+
+func TestVerifiedSourceSnapshotRetainsHashedBytesAcrossSameInodeRewrite(t *testing.T) {
+	fixture := newArtifactFixture(t)
+	original := []byte("prefix-exact-frozen-attestation-suffix")
+	replacement := bytes.Repeat([]byte{'x'}, len(original))
+	sourcePath := filepath.Join(fixture.sourceDir, "download")
+	writeArtifactTestFile(t, sourcePath, original, 0o600)
+	expectation, err := parseArtifactExpectation(int64(len(original)), artifactDigest(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, initial, err := openVerifiedArtifactSource(sourcePath, expectation.bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+
+	// This is the exact boundary between digest verification and semantic
+	// attestation/build-metadata inspection. Rewrite the pathname in place after
+	// the bounded read; device, inode, and size deliberately remain unchanged.
+	snapshot, err := readVerifiedSourceSnapshot(source, initial, expectation, "artifact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	final, err := statFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameArtifactIdentity(initial, final) || final.Size != initial.Size {
+		t.Fatalf("regression did not preserve descriptor identity: before=%+v after=%+v", initial, final)
+	}
+	current, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(current, replacement) {
+		t.Fatalf("source rewrite=%q", current)
+	}
+	if !bytes.Equal(snapshot, original) || !bytes.Contains(snapshot, []byte("exact-frozen-attestation")) {
+		t.Fatalf("immutable verified snapshot changed after same-inode rewrite: %q", snapshot)
+	}
+}

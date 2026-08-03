@@ -29,20 +29,28 @@ type serviceController interface {
 	IsActive(context.Context) (bool, error)
 }
 
+type instanceInitializationLease interface {
+	Initialize(context.Context, []string) (config.Settings, error)
+	Close() error
+}
+
 type Lifecycle struct {
-	layout            Layout
-	target            Target
-	manager           serviceController
-	inspector         IdentityInspector
-	stageArtifact     func(string, string, string, int64, string) (string, error)
-	verifyArtifact    func(string, int64, string) error
-	stageReleaseFile  func(string, string, string, int64, string) (string, error)
-	verifyReleaseFile func(string, int64, string) error
-	initialize        func(context.Context, string, []string) (config.Settings, error)
-	renderService     func(string, string, string) ([]byte, error)
-	probeRunning      func(context.Context, string) (buildinfo.Identity, error)
-	removeArtifacts   func(Layout) error
-	failAfterPhase    Phase
+	layout                  Layout
+	target                  Target
+	manager                 serviceController
+	inspector               IdentityInspector
+	stageArtifact           func(string, string, string, int64, string) (string, error)
+	verifyArtifact          func(string, int64, string) error
+	stageReleaseFile        func(string, string, string, int64, string) (string, error)
+	verifyReleaseFile       func(string, int64, string) error
+	verifySourceArtifact    func(string, InstalledRelease) error
+	verifySourceReleaseFile func(string, int64, string) error
+	verifyPreviewRelease    func(context.Context, InstalledRelease) error
+	acquireInstanceLease    func(string) (instanceInitializationLease, error)
+	renderService           func(string, string, string) ([]byte, error)
+	probeRunning            func(context.Context, string) (buildinfo.Identity, error)
+	removeArtifacts         func(Layout) error
+	failAfterPhase          Phase
 }
 
 type ApplyRequest struct {
@@ -616,25 +624,32 @@ func (lifecycle *Lifecycle) restorePriorAfterFailedSwitch(ctx context.Context, j
 
 func newLifecycle(layout Layout, target Target, manager serviceController) *Lifecycle {
 	return &Lifecycle{
-		layout:            layout,
-		target:            target,
-		manager:           manager,
-		inspector:         ExecutableIdentityInspector{},
-		stageArtifact:     StageVerifiedArtifact,
-		verifyArtifact:    VerifyStagedArtifact,
-		stageReleaseFile:  StageVerifiedReleaseFile,
-		verifyReleaseFile: VerifyStagedReleaseFile,
-		initialize:        instance.Initialize,
-		renderService:     service.Render,
-		probeRunning:      ProbeRunningIdentity,
-		removeArtifacts:   RemoveInstalledArtifacts,
+		layout:                  layout,
+		target:                  target,
+		manager:                 manager,
+		inspector:               ExecutableIdentityInspector{},
+		stageArtifact:           StageVerifiedArtifact,
+		verifyArtifact:          VerifyStagedArtifact,
+		stageReleaseFile:        StageVerifiedReleaseFile,
+		verifyReleaseFile:       VerifyStagedReleaseFile,
+		verifySourceArtifact:    VerifyArtifactSource,
+		verifySourceReleaseFile: VerifyReleaseFileSource,
+		verifyPreviewRelease: func(ctx context.Context, release InstalledRelease) error {
+			return verifyInstalledReleaseForPreview(ctx, layout, release)
+		},
+		acquireInstanceLease: func(stateDir string) (instanceInitializationLease, error) {
+			return instance.AcquireInitializationLease(stateDir)
+		},
+		renderService:   service.Render,
+		probeRunning:    ProbeRunningIdentity,
+		removeArtifacts: RemoveInstalledArtifacts,
 	}
 }
 
 func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (result ApplyResult, returnErr error) {
 	if lifecycle == nil || lifecycle.manager == nil || lifecycle.inspector == nil || lifecycle.stageArtifact == nil ||
 		lifecycle.verifyArtifact == nil || lifecycle.stageReleaseFile == nil || lifecycle.verifyReleaseFile == nil ||
-		lifecycle.initialize == nil || lifecycle.renderService == nil || lifecycle.probeRunning == nil {
+		lifecycle.verifyPreviewRelease == nil || lifecycle.acquireInstanceLease == nil || lifecycle.renderService == nil || lifecycle.probeRunning == nil {
 		return ApplyResult{}, errors.New("deployment lifecycle dependencies are incomplete")
 	}
 	manifest, err := ParsePinnedManifest(request.ManifestPayload, request.ManifestSHA256)
@@ -651,6 +666,59 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	if request.ArtifactPath == request.LicensePath || request.ArtifactPath == request.NoticePath || request.LicensePath == request.NoticePath {
 		return ApplyResult{}, errors.New("deployment input paths must be distinct")
 	}
+	if err := ValidateLayoutReadOnly(lifecycle.layout); err != nil {
+		return ApplyResult{}, err
+	}
+	if err := preflightDesiredReleaseDestinations(ctx, lifecycle.layout, desired); err != nil {
+		return ApplyResult{}, err
+	}
+	if _, _, instanceBlock := inspectPreviewInstance(ctx, lifecycle.layout.StateDir); instanceBlock != "" {
+		return ApplyResult{}, fmt.Errorf("deployment instance preflight is blocked: %s", instanceBlock)
+	}
+	if err := validateExistingDeploymentLock(lifecycle.layout); err != nil {
+		return ApplyResult{}, err
+	}
+	preflightJournal, preflightJournalErr := LoadJournal(lifecycle.layout)
+	if preflightJournalErr == nil {
+		if preflightJournal.Operation != OperationApply || preflightJournal.Desired == nil || *preflightJournal.Desired != desired {
+			return ApplyResult{}, errors.New("a different deployment transaction requires recovery before apply")
+		}
+	} else if !errors.Is(preflightJournalErr, ErrNoDeploymentJournal) {
+		return ApplyResult{}, preflightJournalErr
+	}
+	preflightState, preflightStateErr := LoadState(lifecycle.layout)
+	if preflightStateErr == nil {
+		if err := lifecycle.validateRecordedActiveServiceBinding(&preflightState); err != nil {
+			return ApplyResult{}, err
+		}
+		if err := lifecycle.verifyRecordedReleaseForApply(ctx, &preflightState, desired); err != nil {
+			return ApplyResult{}, err
+		}
+	} else if !errors.Is(preflightStateErr, ErrNoDeploymentState) {
+		return ApplyResult{}, preflightStateErr
+	}
+	if preflightJournalErr == nil {
+		if err := lifecycle.validateRecordedActiveServiceBinding(preflightJournal.PriorState); err != nil {
+			return ApplyResult{}, err
+		}
+		if err := lifecycle.verifyRecordedReleaseForApply(ctx, preflightJournal.PriorState, desired); err != nil {
+			return ApplyResult{}, err
+		}
+	}
+	initialAvailability, err := lifecycle.manager.Detect(ctx, desired.BinaryPath, lifecycle.layout.StateDir)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if err := lifecycle.validateApplyManager(desired, initialAvailability); err != nil {
+		return ApplyResult{}, err
+	}
+	preMutationAvailability, err := lifecycle.revalidateApplyManager(ctx, desired, initialAvailability)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if preflightJournalErr == nil && !managerMatchesJournal(preMutationAvailability, preflightJournal) {
+		return ApplyResult{}, errors.New("service-manager outcome no longer matches the recoverable deployment transaction")
+	}
 	if err := PrepareLayout(lifecycle.layout); err != nil {
 		return ApplyResult{}, err
 	}
@@ -663,11 +731,52 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment lock: %w", closeErr))
 		}
 	}()
+	// Recheck the desired final paths under the exclusive lifecycle lock so a
+	// cooperating deployment cannot race the read-only preflight into a journal.
+	if err := preflightDesiredReleaseDestinations(ctx, lifecycle.layout, desired); err != nil {
+		return ApplyResult{}, err
+	}
+	instanceLease, err := lifecycle.acquireInstanceLease(lifecycle.layout.StateDir)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	defer func() {
+		if closeErr := instanceLease.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment instance lease: %w", closeErr))
+		}
+	}()
+	// The pre-mutation check above catches invalid state without creating the
+	// layout. Repeat it while holding the initializer's exact lease, and retain
+	// that lease through runApply, so init/state replacement cannot race the
+	// journal and staging steps into a late initialization failure.
+	if _, _, instanceBlock := inspectPreviewInstance(ctx, lifecycle.layout.StateDir); instanceBlock != "" {
+		return ApplyResult{}, fmt.Errorf("deployment instance preflight is blocked under initialization lease: %s", instanceBlock)
+	}
 
 	journal, journalErr := LoadJournal(lifecycle.layout)
 	if journalErr == nil {
 		if journal.Operation != OperationApply || journal.Desired == nil || *journal.Desired != desired {
 			return ApplyResult{}, errors.New("a different deployment transaction requires recovery before apply")
+		}
+		if !managerMatchesJournal(preMutationAvailability, journal) {
+			return ApplyResult{}, errors.New("service-manager outcome no longer matches the recoverable deployment transaction")
+		}
+		if err := lifecycle.validateRecordedActiveServiceBinding(journal.PriorState); err != nil {
+			return ApplyResult{}, err
+		}
+		if err := lifecycle.verifyRecordedReleaseForApply(ctx, journal.PriorState, desired); err != nil {
+			return ApplyResult{}, err
+		}
+		currentState, currentStateErr := LoadState(lifecycle.layout)
+		if currentStateErr == nil {
+			if err := lifecycle.validateRecordedActiveServiceBinding(&currentState); err != nil {
+				return ApplyResult{}, err
+			}
+			if err := lifecycle.verifyRecordedReleaseForApply(ctx, &currentState, desired); err != nil {
+				return ApplyResult{}, err
+			}
+		} else if !errors.Is(currentStateErr, ErrNoDeploymentState) {
+			return ApplyResult{}, currentStateErr
 		}
 		if journal.Phase == PhasePlanned && (journal.SourcePath != request.ArtifactPath || journal.LicenseSourcePath != request.LicensePath || journal.NoticeSourcePath != request.NoticePath) {
 			journal.SourcePath = request.ArtifactPath
@@ -677,7 +786,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 				return ApplyResult{}, err
 			}
 		}
-		result, err := lifecycle.runApply(ctx, &journal)
+		result, err := lifecycle.runApply(ctx, &journal, instanceLease.Initialize)
 		if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || journal.Phase == PhaseStateSaved {
 			return result, err
 		}
@@ -692,13 +801,16 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	state, stateErr := LoadState(lifecycle.layout)
 	if stateErr == nil {
 		prior = &state
+		if err := lifecycle.validateRecordedActiveServiceBinding(prior); err != nil {
+			return ApplyResult{}, err
+		}
+		if err := lifecycle.verifyRecordedReleaseForApply(ctx, prior, desired); err != nil {
+			return ApplyResult{}, err
+		}
 	} else if !errors.Is(stateErr, ErrNoDeploymentState) {
 		return ApplyResult{}, stateErr
 	}
-	availability, err := lifecycle.manager.Detect(ctx, desired.BinaryPath, lifecycle.layout.StateDir)
-	if err != nil {
-		return ApplyResult{}, err
-	}
+	availability := preMutationAvailability
 	if prior != nil && prior.Status == StatusActive && !availability.Available {
 		return ApplyResult{}, errors.New("the active native user service manager is unavailable; refusing an implicit foreground transition")
 	}
@@ -728,12 +840,63 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	if err := lifecycle.injectCrash(PhasePlanned); err != nil {
 		return ApplyResult{}, err
 	}
-	result, err = lifecycle.runApply(ctx, &journal)
+	result, err = lifecycle.runApply(ctx, &journal, instanceLease.Initialize)
 	if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || journal.Phase == PhaseStateSaved {
 		return result, err
 	}
 	rollbackErr := lifecycle.restorePriorAfterFailedApply(ctx, journal)
 	return ApplyResult{}, errors.Join(err, rollbackErr)
+}
+
+func (lifecycle *Lifecycle) revalidateApplyManager(ctx context.Context, desired InstalledRelease, initial ManagerAvailability) (ManagerAvailability, error) {
+	current, err := lifecycle.manager.Detect(ctx, desired.BinaryPath, lifecycle.layout.StateDir)
+	if err != nil {
+		return ManagerAvailability{}, err
+	}
+	if err := lifecycle.validateApplyManager(desired, current); err != nil {
+		return ManagerAvailability{}, err
+	}
+	if !sameManagerAvailability(initial, current) {
+		return ManagerAvailability{}, errors.New("service-manager availability changed during apply preflight; rerun preview before applying")
+	}
+	return current, nil
+}
+
+func (lifecycle *Lifecycle) validateApplyManager(desired InstalledRelease, availability ManagerAvailability) error {
+	if err := validateManagerAvailability(lifecycle, desired, availability); err != nil {
+		return err
+	}
+	if availability.ServiceDefinition != "" {
+		return validateProspectiveServiceDefinition(lifecycle.layout, availability.ServiceDefinition)
+	}
+	return nil
+}
+
+func (lifecycle *Lifecycle) validateRecordedActiveServiceBinding(state *DeploymentState) error {
+	if state == nil || state.Status != StatusActive {
+		return nil
+	}
+	if state.Manager != lifecycle.manager.Kind() || state.ServiceDefinition != lifecycle.manager.DefinitionPath() {
+		return errors.New("recorded active service definition does not match the current user service manager")
+	}
+	return nil
+}
+
+func (lifecycle *Lifecycle) verifyRecordedReleaseForApply(ctx context.Context, state *DeploymentState, desired InstalledRelease) error {
+	if state == nil || state.Active == nil || state.Status == StatusUninstalled {
+		return nil
+	}
+	err := lifecycle.verifyPreviewRelease(ctx, *state.Active)
+	if err == nil {
+		return nil
+	}
+	// An exact idempotent request may restore missing immutable files from the
+	// already verified inputs. Upgrades require an intact prior release because
+	// it is the rollback target; corruption is never repairable implicitly.
+	if *state.Active == desired && errors.Is(err, errInstalledReleaseFilesMissing) {
+		return nil
+	}
+	return fmt.Errorf("verify recorded active release before apply: %w", err)
 }
 
 func (lifecycle *Lifecycle) validateIdempotentApply(ctx context.Context, state DeploymentState, availability ManagerAvailability, request ApplyRequest) (ApplyResult, error) {
@@ -776,7 +939,11 @@ func (lifecycle *Lifecycle) validateIdempotentApply(ctx context.Context, state D
 	return lifecycle.resultForState(state, availability.Foreground, "")
 }
 
-func (lifecycle *Lifecycle) runApply(ctx context.Context, journal *DeploymentJournal) (ApplyResult, error) {
+func (lifecycle *Lifecycle) runApply(
+	ctx context.Context,
+	journal *DeploymentJournal,
+	initialize func(context.Context, []string) (config.Settings, error),
+) (ApplyResult, error) {
 	if journal.Phase == PhaseStateSaved {
 		state, err := lifecycle.validateCommittedState(*journal)
 		if err != nil {
@@ -818,7 +985,7 @@ func (lifecycle *Lifecycle) runApply(ctx context.Context, journal *DeploymentJou
 	}
 
 	if !applyPhaseReached(journal.Phase, PhaseInstanceReady) {
-		if _, err := lifecycle.initialize(ctx, lifecycle.layout.StateDir, nil); err != nil {
+		if _, err := initialize(ctx, nil); err != nil {
 			return ApplyResult{}, err
 		}
 		if err := lifecycle.checkpoint(journal, PhaseInstanceReady); err != nil {

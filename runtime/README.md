@@ -62,13 +62,24 @@ device credentials are hashed before persistence.
 
 The `service render` and `service install` commands generate a systemd user
 unit or per-user LaunchAgent that executes the same foreground path without a
-credential in arguments, environment, or service files. The transactional
-`deploy apply`, `deploy recover`, `deploy status`, `deploy rollback`, and
-`deploy uninstall` commands validate an exact pinned release, publish its
-binary and LICENSE/NOTICE without replacement, preserve protected instance
-state, and drive only the current user's native service manager. Recognized
-manager absence returns an explicit supervised-foreground command; a manager
-failure is never silently treated as success.
+credential in arguments, environment, or service files. Before confirmation,
+`deploy preview` accepts the same pinned manifest, artifact, LICENSE, NOTICE,
+and layout arguments as `deploy apply`. It emits deterministic canonical JSON
+covering the exact identities, paths, native-manager or supervised-foreground
+outcome, existing transaction classification, remaining actions, preserved
+data, and loopback-only listeners. Preview verifies its inputs and probes the
+current-user service-manager domain without creating the install root, state
+directory, lifecycle lock or journal, service definition, instance, or release
+artifact. Discarding the result is therefore a complete cancellation.
+
+The transactional `deploy apply`, `deploy recover`, `deploy status`, `deploy
+rollback`, and `deploy uninstall` commands validate an exact pinned release,
+publish its binary and LICENSE/NOTICE without replacement, preserve protected
+instance state, and drive only the current user's native service manager.
+Apply detects the manager before its first mutation and revalidates the exact
+outcome before deployment work. Recognized manager absence returns an explicit
+supervised-foreground command; a manager failure or changed preflight outcome
+is never silently treated as success.
 
 Release builds contain one encoded identity covering release, source revision,
 exact Go patch toolchain, target-derived build identity, protocol version, and

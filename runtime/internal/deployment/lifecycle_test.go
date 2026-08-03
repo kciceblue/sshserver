@@ -4,16 +4,21 @@ package deployment
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/instance"
+	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
 func TestApplyTransactionCommitsExactNativeReleaseAndIsIdempotent(t *testing.T) {
@@ -51,6 +56,148 @@ func TestApplyTransactionCommitsExactNativeReleaseAndIsIdempotent(t *testing.T) 
 		if call == "install" || call == "activate" || call == "stop" || call == "remove" {
 			t.Fatalf("idempotent apply mutated service manager: %v", fixture.manager.calls[beforeCalls:])
 		}
+	}
+}
+
+func TestApplyRejectsDamagedRecordedReleaseBeforeMutation(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	first, _ := fixture.release(t, "v1.2.3", "apply-damaged-prior")
+	if _, err := fixture.lifecycle.Apply(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	upgrade, _ := fixture.release(t, "v1.2.4", "apply-damaged-upgrade")
+	fixture.lifecycle.verifyPreviewRelease = func(context.Context, InstalledRelease) error {
+		return errors.New("damaged installed release")
+	}
+	before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+	managerCallsBefore := len(fixture.manager.calls)
+	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+
+	if _, err := fixture.lifecycle.Apply(context.Background(), upgrade); err == nil ||
+		!strings.Contains(err.Error(), "verify recorded active release before apply") {
+		t.Fatalf("damaged recorded-release apply error=%v", err)
+	}
+	if len(fixture.manager.calls) != managerCallsBefore {
+		t.Fatalf("damaged recorded release reached manager preflight: %v", fixture.manager.calls[managerCallsBefore:])
+	}
+	if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+		t.Fatalf("damaged recorded release reached mutation stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+	}
+	if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+		t.Fatalf("damaged recorded-release preflight mutated target\n before=%+v\n after=%+v", before, after)
+	}
+	if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+		t.Fatalf("damaged recorded-release preflight created journal: %v", err)
+	}
+}
+
+func TestApplyRevalidatesInstanceUnderInitializationLeaseBeforeJournal(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	first, _ := fixture.release(t, "v1.2.3", "instance-lease-race-first")
+	if _, err := fixture.lifecycle.Apply(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	upgrade, desired := fixture.release(t, "v1.2.4", "instance-lease-race-upgrade")
+	originalAcquire := fixture.lifecycle.acquireInstanceLease
+	fixture.lifecycle.acquireInstanceLease = func(stateDir string) (instanceInitializationLease, error) {
+		lease, err := originalAcquire(stateDir)
+		if err != nil {
+			return nil, err
+		}
+		paths := config.ForStateDir(stateDir)
+		if err := os.WriteFile(paths.Database, []byte("not a SQLite database"), 0o600); err != nil {
+			lease.Close()
+			return nil, err
+		}
+		return lease, nil
+	}
+	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+	managerCallsBefore := len(fixture.manager.calls)
+
+	_, err := fixture.lifecycle.Apply(context.Background(), upgrade)
+	if err == nil || !strings.Contains(err.Error(), "deployment instance preflight is blocked under initialization lease: completed_instance_database_is_invalid") {
+		t.Fatalf("instance lease race error=%v", err)
+	}
+	if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+		t.Fatalf("instance lease race reached stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+	}
+	for _, call := range fixture.manager.calls[managerCallsBefore:] {
+		if call == "install" || call == "activate" || call == "stop" || call == "remove" {
+			t.Fatalf("instance lease race reached manager mutation: %v", fixture.manager.calls[managerCallsBefore:])
+		}
+	}
+	if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+		t.Fatalf("instance lease race created journal: %v", err)
+	}
+	if _, err := os.Lstat(desired.BinaryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("instance lease race published desired binary: %v", err)
+	}
+}
+
+func TestApplyResumesReviewedDatabaseStatesUnderInitializationLease(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*testing.T, config.Paths)
+	}{
+		{
+			name: "empty protected database",
+			mutate: func(t *testing.T, paths config.Paths) {
+				t.Helper()
+				if err := os.WriteFile(paths.Database, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "reviewed prior acceptance-origin schema",
+			mutate: func(t *testing.T, paths config.Paths) {
+				t.Helper()
+				database, err := sql.Open("sqlite3", "file:"+paths.Database)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := database.Exec("DROP TABLE revision_acceptance_origins"); err != nil {
+					database.Close()
+					t.Fatal(err)
+				}
+				if err := database.Close(); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newLifecycleFixture(t, false)
+			first, _ := fixture.release(t, "v1.2.3", "resumable-database-first-"+testCase.name)
+			if _, err := fixture.lifecycle.Apply(context.Background(), first); err != nil {
+				t.Fatal(err)
+			}
+			paths := config.ForStateDir(fixture.layout.StateDir)
+			for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+				if err := os.Remove(paths.Database + suffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+			}
+			testCase.mutate(t, paths)
+			if err := config.SaveMarker(paths.InstallMarker, config.InstallMarker{Generation: "1", Phase: "initializing", State: "resume"}); err != nil {
+				t.Fatal(err)
+			}
+			upgrade, desired := fixture.release(t, "v1.2.4", "resumable-database-upgrade-"+testCase.name)
+			result, err := fixture.lifecycle.Apply(context.Background(), upgrade)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.State.Active == nil || *result.State.Active != desired {
+				t.Fatalf("resumable database apply result=%+v", result)
+			}
+			opened, err := instance.Open(context.Background(), fixture.layout.StateDir)
+			if err != nil {
+				t.Fatalf("open resumed instance: %v", err)
+			}
+			if err := opened.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -228,6 +375,110 @@ func TestApplyRefusesImplicitFallbackForActiveNativeService(t *testing.T) {
 	state, err := LoadState(fixture.layout)
 	if err != nil || state.Active.Release != "v1.2.3" {
 		t.Fatalf("state=%+v err=%v", state, err)
+	}
+}
+
+func TestApplyRejectsRecordedActiveServiceDefinitionDriftBeforeMutation(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	firstRequest, _ := fixture.release(t, "v1.2.3", "definition-drift-prior")
+	if _, err := fixture.lifecycle.Apply(context.Background(), firstRequest); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadState(fixture.layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.ServiceDefinition = filepath.Join(fixture.layout.HomeDir, ".config", "systemd", "user", "drifted.service")
+	if err := SaveState(fixture.layout, state); err != nil {
+		t.Fatal(err)
+	}
+	secondRequest, secondRelease := fixture.release(t, "v1.2.4", "definition-drift-desired")
+	secondReleaseDir, err := fixture.layout.VersionDir(secondRelease.Release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager.calls = nil
+	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+
+	if _, err := fixture.lifecycle.Apply(context.Background(), secondRequest); err == nil || !strings.Contains(err.Error(), "recorded active service definition") {
+		t.Fatalf("definition drift error=%v", err)
+	}
+	if len(fixture.manager.calls) != 0 || fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+		t.Fatalf("definition drift reached mutation manager=%v stage/support/init=%d/%d/%d", fixture.manager.calls, fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+	}
+	if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+		t.Fatalf("definition drift created journal: %v", err)
+	}
+	if _, err := os.Lstat(secondReleaseDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("definition drift created desired release directory: %v", err)
+	}
+	retained, err := LoadState(fixture.layout)
+	if err != nil || retained.ServiceDefinition != state.ServiceDefinition || retained.Generation != state.Generation {
+		t.Fatalf("definition drift changed state=%+v err=%v", retained, err)
+	}
+}
+
+func TestApplyRejectsMatchingJournalPriorServiceDefinitionDriftBeforeResume(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	firstRequest, _ := fixture.release(t, "v1.2.3", "journal-definition-prior")
+	if _, err := fixture.lifecycle.Apply(context.Background(), firstRequest); err != nil {
+		t.Fatal(err)
+	}
+	prior, err := LoadState(fixture.layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior.ServiceDefinition = filepath.Join(fixture.layout.HomeDir, ".config", "systemd", "user", "drifted.service")
+	secondRequest, desired := fixture.release(t, "v1.2.4", "journal-definition-desired")
+	journal := DeploymentJournal{
+		StateVersion:      DeploymentStateVersion,
+		TransactionID:     strings.Repeat("c", 32),
+		Operation:         OperationApply,
+		Phase:             PhasePlanned,
+		Manager:           fixture.manager.kind,
+		ServiceDefinition: fixture.manager.definition,
+		SourcePath:        secondRequest.ArtifactPath,
+		LicenseSourcePath: secondRequest.LicensePath,
+		NoticeSourcePath:  secondRequest.NoticePath,
+		Desired:           &desired,
+		PriorState:        &prior,
+	}
+	if err := SaveJournal(fixture.layout, journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveState(fixture.layout); err != nil {
+		t.Fatal(err)
+	}
+	before, err := canonicalDeploymentJSON(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desiredReleaseDir, err := fixture.layout.VersionDir(desired.Release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager.calls = nil
+	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+
+	if _, err := fixture.lifecycle.Apply(context.Background(), secondRequest); err == nil || !strings.Contains(err.Error(), "recorded active service definition") {
+		t.Fatalf("journal definition drift error=%v", err)
+	}
+	if len(fixture.manager.calls) != 0 || fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+		t.Fatalf("journal definition drift resumed manager=%v stage/support/init=%d/%d/%d", fixture.manager.calls, fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+	}
+	afterJournal, err := LoadJournal(fixture.layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := canonicalDeploymentJSON(afterJournal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("rejected journal resume changed journal\n before=%s\n after=%s", before, after)
+	}
+	if _, err := os.Lstat(desiredReleaseDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal definition drift created desired release directory: %v", err)
 	}
 }
 
@@ -650,6 +901,19 @@ type lifecycleFixture struct {
 	removeCalls       int
 }
 
+type testInitializationLease struct {
+	initialize func(context.Context, []string) (config.Settings, error)
+	close      func() error
+}
+
+func (lease *testInitializationLease) Initialize(ctx context.Context, listeners []string) (config.Settings, error) {
+	return lease.initialize(ctx, listeners)
+}
+
+func (lease *testInitializationLease) Close() error {
+	return lease.close()
+}
+
 func newLifecycleFixture(t *testing.T, foreground bool) *lifecycleFixture {
 	t.Helper()
 	layout := testLayout(t)
@@ -681,9 +945,21 @@ func newLifecycleFixture(t *testing.T, foreground bool) *lifecycleFixture {
 		return filepath.Join(destination, name), nil
 	}
 	lifecycle.verifyReleaseFile = func(string, int64, string) error { return nil }
-	lifecycle.initialize = func(ctx context.Context, stateDir string, listeners []string) (settings config.Settings, err error) {
-		fixture.initializeCalls++
-		return instance.Initialize(ctx, stateDir, listeners)
+	lifecycle.verifySourceArtifact = func(string, InstalledRelease) error { return nil }
+	lifecycle.verifySourceReleaseFile = func(string, int64, string) error { return nil }
+	lifecycle.verifyPreviewRelease = func(context.Context, InstalledRelease) error { return nil }
+	lifecycle.acquireInstanceLease = func(stateDir string) (instanceInitializationLease, error) {
+		lease, err := instance.AcquireInitializationLease(stateDir)
+		if err != nil {
+			return nil, err
+		}
+		return &testInitializationLease{
+			initialize: func(ctx context.Context, listeners []string) (config.Settings, error) {
+				fixture.initializeCalls++
+				return lease.Initialize(ctx, listeners)
+			},
+			close: lease.Close,
+		}, nil
 	}
 	lifecycle.renderService = func(_, binary, _ string) ([]byte, error) { return []byte(binary), nil }
 	lifecycle.inspector = identityInspectorFunc(func(_ context.Context, path string) (buildinfo.Identity, error) {
@@ -764,26 +1040,35 @@ func (function identityInspectorFunc) Inspect(ctx context.Context, path string) 
 }
 
 type fakeServiceManager struct {
-	kind         ManagerKind
-	definition   string
-	availability ManagerAvailability
-	identities   map[string]buildinfo.Identity
-	failures     map[string]int
-	calls        []string
-	active       bool
-	pending      string
-	current      buildinfo.Identity
+	kind          ManagerKind
+	definition    string
+	availability  ManagerAvailability
+	detectResults []ManagerAvailability
+	identities    map[string]buildinfo.Identity
+	failures      map[string]int
+	calls         []string
+	active        bool
+	pending       string
+	current       buildinfo.Identity
 }
 
 func (manager *fakeServiceManager) Kind() ManagerKind      { return manager.kind }
 func (manager *fakeServiceManager) DefinitionPath() string { return manager.definition }
 
-func (manager *fakeServiceManager) Detect(context.Context, string, string) (ManagerAvailability, error) {
+func (manager *fakeServiceManager) Detect(_ context.Context, binaryPath, stateDir string) (ManagerAvailability, error) {
 	manager.calls = append(manager.calls, "detect")
 	if err := manager.fail("detect"); err != nil {
 		return ManagerAvailability{}, err
 	}
-	return manager.availability, nil
+	availability := cloneManagerAvailability(manager.availability)
+	if len(manager.detectResults) > 0 {
+		availability = cloneManagerAvailability(manager.detectResults[0])
+		manager.detectResults = manager.detectResults[1:]
+	}
+	if availability.Foreground != nil {
+		availability.Foreground.Command = []string{binaryPath, "serve", "--state-dir", stateDir}
+	}
+	return availability, nil
 }
 
 func (manager *fakeServiceManager) InstallDefinition(payload []byte) (string, error) {

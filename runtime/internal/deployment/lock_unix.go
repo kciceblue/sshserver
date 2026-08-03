@@ -27,6 +27,35 @@ func acquireDeploymentSharedLock(layout Layout) (*deploymentLock, error) {
 	return acquireDeploymentFileLock(layout, 0, unix.LOCK_SH)
 }
 
+// acquireDeploymentSharedLockIfPresent validates and shares an existing
+// lifecycle lock without creating it. Read-only preflight surfaces use this to
+// take a coherent snapshot while preserving the missing-layout cancellation
+// guarantee.
+func acquireDeploymentSharedLockIfPresent(layout Layout) (*deploymentLock, bool, error) {
+	lock, err := acquireDeploymentFileLock(layout, 0, unix.LOCK_SH)
+	if errors.Is(err, unix.ENOENT) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	return lock, true, nil
+}
+
+func validateExistingDeploymentLock(layout Layout) error {
+	lock, _, err := acquireDeploymentSharedLockIfPresent(layout)
+	if err != nil {
+		return err
+	}
+	if lock == nil {
+		return nil
+	}
+	if err := lock.Close(); err != nil {
+		return fmt.Errorf("release deployment preflight lock: %w", err)
+	}
+	return nil
+}
+
 func acquireDeploymentFileLock(layout Layout, openFlags, lockMode int) (*deploymentLock, error) {
 	fd, err := unix.Open(layout.LockPath, openFlags|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o600)
 	if err != nil {

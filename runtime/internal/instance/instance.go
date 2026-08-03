@@ -20,24 +20,61 @@ type Instance struct {
 	lock     *fileLock
 }
 
-func Initialize(ctx context.Context, stateDir string, requestedListeners []string) (returnSettings config.Settings, returnErr error) {
+// InitializationLease serializes validation and initialization of one state
+// directory. Deployment apply acquires it before its final instance preflight
+// and hands the same lease into Initialize, closing the race between validation
+// and the journaled initialization step.
+type InitializationLease struct {
+	stateDir string
+	lock     *fileLock
+}
+
+func AcquireInitializationLease(stateDir string) (*InitializationLease, error) {
 	paths := config.ForStateDir(stateDir)
 	if err := config.EnsureStateDirectory(paths.StateDir); err != nil {
-		return config.Settings{}, err
+		return nil, err
 	}
 	lock, err := acquireLock(paths.StateDir)
+	if err != nil {
+		return nil, err
+	}
+	return &InitializationLease{stateDir: paths.StateDir, lock: lock}, nil
+}
+
+func (lease *InitializationLease) Initialize(ctx context.Context, requestedListeners []string) (config.Settings, error) {
+	if lease == nil || lease.lock == nil {
+		return config.Settings{}, errors.New("initialization lease is closed")
+	}
+	return initializeWithLease(ctx, lease.stateDir, requestedListeners)
+}
+
+func (lease *InitializationLease) Close() error {
+	if lease == nil || lease.lock == nil {
+		return nil
+	}
+	err := lease.lock.Close()
+	lease.lock = nil
+	return err
+}
+
+func Initialize(ctx context.Context, stateDir string, requestedListeners []string) (returnSettings config.Settings, returnErr error) {
+	lease, err := AcquireInitializationLease(stateDir)
 	if err != nil {
 		return config.Settings{}, err
 	}
 	defer func() {
-		if closeErr := lock.Close(); closeErr != nil {
+		if closeErr := lease.Close(); closeErr != nil {
 			returnErr = errors.Join(
 				returnErr,
 				fmt.Errorf("release initialization lock: %w", closeErr),
 			)
 		}
 	}()
+	return lease.Initialize(ctx, requestedListeners)
+}
 
+func initializeWithLease(ctx context.Context, stateDir string, requestedListeners []string) (returnSettings config.Settings, returnErr error) {
+	paths := config.ForStateDir(stateDir)
 	marker, markerErr := config.LoadMarker(paths.InstallMarker)
 	markerExists := markerErr == nil
 	if markerErr != nil && !errors.Is(markerErr, os.ErrNotExist) {

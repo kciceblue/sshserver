@@ -5,6 +5,7 @@ package deployment
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
+	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/instance"
 )
 
@@ -120,6 +122,7 @@ func TestRealNativeBinaryStagesAttestsRunsAndUninstalls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manifestSource := writeIntegrationUpload(t, uploadDir, "release-manifest.json", manifestPayload)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -143,19 +146,125 @@ func TestRealNativeBinaryStagesAttestsRunsAndUninstalls(t *testing.T) {
 		failures:     make(map[string]int),
 	}
 	lifecycle := newLifecycle(layout, target, manager)
-	result, err := lifecycle.Apply(context.Background(), ApplyRequest{
+	applyRequest := ApplyRequest{
 		ManifestPayload: manifestPayload,
 		ManifestSHA256:  SHA256Hex(manifestPayload),
 		ArtifactPath:    binarySource,
 		LicensePath:     licenseSource,
 		NoticePath:      noticeSource,
-	})
+	}
+	configBefore, err := os.ReadFile(config.ForStateDir(layout.StateDir).Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previewRequest := PreviewRequest{
+		ManifestPath: manifestSource, ManifestPayload: manifestPayload, ManifestSHA256: SHA256Hex(manifestPayload),
+		ArtifactPath: binarySource, LicensePath: licenseSource, NoticePath: noticeSource,
+	}
+	preview, err := lifecycle.Preview(context.Background(), previewRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Classification != PreviewFresh || !preview.ApplyAllowed || preview.Existing.InstanceState != "ready" {
+		t.Fatalf("real artifact preview=%+v", preview)
+	}
+	firstCanonical, err := preview.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCanonical, err := preview.CanonicalBytes()
+	if err != nil || !bytes.Equal(firstCanonical, secondCanonical) {
+		t.Fatalf("real artifact preview is nondeterministic: %v", err)
+	}
+	configAfter, err := os.ReadFile(config.ForStateDir(layout.StateDir).Config)
+	if err != nil || !bytes.Equal(configBefore, configAfter) {
+		t.Fatalf("preview changed protected instance config: %v", err)
+	}
+	for _, path := range []string{installedBinary, layout.StatePath, layout.JournalPath, layout.LockPath} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("preview created target-layout artifact %s: %v", path, err)
+		}
+	}
+
+	result, err := lifecycle.Apply(context.Background(), applyRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Status != "foreground_required" || result.Foreground == nil ||
 		fmt.Sprint(result.Foreground.Command) != fmt.Sprint([]string{installedBinary, "serve", "--state-dir", layout.StateDir}) {
 		t.Fatalf("apply result=%+v", result)
+	}
+	installedLicense := filepath.Join(filepath.Dir(installedBinary), "LICENSE")
+	installedNotice := filepath.Join(filepath.Dir(installedBinary), "NOTICE")
+	for _, repair := range []struct {
+		name   string
+		path   string
+		verify func() error
+	}{
+		{
+			name: "binary", path: installedBinary,
+			verify: func() error {
+				if err := VerifyStagedArtifact(installedBinary, int64(len(binaryPayload)), SHA256Hex(binaryPayload)); err != nil {
+					return err
+				}
+				return VerifyArtifactSource(installedBinary, *result.State.Active)
+			},
+		},
+		{name: "LICENSE", path: installedLicense, verify: func() error {
+			return VerifyStagedReleaseFile(installedLicense, int64(len(licensePayload)), SHA256Hex(licensePayload))
+		}},
+		{name: "NOTICE", path: installedNotice, verify: func() error {
+			return VerifyStagedReleaseFile(installedNotice, int64(len(noticePayload)), SHA256Hex(noticePayload))
+		}},
+	} {
+		t.Run("idempotent repair missing "+repair.name, func(t *testing.T) {
+			if err := os.Remove(repair.path); err != nil {
+				t.Fatal(err)
+			}
+			repairPreview, err := lifecycle.Preview(context.Background(), previewRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if repairPreview.Classification != PreviewIdempotent || !repairPreview.ApplyAllowed || repairPreview.BlockReason != "" {
+				t.Fatalf("missing %s preview=%+v", repair.name, repairPreview)
+			}
+			assertPreviewAction(t, repairPreview.Actions, "verify_or_reuse_artifact", installedBinary, binarySource)
+			assertPreviewAction(t, repairPreview.Actions, "verify_or_reuse_license", installedLicense, licenseSource)
+			assertPreviewAction(t, repairPreview.Actions, "verify_or_reuse_notice", installedNotice, noticeSource)
+			if _, err := lifecycle.Apply(context.Background(), applyRequest); err != nil {
+				t.Fatalf("repair missing %s: %v", repair.name, err)
+			}
+			if err := repair.verify(); err != nil {
+				t.Fatalf("verify repaired %s: %v", repair.name, err)
+			}
+		})
+	}
+
+	if err := os.Chmod(installedNotice, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(installedNotice, bytes.Repeat([]byte{'x'}, len(noticePayload)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(installedNotice, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	tamperedPreview, err := lifecycle.Preview(context.Background(), previewRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tamperedPreview.Classification != PreviewBlocked || tamperedPreview.ApplyAllowed ||
+		tamperedPreview.BlockReason != "installed_release_verification_failed" {
+		t.Fatalf("tampered installed NOTICE preview=%+v", tamperedPreview)
+	}
+	if _, err := lifecycle.Apply(context.Background(), applyRequest); err == nil {
+		t.Fatal("idempotent apply replaced a present tampered NOTICE")
+	}
+	if err := os.Remove(installedNotice); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lifecycle.Apply(context.Background(), applyRequest); err != nil {
+		t.Fatalf("repair removed tampered NOTICE: %v", err)
 	}
 
 	var stdout, stderr bytes.Buffer
