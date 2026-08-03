@@ -52,7 +52,7 @@ type Lifecycle struct {
 	verifySourceArtifact    func(string, InstalledRelease) error
 	verifySourceReleaseFile func(string, int64, string) error
 	verifyPreviewRelease    func(context.Context, InstalledRelease) error
-	acquireInstanceLease    func(string) (instanceInitializationLease, error)
+	acquireInstanceLease    func(string, bool) (instanceInitializationLease, error)
 	renderService           func(string, string, string) ([]byte, error)
 	probeRunning            func(context.Context, string) (buildinfo.Identity, error)
 	removeArtifacts         func(Layout) error
@@ -655,8 +655,8 @@ func newLifecycle(layout Layout, target Target, manager serviceController) *Life
 		verifyPreviewRelease: func(ctx context.Context, release InstalledRelease) error {
 			return verifyInstalledReleaseForPreview(ctx, layout, release)
 		},
-		acquireInstanceLease: func(stateDir string) (instanceInitializationLease, error) {
-			return instance.AcquireInitializationLease(stateDir)
+		acquireInstanceLease: func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
+			return instance.AcquireInitializationLeaseWithLockPresence(stateDir, initializationLockPresent)
 		},
 		renderService:   service.Render,
 		probeRunning:    ProbeRunningIdentity,
@@ -876,8 +876,18 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	if err := PrepareDeploymentStateDirectory(lifecycle.layout); err != nil {
 		return ApplyResult{}, err
 	}
-	instanceLease, err := lifecycle.acquireInstanceLease(lifecycle.layout.StateDir)
+	instanceLease, err := lifecycle.acquireInstanceLease(
+		lifecycle.layout.StateDir,
+		confirmedPreview.Existing.InitializationLockPresent,
+	)
 	if err != nil {
+		if errors.Is(err, os.ErrExist) || errors.Is(err, os.ErrNotExist) {
+			return ApplyResult{}, fmt.Errorf(
+				"initialization lock presence changed from the confirmed deployment preview (%v): %w",
+				err,
+				ErrDeploymentPreviewConfirmationMismatch,
+			)
+		}
 		return ApplyResult{}, err
 	}
 	defer func() {

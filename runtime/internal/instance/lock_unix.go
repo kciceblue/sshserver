@@ -15,17 +15,48 @@ type fileLock struct {
 	created bool
 }
 
+type lockOpenMode uint8
+
+const (
+	lockCreateOrOpen lockOpenMode = iota
+	lockCreateOnly
+	lockOpenOnly
+)
+
 func acquireLock(stateDir string) (*fileLock, error) {
 	return acquireNamedLock(stateDir, ".instance.lock", "another initialization is already running")
 }
 
+func acquireLockWithPresence(stateDir string, present bool) (*fileLock, error) {
+	mode := lockCreateOnly
+	if present {
+		mode = lockOpenOnly
+	}
+	return acquireNamedLockMode(stateDir, ".instance.lock", "another initialization is already running", mode)
+}
+
 func acquireNamedLock(stateDir, name, busyMessage string) (*fileLock, error) {
+	return acquireNamedLockMode(stateDir, name, busyMessage, lockCreateOrOpen)
+}
+
+func acquireNamedLockMode(stateDir, name, busyMessage string, mode lockOpenMode) (*fileLock, error) {
 	path := filepath.Join(stateDir, name)
 	flags := syscall.O_RDWR | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
-	fd, err := syscall.Open(path, flags|syscall.O_CREAT|syscall.O_EXCL, 0o600)
-	created := err == nil
-	if errors.Is(err, syscall.EEXIST) {
+	created := false
+	var fd int
+	var err error
+	switch mode {
+	case lockCreateOnly:
+		fd, err = syscall.Open(path, flags|syscall.O_CREAT|syscall.O_EXCL, 0o600)
+		created = err == nil
+	case lockOpenOnly:
 		fd, err = syscall.Open(path, flags, 0)
+	default:
+		fd, err = syscall.Open(path, flags|syscall.O_CREAT|syscall.O_EXCL, 0o600)
+		created = err == nil
+		if errors.Is(err, syscall.EEXIST) {
+			fd, err = syscall.Open(path, flags, 0)
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("open instance lock: %w", err)

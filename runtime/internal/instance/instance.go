@@ -37,11 +37,29 @@ func (lease *InitializationLease) InitializationLockCreated() bool {
 }
 
 func AcquireInitializationLease(stateDir string) (*InitializationLease, error) {
+	return acquireInitializationLease(stateDir, nil)
+}
+
+// AcquireInitializationLeaseWithLockPresence takes a lease without changing
+// the caller's previously confirmed lock-path presence. A present lock is
+// opened without O_CREATE; an absent lock is created with O_EXCL and is never
+// silently replaced by opening a concurrently created path.
+func AcquireInitializationLeaseWithLockPresence(stateDir string, lockPresent bool) (*InitializationLease, error) {
+	return acquireInitializationLease(stateDir, &lockPresent)
+}
+
+func acquireInitializationLease(stateDir string, lockPresent *bool) (*InitializationLease, error) {
 	paths := config.ForStateDir(stateDir)
 	if err := config.EnsureStateDirectory(paths.StateDir); err != nil {
 		return nil, err
 	}
-	lock, err := acquireLock(paths.StateDir)
+	var lock *fileLock
+	var err error
+	if lockPresent == nil {
+		lock, err = acquireLock(paths.StateDir)
+	} else {
+		lock, err = acquireLockWithPresence(paths.StateDir, *lockPresent)
+	}
 	if err != nil {
 		return nil, err
 	}

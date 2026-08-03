@@ -154,12 +154,12 @@ func TestDeploymentPreviewDisclosesInitializationLeaseBeforeJournalOrIdempotentW
 
 		originalAcquire := fixture.lifecycle.acquireInstanceLease
 		acquiredBeforeJournal := false
-		fixture.lifecycle.acquireInstanceLease = func(stateDir string) (instanceInitializationLease, error) {
+		fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
 			if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
 				return nil, fmt.Errorf("initialization lease reached after journal creation: %w", err)
 			}
 			acquiredBeforeJournal = true
-			return originalAcquire(stateDir)
+			return originalAcquire(stateDir, initializationLockPresent)
 		}
 		canonical, err := preview.CanonicalBytes()
 		if err != nil {
@@ -901,7 +901,7 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 		request.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
 		originalAcquire := fixture.lifecycle.acquireInstanceLease
 		acquiredBeforeRemainingLayout := false
-		fixture.lifecycle.acquireInstanceLease = func(stateDir string) (instanceInitializationLease, error) {
+		fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
 			if _, err := os.Lstat(fixture.layout.VersionsDir); !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("versions directory was prepared before initialization lease: %v", err)
 			}
@@ -916,7 +916,7 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 				return nil, errors.New("initialization lease reached without lifecycle lock")
 			}
 			acquiredBeforeRemainingLayout = true
-			return originalAcquire(stateDir)
+			return originalAcquire(stateDir, initializationLockPresent)
 		}
 		if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
 			t.Fatalf("resume with locked layout repair: %v", err)
@@ -1093,6 +1093,76 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 	})
 }
 
+func TestNonApplyRecoveryPreviewMirrorsMutationAdmissionAndLayoutOrder(t *testing.T) {
+	for _, operation := range []Operation{OperationRollback, OperationUninstall} {
+		for _, lifecycleLockPresent := range []bool{true, false} {
+			name := fmt.Sprintf("%s/lifecycle-lock-present-%t", operation, lifecycleLockPresent)
+			t.Run(name, func(t *testing.T) {
+				fixture := newLifecycleFixture(t, false)
+				request, _ := fixture.release(t, "v1.2.3", name+"-installed")
+				if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
+					t.Fatal(err)
+				}
+				if operation == OperationRollback {
+					request, _ = fixture.release(t, "v1.2.4", name+"-active")
+					if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				fixture.lifecycle.failAfterPhase = PhasePlanned
+				var err error
+				if operation == OperationRollback {
+					_, err = fixture.lifecycle.Rollback(context.Background())
+				} else {
+					_, err = fixture.lifecycle.Uninstall(context.Background())
+				}
+				if !errors.Is(err, ErrInjectedDeploymentCrash) {
+					t.Fatalf("injected %s error=%v", operation, err)
+				}
+				fixture.lifecycle.failAfterPhase = ""
+				if !lifecycleLockPresent {
+					if err := os.Remove(fixture.layout.LockPath); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+				preview, err := fixture.lifecycle.Preview(context.Background(), request.previewRequest())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if preview.Classification != PreviewResumeOrRecoveryRequired || preview.ApplyAllowed ||
+					preview.BlockReason != "different_deployment_transaction_requires_matching_recovery" ||
+					preview.Existing.Journal == nil || preview.Existing.Journal.Operation != operation ||
+					preview.Existing.LifecycleLockPresent != lifecycleLockPresent {
+					t.Fatalf("%s recovery preview=%+v", operation, preview)
+				}
+				expectedPrefix := []string{"acquire_bootstrap_lock"}
+				if lifecycleLockPresent {
+					expectedPrefix = append(expectedPrefix, "acquire_lifecycle_lock")
+				} else {
+					expectedPrefix = append(expectedPrefix, "prepare_install_root", "create_lifecycle_lock", "acquire_lifecycle_lock")
+				}
+				expectedPrefix = append(expectedPrefix,
+					"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "recover_existing_transaction",
+				)
+				assertPreviewActionPrefix(t, preview.Actions, expectedPrefix...)
+				assertPreviewActionsExclude(t, preview.Actions, "create_initialization_lock", "acquire_initialization_lock")
+				recovery := preview.Actions[len(preview.Actions)-1]
+				if recovery.Path != fixture.layout.JournalPath || len(recovery.Arguments) != 2 ||
+					recovery.Arguments[0] != string(operation) || recovery.Arguments[1] != string(PhasePlanned) {
+					t.Fatalf("%s recovery action=%+v", operation, recovery)
+				}
+				assertCanonicalPreview(t, preview)
+				if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+					t.Fatalf("%s recovery preview mutated target\n before=%+v\n after=%+v", operation, before, after)
+				}
+			})
+		}
+	}
+}
+
 func TestDeploymentPreviewAndApplyManagerPreflightDoNotMutateOnCancelOrFailure(t *testing.T) {
 	template := newLifecycleFixture(t, false)
 	request, _ := template.release(t, "v1.2.3", "zero-mutation")
@@ -1140,7 +1210,7 @@ func TestApplyRevalidatesManagerBeforeDeploymentActions(t *testing.T) {
 		stageCalls++
 		return "", errors.New("unexpected stage")
 	}
-	lifecycle.acquireInstanceLease = func(string) (instanceInitializationLease, error) {
+	lifecycle.acquireInstanceLease = func(string, bool) (instanceInitializationLease, error) {
 		leaseCalls++
 		return nil, errors.New("unexpected initialization lease")
 	}

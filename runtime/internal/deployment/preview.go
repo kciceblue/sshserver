@@ -694,16 +694,7 @@ func appendPreviewApplyPreparation(
 	preview DeploymentPreview,
 	appendAction func(category, operation, path string, arguments ...string),
 ) {
-	// Apply always takes the existing home directory as its nonpersistent
-	// first-operation admission lock. A missing lifecycle lock requires the
-	// install root before that lock can be created; an existing lock does not.
-	appendAction("state", "acquire_bootstrap_lock", preview.Paths.HomeDir)
-	if !preview.Existing.LifecycleLockPresent {
-		appendAction("filesystem", "prepare_install_root", preview.Paths.InstallRoot)
-	}
-	for _, operation := range previewLifecycleLockOperations(preview) {
-		appendAction("state", operation, preview.Paths.LifecycleLock)
-	}
+	appendPreviewMutationAdmission(preview, appendAction)
 
 	// Under the lifecycle lock, Apply prepares only the state directory needed
 	// for its initialization lease, then acquires that lease before rebuilding
@@ -712,6 +703,30 @@ func appendPreviewApplyPreparation(
 	for _, operation := range previewInitializationLockOperations(preview) {
 		appendAction("state", operation, preview.Paths.InitializationLock)
 	}
+	appendPreviewLayoutPreparation(preview, appendAction)
+}
+
+func appendPreviewMutationAdmission(
+	preview DeploymentPreview,
+	appendAction func(category, operation, path string, arguments ...string),
+) {
+	// Every lifecycle mutation takes the existing home directory as its
+	// nonpersistent first-operation admission lock. A missing lifecycle lock
+	// requires the install root before that lock can be created; an existing
+	// lock does not.
+	appendAction("state", "acquire_bootstrap_lock", preview.Paths.HomeDir)
+	if !preview.Existing.LifecycleLockPresent {
+		appendAction("filesystem", "prepare_install_root", preview.Paths.InstallRoot)
+	}
+	for _, operation := range previewLifecycleLockOperations(preview) {
+		appendAction("state", operation, preview.Paths.LifecycleLock)
+	}
+}
+
+func appendPreviewLayoutPreparation(
+	preview DeploymentPreview,
+	appendAction func(category, operation, path string, arguments ...string),
+) {
 	appendAction("filesystem", "prepare_install_root", preview.Paths.InstallRoot)
 	appendAction("filesystem", "prepare_versions_directory", preview.Paths.VersionsDir)
 	appendAction("filesystem", "prepare_state_directory", preview.Paths.StateDir)
@@ -732,17 +747,22 @@ func previewInitializationLockOperations(preview DeploymentPreview) []string {
 }
 
 func previewRecoveryActions(preview DeploymentPreview, journal DeploymentJournal) []PreviewAction {
-	actions := make([]PreviewAction, 0, 3)
-	for _, operation := range previewLifecycleLockOperations(preview) {
+	actions := make([]PreviewAction, 0, 9)
+	appendAction := func(category, operation, path string, arguments ...string) {
 		actions = append(actions, PreviewAction{
-			Sequence: len(actions) + 1, Category: "state", Operation: operation,
-			Path: preview.Paths.LifecycleLock, Arguments: []string{},
+			Sequence: len(actions) + 1, Category: category, Operation: operation,
+			Path: path, Arguments: append([]string{}, arguments...),
 		})
 	}
-	actions = append(actions, PreviewAction{
-		Sequence: len(actions) + 1, Category: "state", Operation: "recover_existing_transaction",
-		Path: preview.Paths.DeploymentJournal, Arguments: []string{string(journal.Operation), string(journal.Phase)},
-	})
+	if journal.Operation == OperationApply {
+		appendPreviewApplyPreparation(preview, appendAction)
+	} else {
+		// Rollback and uninstall acquire the common bootstrap/lifecycle locks and
+		// then run PrepareLayout before loading and resuming their journal.
+		appendPreviewMutationAdmission(preview, appendAction)
+		appendPreviewLayoutPreparation(preview, appendAction)
+	}
+	appendAction("state", "recover_existing_transaction", preview.Paths.DeploymentJournal, string(journal.Operation), string(journal.Phase))
 	return actions
 }
 
