@@ -71,9 +71,11 @@ data, and loopback-only listeners. Preview verifies its inputs and probes the
 current-user service-manager domain without creating the install root, state
 directory, lifecycle or initialization lock, journal, service definition,
 instance, or release artifact. Its exact action sequence records whether each
-lock must be created and always records both lock acquisitions before journal
-or idempotent release work. Discarding the result is therefore a complete
-cancellation.
+lock must be created and records bootstrap admission, lifecycle locking, and
+the initialization lease in Apply order before the remaining layout repair,
+journal, or idempotent release work. A journal already checkpointed at
+`state_saved` is resumable only when the saved deployment state exactly matches
+that transaction. Discarding the result is therefore a complete cancellation.
 
 The transactional `deploy apply` and `deploy recover` require the SHA-256 of
 the exact canonical preview bytes, including their terminal newline. They

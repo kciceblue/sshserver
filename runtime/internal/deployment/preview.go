@@ -33,7 +33,7 @@ var errInstalledReleaseFilesMissing = errors.New("installed release files are mi
 
 var previewActionOperations = map[string]bool{
 	"prepare_install_root": true, "prepare_versions_directory": true, "prepare_release_directory": true,
-	"prepare_state_directory": true, "create_lifecycle_lock": true, "acquire_lifecycle_lock": true,
+	"prepare_state_directory": true, "acquire_bootstrap_lock": true, "create_lifecycle_lock": true, "acquire_lifecycle_lock": true,
 	"create_initialization_lock": true, "acquire_initialization_lock": true,
 	"create_apply_journal": true, "resume_apply_journal": true, "rebind_apply_journal_inputs": true,
 	"recover_existing_transaction": true, "publish_verified_artifact": true, "publish_verified_license": true,
@@ -67,6 +67,7 @@ var previewBlockReasons = map[string]bool{
 	"recovery_release_verification_failed":                          true,
 	"running_release_identity_does_not_match":                       true,
 	"service_manager_changed_during_recovery":                       true,
+	"saved_deployment_state_does_not_match_recovering_transaction":  true,
 	"supervised_foreground_runtime_must_stop_before_apply":          true,
 	"unknown_foreground_runtime_uses_protected_instance":            true,
 }
@@ -502,6 +503,11 @@ func (lifecycle *Lifecycle) classifyJournalPreview(ctx context.Context, preview 
 		preview.Actions = []PreviewAction{}
 		return finishPreview(preview)
 	}
+	if journal.Phase == PhaseStateSaved {
+		if preview.Existing.State == nil || lifecycle.validateCommittedStateValue(journal, *preview.Existing.State) != nil {
+			return finishRecoveryUnavailable(preview, "saved_deployment_state_does_not_match_recovering_transaction")
+		}
+	}
 	if journal.PriorState != nil && journal.PriorState.Status == StatusForeground &&
 		!applyPhaseReached(journal.Phase, PhasePriorServiceStopped) {
 		if reason := lifecycle.foregroundRuntimePreviewBlockReason(ctx, journal.PriorState); reason != "" {
@@ -596,29 +602,10 @@ func previewApplyActions(preview DeploymentPreview, prior *DeploymentState, jour
 	appendAction := func(category, operation, path string, arguments ...string) {
 		actions = append(actions, PreviewAction{Sequence: len(actions) + 1, Category: category, Operation: operation, Path: path, Arguments: append([]string{}, arguments...)})
 	}
+	appendPreviewApplyPreparation(preview, appendAction)
 	if journal == nil {
-		appendAction("filesystem", "prepare_install_root", preview.Paths.InstallRoot)
-		appendAction("filesystem", "prepare_versions_directory", preview.Paths.VersionsDir)
-		appendAction("filesystem", "prepare_state_directory", preview.Paths.StateDir)
-		for _, operation := range previewLifecycleLockOperations(preview) {
-			appendAction("state", operation, preview.Paths.LifecycleLock)
-		}
-		for _, operation := range previewInitializationLockOperations(preview) {
-			appendAction("state", operation, preview.Paths.InitializationLock)
-		}
 		appendAction("state", "create_apply_journal", preview.Paths.DeploymentJournal, string(PhasePlanned))
 	} else {
-		// Apply prepares every structural directory before resuming a journal;
-		// keep those potentially persistent repairs inside the confirmed plan.
-		appendAction("filesystem", "prepare_install_root", preview.Paths.InstallRoot)
-		appendAction("filesystem", "prepare_versions_directory", preview.Paths.VersionsDir)
-		appendAction("filesystem", "prepare_state_directory", preview.Paths.StateDir)
-		for _, operation := range previewLifecycleLockOperations(preview) {
-			appendAction("state", operation, preview.Paths.LifecycleLock)
-		}
-		for _, operation := range previewInitializationLockOperations(preview) {
-			appendAction("state", operation, preview.Paths.InitializationLock)
-		}
 		appendAction("state", "resume_apply_journal", preview.Paths.DeploymentJournal, journal.TransactionID, string(journal.Phase))
 		if journal.Phase == PhasePlanned &&
 			(journal.SourcePath != preview.Inputs.Artifact.SourcePath ||
@@ -690,15 +677,7 @@ func previewIdempotentActions(preview DeploymentPreview, state DeploymentState) 
 	appendAction := func(category, operation, path string, arguments ...string) {
 		actions = append(actions, PreviewAction{Sequence: len(actions) + 1, Category: category, Operation: operation, Path: path, Arguments: append([]string{}, arguments...)})
 	}
-	appendAction("filesystem", "prepare_install_root", preview.Paths.InstallRoot)
-	appendAction("filesystem", "prepare_versions_directory", preview.Paths.VersionsDir)
-	appendAction("filesystem", "prepare_state_directory", preview.Paths.StateDir)
-	for _, operation := range previewLifecycleLockOperations(preview) {
-		appendAction("state", operation, preview.Paths.LifecycleLock)
-	}
-	for _, operation := range previewInitializationLockOperations(preview) {
-		appendAction("state", operation, preview.Paths.InitializationLock)
-	}
+	appendPreviewApplyPreparation(preview, appendAction)
 	appendAction("filesystem", "prepare_release_directory", preview.Paths.ReleaseDir)
 	appendAction("filesystem", "verify_or_reuse_artifact", preview.Paths.BinaryPath, preview.Inputs.Artifact.SourcePath)
 	appendAction("filesystem", "verify_or_reuse_license", preview.Paths.LicensePath, preview.Inputs.License.SourcePath)
@@ -709,6 +688,33 @@ func previewIdempotentActions(preview DeploymentPreview, state DeploymentState) 
 		appendAction("health", "verify_running_release_identity_and_loopback_health", preview.Paths.AdminSocket, preview.Release.BuildIdentity)
 	}
 	return actions
+}
+
+func appendPreviewApplyPreparation(
+	preview DeploymentPreview,
+	appendAction func(category, operation, path string, arguments ...string),
+) {
+	// Apply always takes the existing home directory as its nonpersistent
+	// first-operation admission lock. A missing lifecycle lock requires the
+	// install root before that lock can be created; an existing lock does not.
+	appendAction("state", "acquire_bootstrap_lock", preview.Paths.HomeDir)
+	if !preview.Existing.LifecycleLockPresent {
+		appendAction("filesystem", "prepare_install_root", preview.Paths.InstallRoot)
+	}
+	for _, operation := range previewLifecycleLockOperations(preview) {
+		appendAction("state", operation, preview.Paths.LifecycleLock)
+	}
+
+	// Under the lifecycle lock, Apply prepares only the state directory needed
+	// for its initialization lease, then acquires that lease before rebuilding
+	// the confirmed plan. Full layout preparation follows both locks.
+	appendAction("filesystem", "prepare_state_directory", preview.Paths.StateDir)
+	for _, operation := range previewInitializationLockOperations(preview) {
+		appendAction("state", operation, preview.Paths.InitializationLock)
+	}
+	appendAction("filesystem", "prepare_install_root", preview.Paths.InstallRoot)
+	appendAction("filesystem", "prepare_versions_directory", preview.Paths.VersionsDir)
+	appendAction("filesystem", "prepare_state_directory", preview.Paths.StateDir)
 }
 
 func previewLifecycleLockOperations(preview DeploymentPreview) []string {

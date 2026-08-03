@@ -1367,11 +1367,18 @@ func (lifecycle *Lifecycle) validateCommittedState(journal DeploymentJournal) (D
 	if err != nil {
 		return DeploymentState{}, err
 	}
-	want := lifecycle.committedApplyState(journal)
-	if !sameDeploymentState(state, want) {
-		return DeploymentState{}, errors.New("saved deployment state does not match the recovering transaction")
+	if err := lifecycle.validateCommittedStateValue(journal, state); err != nil {
+		return DeploymentState{}, err
 	}
 	return state, nil
+}
+
+func (lifecycle *Lifecycle) validateCommittedStateValue(journal DeploymentJournal, state DeploymentState) error {
+	want := lifecycle.committedApplyState(journal)
+	if !sameDeploymentState(state, want) {
+		return errors.New("saved deployment state does not match the recovering transaction")
+	}
+	return nil
 }
 
 func (lifecycle *Lifecycle) restorePriorAfterFailedApply(ctx context.Context, journal DeploymentJournal) error {
