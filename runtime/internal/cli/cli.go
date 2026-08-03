@@ -29,8 +29,9 @@ import (
 )
 
 type Runner struct {
-	Stdout io.Writer
-	Stderr io.Writer
+	Stdout         io.Writer
+	Stderr         io.Writer
+	executablePath func() (string, error)
 }
 
 func (runner Runner) Run(ctx context.Context, args []string) int {
@@ -418,16 +419,17 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 	if format != "json" {
 		return errors.New("enrollment create supports only --format=json")
 	}
-	var deploymentBinding *deployment.ActiveExecutableBinding
-	if stateDir == "" {
-		executable, err := os.Executable()
-		if err != nil {
-			return errors.New("enrollment executable path is unavailable")
-		}
-		stateDir, deploymentBinding, err = commandStateForExecutable(executable)
-		if err != nil {
-			return errors.New("enrollment instance state is unavailable")
-		}
+	executablePath := runner.executablePath
+	if executablePath == nil {
+		executablePath = os.Executable
+	}
+	executable, err := executablePath()
+	if err != nil {
+		return errors.New("enrollment executable path is unavailable")
+	}
+	stateDir, deploymentBinding, err := enrollmentStateForExecutable(executable, stateDir)
+	if err != nil {
+		return errors.New("enrollment instance state is unavailable")
 	}
 	if err := config.EnsureStateDirectory(stateDir); err != nil {
 		return err
@@ -553,6 +555,24 @@ func (runner Runner) runEndpointShow(args []string) error {
 func stateDirForExecutable(executable string) (string, error) {
 	stateDir, _, err := commandStateForExecutable(executable)
 	return stateDir, err
+}
+
+func enrollmentStateForExecutable(executable, explicitStateDir string) (string, *deployment.ActiveExecutableBinding, error) {
+	binding, err := deployment.ActiveExecutableForExecutable(executable)
+	if errors.Is(err, deployment.ErrNotDeployedExecutable) {
+		if explicitStateDir != "" {
+			return explicitStateDir, nil, nil
+		}
+		stateDir, err := config.DefaultStateDir()
+		return stateDir, nil, err
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	if explicitStateDir != "" && explicitStateDir != binding.StateDir {
+		return "", nil, errors.New("explicit enrollment state directory does not match the active deployment")
+	}
+	return binding.StateDir, &binding, nil
 }
 
 func commandStateForExecutable(executable string) (string, *deployment.ActiveExecutableBinding, error) {

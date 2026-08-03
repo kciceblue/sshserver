@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -644,6 +645,78 @@ func assertEndpointShowFails(t *testing.T, stateDir, want string) {
 	}
 }
 
+func managedEnrollmentCLIFixture(t *testing.T) (deployment.Layout, deployment.ActiveExecutableBinding) {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHome, err := os.MkdirTemp(home, ".sshserver-cli-managed-enrollment-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(testHome) })
+	if err := os.Chmod(testHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := deployment.NewLayout(testHome, filepath.Join(testHome, "deployment"), filepath.Join(testHome, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deployment.PrepareLayout(layout); err != nil {
+		t.Fatal(err)
+	}
+	target := deployment.Target{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+	binaryPath, err := layout.BinaryPath("v1.2.3", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(binaryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binary := []byte("test executable")
+	if err := os.WriteFile(binaryPath, binary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	release := deployment.InstalledRelease{
+		Release:         "v1.2.3",
+		SourceRevision:  strings.Repeat("a", 40),
+		BuildToolchain:  "go1.25.0",
+		BuildIdentity:   strings.Repeat("a", 64),
+		ManifestSHA256:  strings.Repeat("a", 64),
+		ProtocolVersion: config.ProtocolMajor,
+		StorageSchema:   "1",
+		OS:              target.OS,
+		Architecture:    target.Architecture,
+		BinaryPath:      binaryPath,
+		BinaryBytes:     int64(len(binary)),
+		BinarySHA256:    strings.Repeat("a", 64),
+		LicenseBytes:    1,
+		LicenseSHA256:   strings.Repeat("a", 64),
+		NoticeBytes:     1,
+		NoticeSHA256:    strings.Repeat("a", 64),
+	}
+	if err := deployment.SaveState(layout, deployment.DeploymentState{
+		StateVersion: deployment.DeploymentStateVersion,
+		Generation:   7,
+		Status:       deployment.StatusForeground,
+		Manager:      deployment.ManagerForeground,
+		StateDir:     layout.StateDir,
+		Active:       &release,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := deployment.ActiveExecutableForExecutable(binaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return layout, binding
+}
+
 func TestRenderServiceRejectsRelativePaths(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{
@@ -667,6 +740,104 @@ func TestHealthRejectsResponseLargerThanLimit(t *testing.T) {
 	})
 	if code == 0 || !strings.Contains(stderr.String(), "exceeds 1024 bytes") {
 		t.Fatalf("oversized health result: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestManagedEnrollmentCreateAcceptsOnlyRecordedExplicitStateDir(t *testing.T) {
+	layout, binding := managedEnrollmentCLIFixture(t)
+	listener, err := net.Listen("unix", config.ForStateDir(layout.StateDir).AdminSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	type adminResult struct {
+		request []byte
+		err     error
+	}
+	adminResultCh := make(chan adminResult, 1)
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			adminResultCh <- adminResult{err: err}
+			return
+		}
+		defer connection.Close()
+		request, err := io.ReadAll(connection)
+		if err == nil {
+			response := struct {
+				ProtocolVersion string `json:"protocol_version"`
+				InstanceID      string `json:"instance_id"`
+				VaultID         string `json:"vault_id"`
+				InstanceSecret  string `json:"instance_secret"`
+				EnrollmentGrant string `json:"enrollment_grant"`
+				ExpiresAt       string `json:"expires_at"`
+				LoopbackPort    int    `json:"loopback_port"`
+			}{
+				ProtocolVersion: config.ProtocolMajor,
+				InstanceID:      "00000000-0000-4000-8000-000000000001",
+				VaultID:         "00000000-0000-4000-8000-000000000002",
+				InstanceSecret:  base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32)),
+				EnrollmentGrant: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x22}, 32)),
+				ExpiresAt:       "2026-08-03T00:00:00.000Z",
+				LoopbackPort:    37421,
+			}
+			err = json.NewEncoder(connection).Encode(response)
+		}
+		adminResultCh <- adminResult{request: request, err: err}
+	}()
+
+	var stdout, stderr bytes.Buffer
+	runner := Runner{
+		Stdout: &stdout,
+		Stderr: &stderr,
+		executablePath: func() (string, error) {
+			return binding.BinaryPath, nil
+		},
+	}
+	if code := runner.Run(context.Background(), []string{
+		"enrollment", "create", "--format=json", "--state-dir", layout.StateDir,
+	}); code != 0 {
+		t.Fatalf("managed enrollment create exit=%d stderr=%q", code, stderr.String())
+	}
+	if stderr.Len() != 0 || stdout.Len() == 0 {
+		t.Fatalf("managed enrollment stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	admin := <-adminResultCh
+	if admin.err != nil {
+		t.Fatal(admin.err)
+	}
+	var request struct {
+		Operation  string                              `json:"operation"`
+		DirectInit bool                                `json:"direct_init"`
+		Deployment *deployment.ActiveExecutableBinding `json:"deployment"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(admin.request))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Operation != "enrollment_create" || request.DirectInit || request.Deployment == nil ||
+		request.Deployment.Generation != binding.Generation || request.Deployment.BinaryPath != binding.BinaryPath ||
+		request.Deployment.BinarySHA256 != binding.BinarySHA256 {
+		t.Fatalf("managed enrollment request = %+v, want binding %+v", request, binding)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	mismatchedStateDir := filepath.Join(layout.HomeDir, "other-state")
+	stdout.Reset()
+	stderr.Reset()
+	if code := runner.Run(context.Background(), []string{
+		"enrollment", "create", "--format=json", "--state-dir", mismatchedStateDir,
+	}); code == 0 {
+		t.Fatal("managed enrollment accepted a mismatched explicit state directory")
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "enrollment instance state is unavailable") {
+		t.Fatalf("mismatched managed enrollment stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if _, err := os.Lstat(mismatchedStateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mismatched managed enrollment touched the requested state directory: %v", err)
 	}
 }
 

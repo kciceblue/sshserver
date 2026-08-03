@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -152,6 +153,65 @@ func TestManagedActiveLeaseRevalidatesBindingAndBlocksLifecycleMutation(t *testi
 	}
 }
 
+func TestManagedActiveLeaseRejectsRecoveryJournalAndReleasesSharedLock(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*testing.T, Layout, DeploymentState)
+	}{
+		{
+			name: "valid recovery journal",
+			prepare: func(t *testing.T, layout Layout, state DeploymentState) {
+				t.Helper()
+				if err := SaveJournal(layout, DeploymentJournal{
+					StateVersion:  DeploymentStateVersion,
+					TransactionID: strings.Repeat("c", 32),
+					Operation:     OperationUninstall,
+					Phase:         PhasePlanned,
+					Manager:       state.Manager,
+					PriorState:    &state,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "malformed recovery journal",
+			prepare: func(t *testing.T, layout Layout, _ DeploymentState) {
+				t.Helper()
+				if err := os.WriteFile(layout.JournalPath, []byte("{"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "special-file recovery journal",
+			prepare: func(t *testing.T, layout Layout, _ DeploymentState) {
+				t.Helper()
+				if err := syscall.Mkfifo(layout.JournalPath, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			layout, state, binding := managedActiveLeaseFixture(t)
+			test.prepare(t, layout, state)
+
+			if lease, err := AcquireManagedActiveLease(state.Active.BinaryPath, layout.StateDir, binding); err == nil {
+				lease.Close()
+				t.Fatal("managed enrollment lease accepted a recovery journal")
+			}
+			exclusive, err := acquireDeploymentLock(layout)
+			if err != nil {
+				t.Fatalf("rejected lease retained the shared lifecycle lock: %v", err)
+			}
+			if err := exclusive.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestStateDirForExecutableRejectsFIFODeploymentStateWithoutBlocking(t *testing.T) {
 	home := secureTestHome(t)
 	layout, err := NewLayout(home, filepath.Join(home, "deployment"), filepath.Join(home, "state"))
@@ -184,4 +244,39 @@ func TestStateDirForExecutableRejectsFIFODeploymentStateWithoutBlocking(t *testi
 	case <-time.After(time.Second):
 		t.Fatal("deployment-state resolution blocked on FIFO")
 	}
+}
+
+func managedActiveLeaseFixture(t *testing.T) (Layout, DeploymentState, ActiveExecutableBinding) {
+	t.Helper()
+	layout := testLayout(t)
+	active := testInstalledRelease(t, layout, "v1.2.3", "a")
+	if err := os.MkdirAll(filepath.Dir(active.BinaryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(active.BinaryPath, []byte("test executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := DeploymentState{
+		StateVersion: DeploymentStateVersion,
+		Generation:   7,
+		Status:       StatusForeground,
+		Manager:      ManagerForeground,
+		StateDir:     layout.StateDir,
+		Active:       &active,
+	}
+	if err := SaveState(layout, state); err != nil {
+		t.Fatal(err)
+	}
+	created, err := acquireDeploymentLock(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := ActiveExecutableForExecutable(active.BinaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return layout, state, binding
 }

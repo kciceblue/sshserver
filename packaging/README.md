@@ -157,14 +157,17 @@ with no recovery journal and issues the active-binary capability only from the
 fully validated active release.
 
 The client uses that same refreshed active binary for
-`enrollment create --format=json`. With no explicit state argument, a managed
-binary resolves the protected state directory from the active deployment
-record and binds the private admin request to its generation, exact binary path,
-and artifact digest. The serving binary reloads that record while holding a
-shared lifecycle lock through grant creation, so a concurrent external upgrade
-or rollback cannot let a stale binary mint a grant. The explicit `--state-dir`
-form remains available for directly initialized, non-managed binaries and is
-parsed without first consulting ambient defaults.
+`enrollment create --format=json`. A managed binary resolves the protected
+state directory from the active deployment record; an explicit `--state-dir`
+is accepted only when it exactly matches that directory. Both forms bind the
+private admin request to its generation, exact binary path, and artifact digest.
+The serving binary takes a shared lifecycle lock, rejects
+any present, malformed, or insecure recovery journal, and reloads that record
+while retaining the lock through grant creation. A concurrent or crashed apply,
+recover, rollback, or uninstall therefore cannot let a stale or
+recovery-required binary mint a grant. The explicit `--state-dir` form also
+remains available for directly initialized, non-managed binaries and is parsed
+without first consulting ambient defaults.
 
 Apply, recover, upgrade, and rollback never remove an installed immutable
 release directory. This lets a locator retained before an equivalent one-line
