@@ -4,13 +4,14 @@ This module implements the frozen V1 loopback data plane: protected on-host
 initialization, an SSH-only enrollment bootstrap, hash-only grant and device
 authorization, opaque envelope and record persistence, retry-safe sync and
 snapshot reads, and device listing, revocation, and token rotation. It also
-provides foreground lifecycle and user-scoped service-definition rendering.
+provides transactional user-scoped deployment, native service activation, and
+supervised foreground fallback.
 
 The runtime is loopback-only, stores only opaque client-encrypted records and
 minimal protocol metadata, performs no vault cryptography, parses no private
 keys, and is never installed on ordinary SSH targets. Host-loss import,
-instance-secret rotation, backup/restore commands, and transactional deployment
-activation remain separate roadmap work; no unsupported route is advertised.
+instance-secret rotation, and backup/restore commands remain separate roadmap
+work; no unsupported route is advertised.
 
 From the repository root, build and verify cgo-free Linux and macOS binaries
 for amd64 and arm64:
@@ -49,11 +50,19 @@ device credentials are hashed before persistence.
 
 The `service render` and `service install` commands generate a systemd user
 unit or per-user LaunchAgent that executes the same foreground path without a
-credential in arguments, environment, or service files. They do not enable or
-start the service manager. Transactional activation and the pinned one-line
-installer are the next Task 2.5 server step. See
-[`../packaging/README.md`](../packaging/README.md) for the current packaging
-boundary.
+credential in arguments, environment, or service files. The transactional
+`deploy apply`, `deploy recover`, `deploy status`, `deploy rollback`, and
+`deploy uninstall` commands validate an exact pinned release, publish its
+binary and LICENSE/NOTICE without replacement, preserve protected instance
+state, and drive only the current user's native service manager. Recognized
+manager absence returns an explicit supervised-foreground command; a manager
+failure is never silently treated as success.
+
+Release builds contain one encoded identity covering release, source revision,
+exact Go patch toolchain, target-derived build identity, protocol version, and
+storage schema. Malformed production identities fail closed. See
+[`../packaging/README.md`](../packaging/README.md) for the immutable bundle and
+the client-upload boundary.
 
 The SQLite driver is an exact, mechanically trimmed source fork of the
 MIT-licensed `github.com/ncruces/go-sqlite3` v0.32.0 package closure. Its

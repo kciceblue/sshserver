@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://downloads.example.invalid/schemas/sshserver-release-manifest-v1.json",
+  "title": "sshserver immutable release manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "release",
+    "source_revision",
+    "build_toolchain",
+    "protocol_version",
+    "storage_schema",
+    "download_origin",
+    "artifacts",
+    "release_files"
+  ],
+  "properties": {
+    "manifest_version": {
+      "const": 1
+    },
+    "release": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+      "allOf": [
+        {
+          "not": {
+            "enum": [
+              "latest"
+            ]
+          }
+        },
+        {
+          "not": {
+            "pattern": "\\.\\."
+          }
+        }
+      ]
+    },
+    "source_revision": {
+      "$ref": "#/$defs/git_revision"
+    },
+    "build_toolchain": {
+      "type": "string",
+      "pattern": "^go[1-9][0-9]*\\.[0-9]+\\.[0-9]+$"
+    },
+    "protocol_version": {
+      "const": "1"
+    },
+    "storage_schema": {
+      "const": "1"
+    },
+    "download_origin": {
+      "type": "string",
+      "pattern": "^https://[^/?#]+$"
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/linux_amd64"
+        },
+        {
+          "$ref": "#/$defs/linux_arm64"
+        },
+        {
+          "$ref": "#/$defs/darwin_amd64"
+        },
+        {
+          "$ref": "#/$defs/darwin_arm64"
+        }
+      ],
+      "items": false
+    },
+    "release_files": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/release_file"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "LICENSE"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/release_file"
+            },
+            {
+              "properties": {
+                "name": {
+                  "const": "NOTICE"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "items": false
+    }
+  },
+  "$defs": {
+    "git_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "architecture",
+        "build_identity",
+        "url",
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "os": {
+          "type": "string"
+        },
+        "architecture": {
+          "type": "string"
+        },
+        "build_identity": {
+          "$ref": "#/$defs/sha256"
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^https://[^?#]+$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 268435456
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "linux_amd64": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/artifact"
+        },
+        {
+          "properties": {
+            "os": {
+              "const": "linux"
+            },
+            "architecture": {
+              "const": "amd64"
+            }
+          }
+        }
+      ]
+    },
+    "linux_arm64": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/artifact"
+        },
+        {
+          "properties": {
+            "os": {
+              "const": "linux"
+            },
+            "architecture": {
+              "const": "arm64"
+            }
+          }
+        }
+      ]
+    },
+    "darwin_amd64": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/artifact"
+        },
+        {
+          "properties": {
+            "os": {
+              "const": "darwin"
+            },
+            "architecture": {
+              "const": "amd64"
+            }
+          }
+        }
+      ]
+    },
+    "darwin_arm64": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/artifact"
+        },
+        {
+          "properties": {
+            "os": {
+              "const": "darwin"
+            },
+            "architecture": {
+              "const": "arm64"
+            }
+          }
+        }
+      ]
+    },
+    "release_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "url",
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^https://[^?#]+$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4194304
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

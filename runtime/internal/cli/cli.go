@@ -18,14 +18,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
+	"github.com/kciceblue/sshserver/runtime/internal/deployment"
 	"github.com/kciceblue/sshserver/runtime/internal/instance"
 	"github.com/kciceblue/sshserver/runtime/internal/server"
 	"github.com/kciceblue/sshserver/runtime/internal/service"
 	"github.com/kciceblue/sshserver/runtime/internal/uuidv4"
 )
-
-var Version = "dev"
 
 type Runner struct {
 	Stdout io.Writer
@@ -55,12 +55,10 @@ func (runner Runner) Run(ctx context.Context, args []string) int {
 		err = runner.runEnrollment(ctx, args[1:])
 	case "service":
 		err = runner.runService(args[1:])
+	case "deploy":
+		err = runner.runDeploy(ctx, args[1:])
 	case "version":
-		if len(args) != 1 {
-			err = errors.New("version accepts no arguments")
-		} else {
-			_, err = fmt.Fprintf(runner.Stdout, "sshserver %s\n", Version)
-		}
+		err = runner.runVersion(args[1:])
 	case "help", "-h", "--help":
 		runner.usage()
 		return 0
@@ -72,6 +70,224 @@ func (runner Runner) Run(ctx context.Context, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func (runner Runner) runVersion(args []string) error {
+	format := "text"
+	flags := runner.flagSet("version")
+	flags.StringVar(&format, "format", format, "output format (text or json)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("version accepts no positional arguments")
+	}
+	identity, err := buildinfo.ValidatedCurrent()
+	if err != nil {
+		return fmt.Errorf("validate compiled build identity: %w", err)
+	}
+	switch format {
+	case "text":
+		_, err := fmt.Fprintf(runner.Stdout, "sshserver %s\n", identity.Release)
+		return err
+	case "json":
+		return json.NewEncoder(runner.Stdout).Encode(identity)
+	default:
+		return errors.New("version supports only --format=text or --format=json")
+	}
+}
+
+func (runner Runner) runDeploy(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("deploy requires apply, recover, status, rollback, or uninstall")
+	}
+	switch args[0] {
+	case "apply", "recover":
+		return runner.runDeployApply(ctx, args[0], args[1:])
+	case "status":
+		return runner.runDeployStatus(ctx, args[1:])
+	case "rollback":
+		return runner.runDeployRollback(ctx, args[1:])
+	case "uninstall":
+		return runner.runDeployUninstall(ctx, args[1:])
+	default:
+		return fmt.Errorf("unknown deploy command %q", args[0])
+	}
+}
+
+func (runner Runner) runDeployApply(ctx context.Context, operation string, args []string) error {
+	values, flags, err := runner.newDeploymentFlags("deploy " + operation)
+	if err != nil {
+		return err
+	}
+	manifestPath := ""
+	manifestSHA256 := ""
+	artifactPath := ""
+	licensePath := ""
+	noticePath := ""
+	consumeInputs := false
+	flags.StringVar(&manifestPath, "manifest", manifestPath, "absolute owner-only release manifest path")
+	flags.StringVar(&manifestSHA256, "manifest-sha256", manifestSHA256, "pinned lowercase manifest SHA-256")
+	flags.StringVar(&artifactPath, "artifact", artifactPath, "absolute verified release artifact path")
+	flags.StringVar(&licensePath, "license", licensePath, "absolute verified LICENSE path")
+	flags.StringVar(&noticePath, "notice", noticePath, "absolute verified NOTICE path")
+	flags.BoolVar(&consumeInputs, "consume-inputs", consumeInputs, "remove verified manifest and artifact inputs after success")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("deploy %s accepts no positional arguments", operation)
+	}
+	if manifestPath == "" || manifestSHA256 == "" || artifactPath == "" || licensePath == "" || noticePath == "" {
+		return fmt.Errorf("deploy %s requires --manifest, --manifest-sha256, --artifact, --license, and --notice", operation)
+	}
+	inputPaths := []string{manifestPath, artifactPath, licensePath, noticePath}
+	seenInputs := make(map[string]bool, len(inputPaths))
+	for _, inputPath := range inputPaths {
+		if seenInputs[inputPath] {
+			return errors.New("deployment input paths must be distinct")
+		}
+		seenInputs[inputPath] = true
+	}
+	lifecycle, err := values.lifecycle()
+	if err != nil {
+		return err
+	}
+	payload, err := deployment.ReadPinnedManifestFile(manifestPath, manifestSHA256)
+	if err != nil {
+		return err
+	}
+	result, err := lifecycle.Apply(ctx, deployment.ApplyRequest{
+		ManifestPayload: payload,
+		ManifestSHA256:  manifestSHA256,
+		ArtifactPath:    artifactPath,
+		LicensePath:     licensePath,
+		NoticePath:      noticePath,
+	})
+	if err != nil {
+		return err
+	}
+	if consumeInputs {
+		var removalErrors []error
+		for label, inputPath := range map[string]string{
+			"manifest": manifestPath,
+			"artifact": artifactPath,
+			"LICENSE":  licensePath,
+			"NOTICE":   noticePath,
+		} {
+			removalErrors = append(removalErrors, wrapOptionalError("remove consumed "+label, deployment.RemoveConsumedInput(inputPath)))
+		}
+		if err := errors.Join(removalErrors...); err != nil {
+			return err
+		}
+	}
+	return json.NewEncoder(runner.Stdout).Encode(result)
+}
+
+func wrapOptionalError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func (runner Runner) runDeployStatus(ctx context.Context, args []string) error {
+	values, flags, err := runner.newDeploymentFlags("deploy status")
+	if err != nil {
+		return err
+	}
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("deploy status accepts no positional arguments")
+	}
+	lifecycle, err := values.lifecycle()
+	if err != nil {
+		return err
+	}
+	result, statusErr := lifecycle.Status(ctx)
+	if result.Status != "" {
+		if err := json.NewEncoder(runner.Stdout).Encode(result); err != nil {
+			return err
+		}
+	}
+	return statusErr
+}
+
+func (runner Runner) runDeployRollback(ctx context.Context, args []string) error {
+	values, flags, err := runner.newDeploymentFlags("deploy rollback")
+	if err != nil {
+		return err
+	}
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("deploy rollback accepts no positional arguments")
+	}
+	lifecycle, err := values.lifecycle()
+	if err != nil {
+		return err
+	}
+	result, err := lifecycle.Rollback(ctx)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(runner.Stdout).Encode(result)
+}
+
+func (runner Runner) runDeployUninstall(ctx context.Context, args []string) error {
+	values, flags, err := runner.newDeploymentFlags("deploy uninstall")
+	if err != nil {
+		return err
+	}
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("deploy uninstall accepts no positional arguments")
+	}
+	lifecycle, err := values.lifecycle()
+	if err != nil {
+		return err
+	}
+	result, err := lifecycle.Uninstall(ctx)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(runner.Stdout).Encode(result)
+}
+
+type deploymentFlagValues struct {
+	homeDir     string
+	installRoot string
+	stateDir    string
+}
+
+func (runner Runner) newDeploymentFlags(name string) (*deploymentFlagValues, *flag.FlagSet, error) {
+	layout, err := deployment.DefaultLayout()
+	if err != nil {
+		return nil, nil, err
+	}
+	values := &deploymentFlagValues{
+		homeDir:     layout.HomeDir,
+		installRoot: layout.InstallRoot,
+		stateDir:    layout.StateDir,
+	}
+	flags := runner.flagSet(name)
+	flags.StringVar(&values.homeDir, "home-dir", values.homeDir, "physical current-user home directory")
+	flags.StringVar(&values.installRoot, "install-root", values.installRoot, "owner-only deployment root beneath home")
+	flags.StringVar(&values.stateDir, "state-dir", values.stateDir, "protected instance state directory beneath home")
+	return values, flags, nil
+}
+
+func (values deploymentFlagValues) lifecycle() (*deployment.Lifecycle, error) {
+	layout, err := deployment.NewLayout(values.homeDir, values.installRoot, values.stateDir)
+	if err != nil {
+		return nil, err
+	}
+	return deployment.NewNativeLifecycle(layout)
 }
 
 func (runner Runner) runInit(ctx context.Context, args []string) error {
@@ -367,7 +583,7 @@ func (runner Runner) flagSet(name string) *flag.FlagSet {
 }
 
 func (runner Runner) usage() {
-	fmt.Fprintln(runner.Stderr, "usage: sshserver <init|serve|health|enrollment|service|version> [options]")
+	fmt.Fprintln(runner.Stderr, "usage: sshserver <init|serve|health|enrollment|service|deploy|version> [options]")
 }
 
 type stringList struct {

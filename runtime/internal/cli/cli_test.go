@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,10 +18,97 @@ import (
 	"time"
 
 	"github.com/kciceblue/sshserver/runtime/internal/auth"
+	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/instance"
 	serverpkg "github.com/kciceblue/sshserver/runtime/internal/server"
 )
+
+func TestVersionJSONReportsExactBuildIdentity(t *testing.T) {
+	original := buildinfo.EncodedIdentity
+	expected := buildinfo.Identity{
+		Release:         "v1.2.3",
+		SourceRevision:  strings.Repeat("a", 40),
+		BuildToolchain:  "go1.25.0",
+		BuildIdentity:   strings.Repeat("b", 64),
+		ProtocolVersion: "1",
+		StorageSchema:   "1",
+	}
+	encoded, err := buildinfo.Encode(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildinfo.EncodedIdentity = encoded
+	t.Cleanup(func() { buildinfo.EncodedIdentity = original })
+	var stdout, stderr bytes.Buffer
+	code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{"version", "--format=json"})
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("version code=%d stderr=%q", code, stderr.String())
+	}
+	var identity buildinfo.Identity
+	decoder := json.NewDecoder(&stdout)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&identity); err != nil {
+		t.Fatal(err)
+	}
+	if identity != expected {
+		t.Fatalf("identity=%+v want=%+v", identity, expected)
+	}
+}
+
+func TestDeployStatusReportsUninstalledWithoutMutatingRuntime(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHome, err := os.MkdirTemp(home, ".sshserver-cli-deploy-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(testHome) })
+	if err := os.Chmod(testHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installRoot := filepath.Join(testHome, "deployment")
+	stateDir := filepath.Join(testHome, "state")
+	var stdout, stderr bytes.Buffer
+	code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{
+		"deploy", "status",
+		"--home-dir", testHome,
+		"--install-root", installRoot,
+		"--state-dir", stateDir,
+	})
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("deploy status code=%d stderr=%q", code, stderr.String())
+	}
+	var result struct {
+		Status           string `json:"status"`
+		Running          bool   `json:"running"`
+		RecoveryRequired bool   `json:"recovery_required"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "uninstalled" || result.Running || result.RecoveryRequired {
+		t.Fatalf("deploy status=%+v", result)
+	}
+	if _, err := os.Lstat(installRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only status created deployment root: %v", err)
+	}
+}
+
+func TestDeployApplyRequiresExactPinnedInputs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{"deploy", "apply"})
+	if code == 0 || !strings.Contains(stderr.String(), "requires --manifest") || stdout.Len() != 0 {
+		t.Fatalf("deploy apply code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
 
 func TestInitOutputContainsNoSecretAndIsIdempotent(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
