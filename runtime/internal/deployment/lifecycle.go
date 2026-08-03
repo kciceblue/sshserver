@@ -388,7 +388,7 @@ func (lifecycle *Lifecycle) runUninstall(ctx context.Context, journal *Deploymen
 		return UninstallResult{Status: "uninstalled", State: state, TransactionID: journal.TransactionID}, nil
 	}
 	if !uninstallPhaseReached(journal.Phase, PhasePriorServiceStopped) {
-		if err := lifecycle.stopPrior(ctx, journal.PriorState); err != nil {
+		if err := lifecycle.stopPrior(ctx, journal.PriorState, nil); err != nil {
 			return UninstallResult{}, err
 		}
 		if err := lifecycle.checkpoint(journal, PhasePriorServiceStopped); err != nil {
@@ -512,7 +512,7 @@ func (lifecycle *Lifecycle) runRollback(ctx context.Context, journal *Deployment
 		return ApplyResult{}, err
 	}
 	if !rollbackPhaseReached(journal.Phase, PhasePriorServiceStopped) {
-		if err := lifecycle.stopPrior(ctx, journal.PriorState); err != nil {
+		if err := lifecycle.stopPrior(ctx, journal.PriorState, nil); err != nil {
 			return ApplyResult{}, err
 		}
 		if err := lifecycle.checkpoint(journal, PhasePriorServiceStopped); err != nil {
@@ -539,7 +539,7 @@ func (lifecycle *Lifecycle) runRollback(ctx context.Context, journal *Deployment
 	}
 	if journal.Manager != ManagerForeground {
 		if !rollbackPhaseReached(journal.Phase, PhaseActivated) {
-			if err := lifecycle.activateDesired(ctx, desired); err != nil {
+			if err := lifecycle.activateDesired(ctx, desired, nil); err != nil {
 				return ApplyResult{}, err
 			}
 			if err := lifecycle.checkpoint(journal, PhaseActivated); err != nil {
@@ -1140,6 +1140,9 @@ func (lifecycle *Lifecycle) validateIdempotentApply(
 	if err != nil {
 		return ApplyResult{}, err
 	}
+	if err := attest(); err != nil {
+		return ApplyResult{}, err
+	}
 	staged, err := lifecycle.stageArtifact(request.ArtifactPath, versionDir, filepath.Base(state.Active.BinaryPath), state.Active.BinaryBytes, state.Active.BinarySHA256)
 	if err != nil {
 		return ApplyResult{}, err
@@ -1147,7 +1150,7 @@ func (lifecycle *Lifecycle) validateIdempotentApply(
 	if staged != state.Active.BinaryPath {
 		return ApplyResult{}, errors.New("idempotent artifact staging returned an unexpected path")
 	}
-	if err := lifecycle.stageSupportFiles(versionDir, *state.Active, request.LicensePath, request.NoticePath); err != nil {
+	if err := lifecycle.stageSupportFiles(versionDir, *state.Active, request.LicensePath, request.NoticePath, attest); err != nil {
 		return ApplyResult{}, err
 	}
 	if err := lifecycle.verifyDesired(ctx, *state.Active); err != nil {
@@ -1169,7 +1172,14 @@ func (lifecycle *Lifecycle) validateIdempotentApply(
 			return ApplyResult{}, err
 		}
 	}
-	return lifecycle.resultForState(state, availability.Foreground, "")
+	result, err := lifecycle.resultForState(state, availability.Foreground, "")
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if err := attest(); err != nil {
+		return ApplyResult{}, err
+	}
+	return result, nil
 }
 
 func (lifecycle *Lifecycle) runApply(
@@ -1217,7 +1227,7 @@ func (lifecycle *Lifecycle) runApply(
 		if staged != desired.BinaryPath {
 			return ApplyResult{}, errors.New("artifact staging returned an unexpected immutable path")
 		}
-		if err := lifecycle.stageSupportFiles(versionDir, desired, journal.LicenseSourcePath, journal.NoticeSourcePath); err != nil {
+		if err := lifecycle.stageSupportFiles(versionDir, desired, journal.LicenseSourcePath, journal.NoticeSourcePath, attest); err != nil {
 			return ApplyResult{}, err
 		}
 		if err := lifecycle.verifyDesired(ctx, desired); err != nil {
@@ -1239,7 +1249,7 @@ func (lifecycle *Lifecycle) runApply(
 		}
 	}
 	if !applyPhaseReached(journal.Phase, PhasePriorServiceStopped) {
-		if err := lifecycle.stopPrior(ctx, journal.PriorState); err != nil {
+		if err := lifecycle.stopPrior(ctx, journal.PriorState, attest); err != nil {
 			return ApplyResult{}, err
 		}
 		if err := checkpoint(PhasePriorServiceStopped); err != nil {
@@ -1250,6 +1260,9 @@ func (lifecycle *Lifecycle) runApply(
 		if journal.Manager != ManagerForeground {
 			payload, err := lifecycle.renderService(desired.OS, desired.BinaryPath, lifecycle.layout.StateDir)
 			if err != nil {
+				return ApplyResult{}, err
+			}
+			if err := attest(); err != nil {
 				return ApplyResult{}, err
 			}
 			installed, err := lifecycle.manager.InstallDefinition(payload)
@@ -1266,7 +1279,7 @@ func (lifecycle *Lifecycle) runApply(
 	}
 	if journal.Manager != ManagerForeground {
 		if !applyPhaseReached(journal.Phase, PhaseActivated) {
-			if err := lifecycle.activateDesired(ctx, desired); err != nil {
+			if err := lifecycle.activateDesired(ctx, desired, attest); err != nil {
 				return ApplyResult{}, err
 			}
 			if err := checkpoint(PhaseActivated); err != nil {
@@ -1335,7 +1348,10 @@ func (lifecycle *Lifecycle) verifyDesired(ctx context.Context, desired Installed
 	return ValidateReleaseIdentity(identity, desired)
 }
 
-func (lifecycle *Lifecycle) stageSupportFiles(versionDir string, desired InstalledRelease, licenseSource, noticeSource string) error {
+func (lifecycle *Lifecycle) stageSupportFiles(versionDir string, desired InstalledRelease, licenseSource, noticeSource string, attest func() error) error {
+	if err := attest(); err != nil {
+		return err
+	}
 	licensePath, err := lifecycle.stageReleaseFile(licenseSource, versionDir, "LICENSE", desired.LicenseBytes, desired.LicenseSHA256)
 	if err != nil {
 		return err
@@ -1346,6 +1362,9 @@ func (lifecycle *Lifecycle) stageSupportFiles(versionDir string, desired Install
 	}
 	if licensePath != wantLicense {
 		return errors.New("release LICENSE staging returned an unexpected immutable path")
+	}
+	if err := attest(); err != nil {
+		return err
 	}
 	noticePath, err := lifecycle.stageReleaseFile(noticeSource, versionDir, "NOTICE", desired.NoticeBytes, desired.NoticeSHA256)
 	if err != nil {
@@ -1361,13 +1380,18 @@ func (lifecycle *Lifecycle) stageSupportFiles(versionDir string, desired Install
 	return nil
 }
 
-func (lifecycle *Lifecycle) stopPrior(ctx context.Context, prior *DeploymentState) error {
+func (lifecycle *Lifecycle) stopPrior(ctx context.Context, prior *DeploymentState, attest func() error) error {
 	if prior == nil || prior.Status == StatusUninstalled || prior.Active == nil {
 		return nil
 	}
 	if prior.Status == StatusActive {
 		if prior.Manager != lifecycle.manager.Kind() {
 			return errors.New("prior service manager does not match this host")
+		}
+		if attest != nil {
+			if err := attest(); err != nil {
+				return err
+			}
 		}
 		return lifecycle.manager.Stop(ctx)
 	}
@@ -1384,7 +1408,7 @@ func (lifecycle *Lifecycle) stopPrior(ctx context.Context, prior *DeploymentStat
 	return nil
 }
 
-func (lifecycle *Lifecycle) activateDesired(ctx context.Context, desired InstalledRelease) error {
+func (lifecycle *Lifecycle) activateDesired(ctx context.Context, desired InstalledRelease, attest func() error) error {
 	active, err := lifecycle.manager.IsActive(ctx)
 	if err != nil {
 		return err
@@ -1394,7 +1418,17 @@ func (lifecycle *Lifecycle) activateDesired(ctx context.Context, desired Install
 		if probeErr == nil && ValidateReleaseIdentity(identity, desired) == nil {
 			return nil
 		}
+		if attest != nil {
+			if err := attest(); err != nil {
+				return err
+			}
+		}
 		if err := lifecycle.manager.Stop(ctx); err != nil {
+			return err
+		}
+	}
+	if attest != nil {
+		if err := attest(); err != nil {
 			return err
 		}
 	}

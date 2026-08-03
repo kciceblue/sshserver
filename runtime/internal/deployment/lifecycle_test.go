@@ -646,6 +646,268 @@ func TestApplyReattestsInitializationLeaseAtJournalAndStagingBoundaries(t *testi
 	})
 }
 
+func TestIdempotentRepairReattestsInitializationLeaseAtEveryMutationAndReturn(t *testing.T) {
+	for _, testCase := range []struct {
+		name            string
+		targetCall      int
+		wantStage       int
+		wantSupport     int
+		wantInitialize  int
+		wantManagerLive bool
+	}{
+		{name: "artifact publication", targetCall: 4, wantStage: 0, wantSupport: 0, wantManagerLive: true},
+		{name: "license publication", targetCall: 5, wantStage: 1, wantSupport: 0, wantManagerLive: true},
+		{name: "notice publication", targetCall: 6, wantStage: 1, wantSupport: 1, wantManagerLive: true},
+		{name: "successful return", targetCall: 7, wantStage: 1, wantSupport: 2, wantManagerLive: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newLifecycleFixture(t, false)
+			request, desired := fixture.release(t, "v1.2.3", "idempotent-repair-"+testCase.name)
+			if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
+				t.Fatal(err)
+			}
+			stateBefore, err := os.ReadFile(fixture.layout.StatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.lifecycle.verifyPreviewRelease = func(context.Context, InstalledRelease) error {
+				return errInstalledReleaseFilesMissing
+			}
+			originalAcquire := fixture.lifecycle.acquireInstanceLease
+			attestationCalls := 0
+			var replacement *instance.InitializationLease
+			fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
+				lease, err := originalAcquire(stateDir, initializationLockPresent)
+				if err != nil {
+					return nil, err
+				}
+				return replaceInitializationLockAtAttestation(
+					lease,
+					stateDir,
+					testCase.targetCall,
+					&attestationCalls,
+					&replacement,
+				), nil
+			}
+			stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+
+			_, err = applyConfirmed(t, fixture.lifecycle, request)
+			if replacement == nil {
+				t.Fatal("idempotent repair did not acquire the replacement initialization lock")
+			}
+			if closeErr := replacement.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			if attestationCalls != testCase.targetCall || !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) ||
+				!strings.Contains(err.Error(), "leased initialization lock path changed") {
+				t.Fatalf("idempotent repair attestation calls=%d error=%v", attestationCalls, err)
+			}
+			if fixture.stageCalls-stageBefore != testCase.wantStage || fixture.supportStageCalls-supportBefore != testCase.wantSupport ||
+				fixture.initializeCalls-initializeBefore != testCase.wantInitialize {
+				t.Fatalf("idempotent repair stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+			}
+			if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+				t.Fatalf("idempotent repair created journal: %v", err)
+			}
+			stateAfter, err := os.ReadFile(fixture.layout.StatePath)
+			if err != nil || !bytes.Equal(stateAfter, stateBefore) {
+				t.Fatalf("idempotent repair changed state bytes: equal=%v err=%v", bytes.Equal(stateAfter, stateBefore), err)
+			}
+			if fixture.manager.active != testCase.wantManagerLive || fixture.manager.current != identityFor(desired) {
+				t.Fatalf("idempotent repair changed active service: active=%t identity=%+v", fixture.manager.active, fixture.manager.current)
+			}
+		})
+	}
+}
+
+func TestApplyReattestsInitializationLeaseBeforeForwardServiceMutations(t *testing.T) {
+	replaceInitializationLock := func(stateDir string) (*instance.InitializationLease, error) {
+		lockPath := filepath.Join(stateDir, ".instance.lock")
+		if err := os.Remove(lockPath); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+			return nil, err
+		}
+		return instance.AcquireInitializationLeaseWithLockPresence(stateDir, true)
+	}
+	installPhaseReplacement := func(fixture *lifecycleFixture, target Phase) **instance.InitializationLease {
+		replacement := new(*instance.InitializationLease)
+		originalAcquire := fixture.lifecycle.acquireInstanceLease
+		fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
+			lease, err := originalAcquire(stateDir, initializationLockPresent)
+			if err != nil {
+				return nil, err
+			}
+			return &testInitializationLease{
+				initialize: lease.Initialize,
+				created:    lease.InitializationLockCreated(),
+				attest: func() error {
+					journal, journalErr := LoadJournal(fixture.layout)
+					if *replacement == nil && journalErr == nil && journal.Phase == target {
+						acquired, replaceErr := replaceInitializationLock(stateDir)
+						if replaceErr != nil {
+							return replaceErr
+						}
+						*replacement = acquired
+					}
+					return lease.AttestLockPath()
+				},
+				close: lease.Close,
+			}, nil
+		}
+		return replacement
+	}
+	assertReplacementMismatch := func(t *testing.T, err error, replacement **instance.InitializationLease) {
+		t.Helper()
+		if replacement == nil || *replacement == nil {
+			t.Fatal("forward service boundary did not acquire the replacement initialization lock")
+		}
+		if closeErr := (*replacement).Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || !strings.Contains(err.Error(), "leased initialization lock path changed") {
+			t.Fatalf("forward service mutation attestation error=%v", err)
+		}
+	}
+	countCall := func(calls []string, target string) int {
+		count := 0
+		for _, call := range calls {
+			if call == target {
+				count++
+			}
+		}
+		return count
+	}
+
+	for _, testCase := range []struct {
+		name         string
+		targetPhase  Phase
+		wantPhase    Phase
+		wantStop     int
+		wantInstall  int
+		wantActivate int
+		wantActive   bool
+		wantPending  string
+	}{
+		{name: "stop prior", targetPhase: PhaseInstanceReady, wantPhase: PhaseInstanceReady, wantActive: true},
+		{name: "install definition", targetPhase: PhasePriorServiceStopped, wantPhase: PhasePriorServiceStopped, wantStop: 1},
+		{name: "activate desired", targetPhase: PhaseDefinitionInstalled, wantPhase: PhaseDefinitionInstalled, wantStop: 1, wantInstall: 1},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newLifecycleFixture(t, false)
+			installedRequest, installed := fixture.release(t, "v1.2.3", "forward-service-installed-"+testCase.name)
+			if _, err := applyConfirmed(t, fixture.lifecycle, installedRequest); err != nil {
+				t.Fatal(err)
+			}
+			stateBefore, err := os.ReadFile(fixture.layout.StatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			upgrade, desired := fixture.release(t, "v1.2.4", "forward-service-upgrade-"+testCase.name)
+			if testCase.name == "stop prior" || testCase.name == "install definition" {
+				testCase.wantPending = installed.BinaryPath
+			} else {
+				testCase.wantPending = desired.BinaryPath
+			}
+			replacement := installPhaseReplacement(fixture, testCase.targetPhase)
+			managerCallsBefore := len(fixture.manager.calls)
+
+			_, err = applyConfirmed(t, fixture.lifecycle, upgrade)
+			assertReplacementMismatch(t, err, replacement)
+			journal, err := LoadJournal(fixture.layout)
+			if err != nil || journal.Phase != testCase.wantPhase || journal.Desired == nil || *journal.Desired != desired {
+				t.Fatalf("forward service recovery journal=%+v err=%v", journal, err)
+			}
+			stateAfter, err := os.ReadFile(fixture.layout.StatePath)
+			if err != nil || !bytes.Equal(stateAfter, stateBefore) {
+				t.Fatalf("forward service mutation changed state: equal=%v err=%v", bytes.Equal(stateAfter, stateBefore), err)
+			}
+			calls := fixture.manager.calls[managerCallsBefore:]
+			if countCall(calls, "stop") != testCase.wantStop || countCall(calls, "install") != testCase.wantInstall ||
+				countCall(calls, "activate") != testCase.wantActivate || countCall(calls, "remove") != 0 {
+				t.Fatalf("forward service calls=%v", calls)
+			}
+			if fixture.manager.active != testCase.wantActive || fixture.manager.pending != testCase.wantPending {
+				t.Fatalf("forward service state active=%t pending=%q", fixture.manager.active, fixture.manager.pending)
+			}
+		})
+	}
+
+	t.Run("stop conflicting active service before activation", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		installedRequest, installed := fixture.release(t, "v1.2.3", "forward-activation-conflict-installed")
+		if _, err := applyConfirmed(t, fixture.lifecycle, installedRequest); err != nil {
+			t.Fatal(err)
+		}
+		stateBefore, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upgrade, desired := fixture.release(t, "v1.2.4", "forward-activation-conflict-upgrade")
+		var replacement *instance.InitializationLease
+		injectedConflict := false
+		originalAcquire := fixture.lifecycle.acquireInstanceLease
+		fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
+			lease, err := originalAcquire(stateDir, initializationLockPresent)
+			if err != nil {
+				return nil, err
+			}
+			return &testInitializationLease{
+				initialize: lease.Initialize,
+				created:    lease.InitializationLockCreated(),
+				attest: func() error {
+					journal, journalErr := LoadJournal(fixture.layout)
+					if journalErr == nil && journal.Phase == PhasePriorServiceStopped && fixture.manager.pending == desired.BinaryPath && !injectedConflict {
+						fixture.manager.active = true
+						fixture.manager.current = identityFor(installed)
+						injectedConflict = true
+					}
+					if journalErr == nil && journal.Phase == PhaseDefinitionInstalled && injectedConflict && replacement == nil {
+						acquired, replaceErr := replaceInitializationLock(stateDir)
+						if replaceErr != nil {
+							return replaceErr
+						}
+						replacement = acquired
+					}
+					return lease.AttestLockPath()
+				},
+				close: lease.Close,
+			}, nil
+		}
+		managerCallsBefore := len(fixture.manager.calls)
+
+		_, err = applyConfirmed(t, fixture.lifecycle, upgrade)
+		if !injectedConflict {
+			t.Fatal("activation test did not inject the conflicting active service")
+		}
+		if replacement == nil {
+			t.Fatal("activation conflict did not acquire the replacement initialization lock")
+		}
+		if closeErr := replacement.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || !strings.Contains(err.Error(), "leased initialization lock path changed") {
+			t.Fatalf("activation conflict attestation error=%v", err)
+		}
+		journal, err := LoadJournal(fixture.layout)
+		if err != nil || journal.Phase != PhaseDefinitionInstalled || journal.Desired == nil || *journal.Desired != desired {
+			t.Fatalf("activation conflict recovery journal=%+v err=%v", journal, err)
+		}
+		stateAfter, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil || !bytes.Equal(stateAfter, stateBefore) {
+			t.Fatalf("activation conflict changed state: equal=%v err=%v", bytes.Equal(stateAfter, stateBefore), err)
+		}
+		calls := fixture.manager.calls[managerCallsBefore:]
+		if countCall(calls, "stop") != 1 || countCall(calls, "install") != 1 || countCall(calls, "activate") != 0 || countCall(calls, "remove") != 0 {
+			t.Fatalf("activation conflict service calls=%v", calls)
+		}
+		if !fixture.manager.active || fixture.manager.current != identityFor(installed) || fixture.manager.pending != desired.BinaryPath {
+			t.Fatalf("activation conflict mutated protected service: active=%t current=%+v pending=%q", fixture.manager.active, fixture.manager.current, fixture.manager.pending)
+		}
+	})
+}
+
 func TestApplyPreservesArtifactStagedJournalWhenInitializationLeasePathChanges(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	request, _ := fixture.release(t, "v1.2.3", "initialize-attestation-evidence")
