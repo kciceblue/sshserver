@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/httpapi"
 	"github.com/kciceblue/sshserver/runtime/internal/store"
@@ -197,9 +198,26 @@ func handleAdminConnection(ctx context.Context, connection net.Conn, settings co
 	if err != nil {
 		return err
 	}
-	if string(request) != `{"operation":"enrollment_create"}` {
-		return errors.New("invalid enrollment command")
+	switch string(request) {
+	case `{"operation":"deployment_status"}`:
+		identity, err := buildinfo.ValidatedCurrent()
+		if err != nil {
+			return fmt.Errorf("validate compiled build identity: %w", err)
+		}
+		body, err := json.Marshal(identity)
+		if err != nil {
+			return err
+		}
+		_, err = connection.Write(body)
+		return err
+	case `{"operation":"enrollment_create"}`:
+		return writeEnrollment(ctx, connection, settings, database, paths)
+	default:
+		return errors.New("invalid admin command")
 	}
+}
+
+func writeEnrollment(ctx context.Context, connection net.Conn, settings config.Settings, database *store.Store, paths config.Paths) error {
 	grant, err := database.CreateEnrollmentGrant(ctx, time.Now())
 	if err != nil {
 		return err

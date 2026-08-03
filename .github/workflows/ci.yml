@@ -125,12 +125,22 @@ jobs:
         env:
           RUNTIME_VERSION: ${{ needs.policy.outputs.validated_head_sha }}
         run: |
-          make runtime-build-one RUNTIME_GOOS=${{ matrix.goos }} RUNTIME_GOARCH=${{ matrix.goarch }} VERSION="$RUNTIME_VERSION"
+          make runtime-release-bundle-one \
+            RUNTIME_GOOS=${{ matrix.goos }} \
+            RUNTIME_GOARCH=${{ matrix.goarch }} \
+            VERSION="$RUNTIME_VERSION" \
+            SOURCE_REVISION="$RUNTIME_VERSION"
           python3 scripts/check_runtime_release.py \
             --dist dist \
             --version "$RUNTIME_VERSION" \
             --target ${{ matrix.goos }}/${{ matrix.goarch }} \
             --execute-native
+      - name: Verify transactional deployment and release metadata
+        run: |
+          cd runtime
+          go test -mod=readonly \
+            -run '^(TestRealNativeBinaryStagesAttestsRunsAndUninstalls|TestRealFourTargetBuildsContainExactFrozenAttestations)$' \
+            -v ./internal/deployment ./internal/releasebundle
       - name: Verify foreground fallback through an SSH tunnel
         env:
           JAT_RUNTIME_SERVICE_BINARY: ${{ github.workspace }}/dist/sshserver-${{ matrix.goos }}-${{ matrix.goarch }}

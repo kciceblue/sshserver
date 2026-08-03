@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/httpapi"
 	"github.com/kciceblue/sshserver/runtime/internal/instance"
@@ -178,6 +179,22 @@ func TestRunWithAdminAcquiresListenersBeforeStartingBoot(t *testing.T) {
 		t.Fatalf("first server exited after competing startup: %v", err)
 	default:
 	}
+	statusBody := sendAdminCommand(t, first.Paths.AdminSocket, `{"operation":"deployment_status"}`)
+	var runningIdentity buildinfo.Identity
+	if err := json.Unmarshal(statusBody, &runningIdentity); err != nil {
+		t.Fatalf("decode deployment status: %v", err)
+	}
+	wantIdentity, err := buildinfo.ValidatedCurrent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runningIdentity != wantIdentity {
+		t.Fatalf("running identity = %+v, want %+v", runningIdentity, wantIdentity)
+	}
+	_, statusGrants, statusSnapshots := readBootArtifacts(t, raw)
+	if statusGrants != beforeGrants || statusSnapshots != beforeSnapshots {
+		t.Fatalf("deployment status mutated grants/snapshots to %d/%d", statusGrants, statusSnapshots)
+	}
 	connection, err := net.DialTimeout("unix", first.Paths.AdminSocket, time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -303,6 +320,33 @@ func TestOwnedAdminListenerCleanupPreservesReplacement(t *testing.T) {
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("owned replacement socket remains after cleanup: %v", err)
 	}
+}
+
+func sendAdminCommand(t *testing.T, socketPath, command string) []byte {
+	t.Helper()
+	connection, err := net.DialTimeout("unix", socketPath, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(connection, command); err != nil {
+		t.Fatal(err)
+	}
+	unixConnection, ok := connection.(*net.UnixConn)
+	if !ok {
+		t.Fatal("admin connection is not a Unix connection")
+	}
+	if err := unixConnection.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := io.ReadAll(connection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
 }
 
 func TestRequestHeadLimitAcceptsExactBoundaryAndRejectsOneByteMore(t *testing.T) {

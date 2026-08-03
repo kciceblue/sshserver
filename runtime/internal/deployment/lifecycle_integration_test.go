@@ -1,0 +1,290 @@
+//go:build darwin || linux
+
+package deployment
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
+	"github.com/kciceblue/sshserver/runtime/internal/instance"
+)
+
+func TestRealNativeBinaryStagesAttestsRunsAndUninstalls(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real release-binary integration is disabled in short mode")
+	}
+	layout := shortIntegrationLayout(t)
+	uploadDir := filepath.Join(layout.HomeDir, "verified-upload")
+	if err := os.Mkdir(uploadDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	goVersionCommand := exec.Command("go", "env", "GOVERSION")
+	goVersionCommand.Env = integrationGoEnvironment("GOENV=off", "GOTOOLCHAIN=local")
+	goVersionOutput, err := goVersionCommand.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolchain := strings.TrimSpace(string(goVersionOutput))
+	release := "v0.0.0-lifecycle-test"
+	sourceRevision := strings.Repeat("a", 40)
+	target := Target{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+	buildIdentity, err := DeriveBuildIdentity(release, sourceRevision, toolchain, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestation, err := buildinfo.Encode(buildinfo.Identity{
+		Release:         release,
+		SourceRevision:  sourceRevision,
+		BuildToolchain:  toolchain,
+		BuildIdentity:   buildIdentity,
+		ProtocolVersion: "1",
+		StorageSchema:   "1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	binarySource := filepath.Join(uploadDir, "sshserver")
+	runtimeRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command(
+		"go", "build", "-mod=readonly", "-buildmode=exe", "-buildvcs=true", "-tags=", "-trimpath",
+		"-ldflags=-X github.com/kciceblue/sshserver/runtime/internal/buildinfo.EncodedIdentity="+attestation,
+		"-o", binarySource, "./cmd/sshserver",
+	)
+	build.Dir = runtimeRoot
+	build.Env = integrationGoEnvironment(
+		"GOENV=off", "GOWORK=off", "GOFLAGS=", "GOEXPERIMENT=", "GOTOOLCHAIN=local",
+		"CGO_ENABLED=0", "GOOS="+target.OS, "GOARCH="+target.Architecture,
+		"GOAMD64=v1", "GOARM64=v8.0",
+	)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build real native release fixture: %v\n%s", err, output)
+	}
+	if err := os.Chmod(binarySource, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	licensePayload := []byte("Apache-2.0 release license fixture\n")
+	noticePayload := []byte("release notice fixture\n")
+	licenseSource := writeIntegrationUpload(t, uploadDir, "LICENSE", licensePayload)
+	noticeSource := writeIntegrationUpload(t, uploadDir, "NOTICE", noticePayload)
+	binaryPayload, err := os.ReadFile(binarySource)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := ReleaseManifest{
+		ManifestVersion: ManifestVersion,
+		Release:         release,
+		SourceRevision:  sourceRevision,
+		BuildToolchain:  toolchain,
+		ProtocolVersion: "1",
+		StorageSchema:   "1",
+		DownloadOrigin:  "https://downloads.example.test",
+		ReleaseFiles: []ReleaseFile{
+			{Name: "LICENSE", URL: integrationReleaseURL(release, "LICENSE"), Bytes: int64(len(licensePayload)), SHA256: SHA256Hex(licensePayload)},
+			{Name: "NOTICE", URL: integrationReleaseURL(release, "NOTICE"), Bytes: int64(len(noticePayload)), SHA256: SHA256Hex(noticePayload)},
+		},
+	}
+	for _, supported := range SupportedTargets() {
+		identity, err := DeriveBuildIdentity(release, sourceRevision, toolchain, supported)
+		if err != nil {
+			t.Fatal(err)
+		}
+		artifact := ReleaseArtifact{
+			OS: supported.OS, Architecture: supported.Architecture, BuildIdentity: identity,
+			URL:   integrationReleaseURL(release, "sshserver-"+supported.OS+"-"+supported.Architecture),
+			Bytes: 1, SHA256: strings.Repeat("f", 64),
+		}
+		if supported == target {
+			artifact.Bytes = int64(len(binaryPayload))
+			artifact.SHA256 = SHA256Hex(binaryPayload)
+		}
+		manifest.Artifacts = append(manifest.Artifacts, artifact)
+	}
+	manifestPayload, err := manifest.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenAddress := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.Initialize(context.Background(), layout.StateDir, []string{listenAddress}); err != nil {
+		t.Fatal(err)
+	}
+
+	installedBinary, err := layout.BinaryPath(release, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &fakeServiceManager{
+		kind:         ManagerForeground,
+		availability: foregroundAvailability(layout, installedBinary),
+		failures:     make(map[string]int),
+	}
+	lifecycle := newLifecycle(layout, target, manager)
+	result, err := lifecycle.Apply(context.Background(), ApplyRequest{
+		ManifestPayload: manifestPayload,
+		ManifestSHA256:  SHA256Hex(manifestPayload),
+		ArtifactPath:    binarySource,
+		LicensePath:     licenseSource,
+		NoticePath:      noticeSource,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "foreground_required" || result.Foreground == nil ||
+		fmt.Sprint(result.Foreground.Command) != fmt.Sprint([]string{installedBinary, "serve", "--state-dir", layout.StateDir}) {
+		t.Fatalf("apply result=%+v", result)
+	}
+
+	var stdout, stderr bytes.Buffer
+	server := exec.Command(result.Foreground.Command[0], result.Foreground.Command[1:]...)
+	server.Stdout = &stdout
+	server.Stderr = &stderr
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Wait() }()
+	serverStopped := false
+	t.Cleanup(func() {
+		if !serverStopped && server.Process != nil {
+			_ = server.Process.Kill()
+			<-done
+		}
+	})
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		runningIdentity, probeErr := ProbeRunningIdentity(context.Background(), layout.StateDir)
+		if probeErr == nil {
+			if runningIdentity != identityFor(*result.State.Active) {
+				t.Fatalf("running identity=%+v", runningIdentity)
+			}
+			break
+		}
+		select {
+		case exitErr := <-done:
+			serverStopped = true
+			t.Fatalf("foreground server exited before attestation: %v\nstdout=%s\nstderr=%s", exitErr, stdout.String(), stderr.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("foreground server did not become ready: %v\nstderr=%s", probeErr, stderr.String())
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	status, err := lifecycle.Status(context.Background())
+	if err != nil || status.Status != "foreground_running" || !status.Running {
+		t.Fatalf("running status=%+v err=%v", status, err)
+	}
+
+	if err := server.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		serverStopped = true
+		if err != nil {
+			t.Fatalf("foreground server stop: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("foreground server did not stop after SIGTERM")
+	}
+	status, err = lifecycle.Status(context.Background())
+	if err != nil || status.Status != "foreground_stopped" || status.Running {
+		t.Fatalf("stopped status=%+v err=%v", status, err)
+	}
+	uninstalled, err := lifecycle.Uninstall(context.Background())
+	if err != nil || uninstalled.Status != "uninstalled" || uninstalled.State.Status != StatusUninstalled {
+		t.Fatalf("uninstall=%+v err=%v", uninstalled, err)
+	}
+	if _, err := os.Lstat(filepath.Dir(installedBinary)); !os.IsNotExist(err) {
+		t.Fatalf("immutable release directory remains after uninstall: %v", err)
+	}
+	opened, err := instance.Open(context.Background(), layout.StateDir)
+	if err != nil {
+		t.Fatalf("protected instance was not preserved: %v", err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeIntegrationUpload(t *testing.T, directory, name string, payload []byte) string {
+	t.Helper()
+	path := filepath.Join(directory, name)
+	if err := os.WriteFile(path, payload, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func integrationReleaseURL(release, name string) string {
+	return "https://downloads.example.test/releases/" + release + "/" + name
+}
+
+func integrationGoEnvironment(overrides ...string) []string {
+	replaced := make(map[string]bool, len(overrides))
+	for _, override := range overrides {
+		key, _, _ := strings.Cut(override, "=")
+		replaced[key] = true
+	}
+	environment := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if !replaced[key] {
+			environment = append(environment, entry)
+		}
+	}
+	return append(environment, overrides...)
+}
+
+func shortIntegrationLayout(t *testing.T) Layout {
+	t.Helper()
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	physicalHome, err := filepath.EvalSymlinks(userHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := os.MkdirTemp(physicalHome, ".jat-lifecycle-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	layout, err := NewLayout(home, filepath.Join(home, "deployment"), filepath.Join(home, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareLayout(layout); err != nil {
+		t.Fatal(err)
+	}
+	return layout
+}
