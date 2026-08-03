@@ -12,12 +12,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
+	"github.com/kciceblue/sshserver/runtime/internal/deployment"
 	"github.com/kciceblue/sshserver/runtime/internal/httpapi"
 	"github.com/kciceblue/sshserver/runtime/internal/instance"
 )
@@ -203,7 +206,12 @@ func TestRunWithAdminAcquiresListenersBeforeStartingBoot(t *testing.T) {
 		connection.Close()
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(connection, `{"operation":"enrollment_create"}`); err != nil {
+	enrollmentCommand, err := EncodeEnrollmentCreateRequest(nil)
+	if err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	if _, err := connection.Write(enrollmentCommand); err != nil {
 		connection.Close()
 		t.Fatal(err)
 	}
@@ -248,6 +256,160 @@ func TestRunWithAdminAcquiresListenersBeforeStartingBoot(t *testing.T) {
 	}
 	if _, err := os.Lstat(first.Paths.AdminSocket); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("admin socket remains after shutdown: %v", err)
+	}
+}
+
+func TestManagedEnrollmentRejectsUpgradeBetweenCLIBindingAndGrantHandling(t *testing.T) {
+	ctx := context.Background()
+	layout := managedEnrollmentLayout(t)
+	first := managedEnrollmentRelease(t, layout, "v1.2.3", "a")
+	second := managedEnrollmentRelease(t, layout, "v1.2.4", "b")
+	for _, release := range []deployment.InstalledRelease{first, second} {
+		if err := os.MkdirAll(filepath.Dir(release.BinaryPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(release.BinaryPath, []byte(release.Release), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstState := deployment.DeploymentState{
+		StateVersion: deployment.DeploymentStateVersion,
+		Generation:   1,
+		Status:       deployment.StatusForeground,
+		Manager:      deployment.ManagerForeground,
+		StateDir:     layout.StateDir,
+		Active:       &first,
+	}
+	if err := deployment.SaveState(layout, firstState); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(layout.LockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := deployment.ActiveExecutableForExecutable(first.BinaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := EncodeEnrollmentCreateRequest(&binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	settings, err := instance.Initialize(ctx, layout.StateDir, []string{"127.0.0.1:37421"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := instance.Open(ctx, layout.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := opened.Close(); err != nil {
+			t.Errorf("close managed enrollment instance: %v", err)
+		}
+	})
+	if err := opened.Store.StartBoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite3", "file:"+opened.Paths.Database+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	_, grantsBefore, _ := readBootArtifacts(t, raw)
+	directRequest, err := EncodeEnrollmentCreateRequest(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handleAdminRequest(ctx, directRequest, io.Discard, settings, opened.Store, opened.Paths, first.BinaryPath); err == nil {
+		t.Fatal("managed serving executable accepted an unbound direct-init request")
+	}
+	_, grantsAfterDirect, _ := readBootArtifacts(t, raw)
+	if grantsAfterDirect != grantsBefore {
+		t.Fatalf("unbound managed request changed grants from %d to %d", grantsBefore, grantsAfterDirect)
+	}
+	var activeResponse bytes.Buffer
+	if err := handleAdminRequest(ctx, request, &activeResponse, settings, opened.Store, opened.Paths, first.BinaryPath); err != nil {
+		t.Fatalf("active managed enrollment failed: %v", err)
+	}
+	if activeResponse.Len() == 0 {
+		t.Fatal("active managed enrollment returned no response")
+	}
+	_, grantsBeforeRace, _ := readBootArtifacts(t, raw)
+	if grantsBeforeRace != grantsBefore+1 {
+		t.Fatalf("active managed enrollment changed grants from %d to %d", grantsBefore, grantsBeforeRace)
+	}
+
+	// This state switch is the deterministic external upgrade between the
+	// CLI's captured binding above and the admin handler below.
+	secondState := deployment.DeploymentState{
+		StateVersion: deployment.DeploymentStateVersion,
+		Generation:   2,
+		Status:       deployment.StatusForeground,
+		Manager:      deployment.ManagerForeground,
+		StateDir:     layout.StateDir,
+		Active:       &second,
+		Previous:     &first,
+	}
+	if err := deployment.SaveState(layout, secondState); err != nil {
+		t.Fatal(err)
+	}
+	var response bytes.Buffer
+	if err := handleAdminRequest(ctx, request, &response, settings, opened.Store, opened.Paths, first.BinaryPath); err == nil {
+		t.Fatal("stale managed executable unexpectedly created an enrollment response")
+	}
+	if response.Len() != 0 {
+		t.Fatalf("stale managed enrollment exposed response bytes: %q", response.String())
+	}
+	_, grantsAfter, _ := readBootArtifacts(t, raw)
+	if grantsAfter != grantsBeforeRace {
+		t.Fatalf("stale managed enrollment changed grants from %d to %d", grantsBeforeRace, grantsAfter)
+	}
+}
+
+func TestAdminRequestBoundaryIsCanonicalBoundedAndCredentialFree(t *testing.T) {
+	binding := deployment.ActiveExecutableBinding{
+		Generation:   9,
+		BinaryPath:   "/managed/versions/v1.2.3/sshserver-linux-amd64",
+		BinarySHA256: strings.Repeat("a", 64),
+		StateDir:     "/must/not/be/serialized",
+	}
+	payload, err := EncodeEnrollmentCreateRequest(&binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"instance_secret", "enrollment_grant", "device_token", binding.StateDir} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("admin request exposed %q: %s", forbidden, payload)
+		}
+	}
+	decoded, err := decodeAdminRequest(payload)
+	if err != nil || decoded.Deployment == nil || decoded.Deployment.BinaryPath != binding.BinaryPath {
+		t.Fatalf("decode managed request = %+v, error=%v", decoded, err)
+	}
+	directPayload, err := EncodeEnrollmentCreateRequest(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := decodeAdminRequest(directPayload)
+	if err != nil || !direct.DirectInit || direct.Deployment != nil {
+		t.Fatalf("decode direct request = %+v, error=%v", direct, err)
+	}
+	oversizedBinding := binding
+	oversizedBinding.BinaryPath = "/" + strings.Repeat("x", maxAdminRequestBytes)
+	if _, err := EncodeEnrollmentCreateRequest(&oversizedBinding); err == nil {
+		t.Fatal("oversized canonical admin request unexpectedly encoded")
+	}
+	for name, malformed := range map[string][]byte{
+		"trailing":   append(append([]byte(nil), payload...), ' '),
+		"unknown":    []byte(`{"operation":"deployment_status","future":true}`),
+		"over limit": bytes.Repeat([]byte("x"), maxAdminRequestBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeAdminRequest(malformed); err == nil {
+				t.Fatalf("malformed admin request accepted (%d bytes)", len(malformed))
+			}
+		})
 	}
 }
 
@@ -490,6 +652,61 @@ func shortStateDir(t *testing.T) string {
 		}
 	})
 	return stateDir
+}
+
+func managedEnrollmentLayout(t *testing.T) deployment.Layout {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHome, err := os.MkdirTemp(home, ".sshserver-admin-race-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(testHome) })
+	if err := os.Chmod(testHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := deployment.NewLayout(testHome, filepath.Join(testHome, "deployment"), filepath.Join(testHome, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deployment.PrepareLayout(layout); err != nil {
+		t.Fatal(err)
+	}
+	return layout
+}
+
+func managedEnrollmentRelease(t *testing.T, layout deployment.Layout, release, digestDigit string) deployment.InstalledRelease {
+	t.Helper()
+	target := deployment.Target{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+	binaryPath, err := layout.BinaryPath(release, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deployment.InstalledRelease{
+		Release:         release,
+		SourceRevision:  strings.Repeat(digestDigit, 40),
+		BuildToolchain:  "go1.25.0",
+		BuildIdentity:   strings.Repeat(digestDigit, 64),
+		ManifestSHA256:  strings.Repeat(digestDigit, 64),
+		ProtocolVersion: "1",
+		StorageSchema:   "1",
+		OS:              target.OS,
+		Architecture:    target.Architecture,
+		BinaryPath:      binaryPath,
+		BinaryBytes:     int64(len(release)),
+		BinarySHA256:    strings.Repeat(digestDigit, 64),
+		LicenseBytes:    1,
+		LicenseSHA256:   strings.Repeat(digestDigit, 64),
+		NoticeBytes:     1,
+		NoticeSHA256:    strings.Repeat(digestDigit, 64),
+	}
 }
 
 func readBootArtifacts(t *testing.T, database *sql.DB) ([]byte, int, int) {

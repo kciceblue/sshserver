@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestSettingsRejectNonLoopbackAndNonCanonicalListeners(t *testing.T) {
@@ -27,6 +29,26 @@ func TestSettingsRejectNonLoopbackAndNonCanonicalListeners(t *testing.T) {
 		if err := ValidateListener(address); err == nil {
 			t.Fatalf("ValidateListener(%q) unexpectedly succeeded", address)
 		}
+	}
+}
+
+func TestProtectedFileReadRejectsFIFOWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := LoadSettings(path)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("FIFO unexpectedly accepted as protected config")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("protected config read blocked on FIFO")
 	}
 }
 

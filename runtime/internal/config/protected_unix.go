@@ -37,7 +37,10 @@ func readProtectedFile(path string, allowedMode os.FileMode, limit int64) ([]byt
 }
 
 func openProtectedFile(path string, flags int, allowedMode os.FileMode) (*os.File, error) {
-	fd, err := syscall.Open(path, flags|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	// O_NONBLOCK prevents a replaced FIFO or device from stalling before the
+	// descriptor can be inspected and rejected. It has no effect on regular
+	// file I/O on the supported Unix platforms.
+	fd, err := syscall.Open(path, flags|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}

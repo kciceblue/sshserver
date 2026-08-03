@@ -97,3 +97,44 @@ for its full lifetime. `deploy status` distinguishes active, inactive,
 foreground-running, foreground-stopped, damaged, identity-mismatch, and
 recovery-required states; rollback and uninstall reuse the same durable
 transaction journal.
+
+## Stable deployment locator and upgrade refresh
+
+The app retains one previously verified immutable lifecycle binary together
+with the canonical home, install-root, and state-directory paths from the
+lifecycle request/result context. Before each new sync channel it runs:
+
+```text
+<absolute-verified-lifecycle-binary> deploy status \
+  --home-dir <canonical-home> \
+  --install-root <canonical-install-root> \
+  --state-dir <canonical-state-directory>
+```
+
+All three layout flags must be supplied together for this read-only status
+locator. Mutating apply, recover, rollback, and uninstall commands retain their
+independent per-flag override behavior and merge omitted fields from platform
+defaults. Exact-layout status parses its tuple before consulting defaults and
+does not use ambient `HOME`,
+`XDG_DATA_HOME`, `XDG_STATE_HOME`, or `XDG_CONFIG_HOME` to select or validate
+another deployment layout. The client accepts only a healthy running result
+with no recovery journal and issues the active-binary capability only from the
+fully validated active release.
+
+The client uses that same refreshed active binary for
+`enrollment create --format=json`. With no explicit state argument, a managed
+binary resolves the protected state directory from the active deployment
+record and binds the private admin request to its generation, exact binary path,
+and artifact digest. The serving binary reloads that record while holding a
+shared lifecycle lock through grant creation, so a concurrent external upgrade
+or rollback cannot let a stale binary mint a grant. The explicit `--state-dir`
+form remains available for directly initialized, non-managed binaries and is
+parsed without first consulting ambient defaults.
+
+Apply, recover, upgrade, and rollback never remove an installed immutable
+release directory. This lets a locator retained before an equivalent one-line
+or other supported out-of-app upgrade report the newest active binary. Only
+explicit uninstall removes the immutable version tree. A missing or damaged
+locator, partial layout tuple, unhealthy status, or recovery-required result
+fails closed into deployment recovery; it never triggers PATH lookup, port
+scanning, or a direct/public fallback.

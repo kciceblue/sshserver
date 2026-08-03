@@ -86,6 +86,22 @@ func NewNativeLifecycle(layout Layout) (*Lifecycle, error) {
 	return newLifecycle(layout, target, manager), nil
 }
 
+// NewNativeStatusLifecycle constructs the read-only status path without
+// consulting XDG_CONFIG_HOME. The recorded manager kind and service definition
+// remain validated by DeploymentState; the status probe itself addresses only
+// the fixed current-user service label.
+func NewNativeStatusLifecycle(layout Layout) (*Lifecycle, error) {
+	target := Target{OS: runtime.GOOS, Architecture: runtime.GOARCH}
+	if !isSupportedTarget(target) {
+		return nil, fmt.Errorf("unsupported deployment host %s/%s", target.OS, target.Architecture)
+	}
+	manager, err := newNativeStatusServiceManagerAdapter(layout.HomeDir)
+	if err != nil {
+		return nil, err
+	}
+	return newLifecycle(layout, target, manager), nil
+}
+
 func (lifecycle *Lifecycle) Status(ctx context.Context) (StatusResult, error) {
 	if lifecycle == nil || lifecycle.manager == nil || lifecycle.inspector == nil || lifecycle.verifyArtifact == nil || lifecycle.verifyReleaseFile == nil || lifecycle.probeRunning == nil {
 		return StatusResult{}, errors.New("deployment lifecycle dependencies are incomplete")

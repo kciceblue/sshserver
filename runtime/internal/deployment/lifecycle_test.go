@@ -51,6 +51,45 @@ func TestApplyTransactionCommitsExactNativeReleaseAndIsIdempotent(t *testing.T) 
 	}
 }
 
+func TestVerifiedLocatorSurvivesRepeatedUpgradesAndStatusRefreshesNewestActivePath(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	var installed []InstalledRelease
+	for index, version := range []string{"v1.2.3", "v1.2.4", "v1.2.5"} {
+		request, release := fixture.release(t, version, fmt.Sprint(index))
+		result, err := fixture.lifecycle.Apply(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.State.Active == nil || *result.State.Active != release {
+			t.Fatalf("upgrade %s active state=%+v", version, result.State.Active)
+		}
+		installed = append(installed, release)
+	}
+	if fixture.removeCalls != 0 {
+		t.Fatalf("supported upgrades removed immutable release artifacts %d times", fixture.removeCalls)
+	}
+	for _, release := range installed {
+		identity, err := fixture.lifecycle.inspector.Inspect(
+			context.Background(),
+			release.BinaryPath,
+		)
+		if err != nil || identity != identityFor(release) {
+			t.Fatalf("retained locator %s identity=%+v err=%v", release.BinaryPath, identity, err)
+		}
+	}
+	status, err := fixture.lifecycle.Status(context.Background())
+	if err != nil || status.Status != "active" || !status.Running || status.State == nil ||
+		status.State.Active == nil || status.State.Active.BinaryPath != installed[len(installed)-1].BinaryPath {
+		t.Fatalf("refreshed newest status=%+v err=%v", status, err)
+	}
+	if _, err := fixture.lifecycle.Uninstall(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.removeCalls != 1 {
+		t.Fatalf("explicit uninstall artifact removals=%d want=1", fixture.removeCalls)
+	}
+}
+
 func TestApplyTransactionResumesAfterEveryDurablePhase(t *testing.T) {
 	phases := []Phase{
 		PhasePlanned,

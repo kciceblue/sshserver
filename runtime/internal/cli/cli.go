@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +54,8 @@ func (runner Runner) Run(ctx context.Context, args []string) int {
 		err = runner.runHealth(ctx, args[1:])
 	case "enrollment":
 		err = runner.runEnrollment(ctx, args[1:])
+	case "endpoint":
+		err = runner.runEndpoint(args[1:])
 	case "service":
 		err = runner.runService(args[1:])
 	case "deploy":
@@ -192,17 +195,14 @@ func wrapOptionalError(operation string, err error) error {
 }
 
 func (runner Runner) runDeployStatus(ctx context.Context, args []string) error {
-	values, flags, err := runner.newDeploymentFlags("deploy status")
-	if err != nil {
-		return err
-	}
+	values, flags := runner.newDeploymentStatusFlags("deploy status")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return errors.New("deploy status accepts no positional arguments")
 	}
-	lifecycle, err := values.lifecycle()
+	lifecycle, err := values.statusLifecycle()
 	if err != nil {
 		return err
 	}
@@ -266,6 +266,8 @@ type deploymentFlagValues struct {
 }
 
 func (runner Runner) newDeploymentFlags(name string) (*deploymentFlagValues, *flag.FlagSet, error) {
+	// Mutating lifecycle commands preserve the original independent override
+	// behavior: each omitted layout field inherits its platform default.
 	layout, err := deployment.DefaultLayout()
 	if err != nil {
 		return nil, nil, err
@@ -288,6 +290,41 @@ func (values deploymentFlagValues) lifecycle() (*deployment.Lifecycle, error) {
 		return nil, err
 	}
 	return deployment.NewNativeLifecycle(layout)
+}
+
+func (runner Runner) newDeploymentStatusFlags(name string) (*deploymentFlagValues, *flag.FlagSet) {
+	// Status parses a complete verified locator before consulting ambient
+	// defaults, so a retained all-three tuple survives HOME/XDG drift.
+	values := &deploymentFlagValues{}
+	flags := runner.flagSet(name)
+	flags.StringVar(&values.homeDir, "home-dir", "", "physical current-user home directory (default: current user home)")
+	flags.StringVar(&values.installRoot, "install-root", "", "owner-only deployment root beneath home (default: platform data directory)")
+	flags.StringVar(&values.stateDir, "state-dir", "", "protected instance state directory beneath home (default: platform state directory)")
+	return values, flags
+}
+
+func (values deploymentFlagValues) statusLifecycle() (*deployment.Lifecycle, error) {
+	layout, err := values.statusLayout()
+	if err != nil {
+		return nil, err
+	}
+	return deployment.NewNativeStatusLifecycle(layout)
+}
+
+func (values deploymentFlagValues) statusLayout() (deployment.Layout, error) {
+	explicitCount := 0
+	for _, value := range []string{values.homeDir, values.installRoot, values.stateDir} {
+		if value != "" {
+			explicitCount++
+		}
+	}
+	if explicitCount == 0 {
+		return deployment.DefaultLayout()
+	}
+	if explicitCount != 3 {
+		return deployment.Layout{}, errors.New("--home-dir, --install-root, and --state-dir must be supplied together")
+	}
+	return deployment.NewLayout(values.homeDir, values.installRoot, values.stateDir)
 }
 
 func (runner Runner) runInit(ctx context.Context, args []string) error {
@@ -363,13 +400,10 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] != "create" {
 		return errors.New("enrollment requires create")
 	}
-	stateDir, err := config.DefaultStateDir()
-	if err != nil {
-		return err
-	}
+	stateDir := ""
 	format := "json"
 	flags := runner.flagSet("enrollment create")
-	flags.StringVar(&stateDir, "state-dir", stateDir, "absolute protected state directory")
+	flags.StringVar(&stateDir, "state-dir", stateDir, "absolute protected state directory; managed binaries use their deployment record")
 	flags.StringVar(&format, "format", format, "output format (json)")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
@@ -380,6 +414,17 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 	if format != "json" {
 		return errors.New("enrollment create supports only --format=json")
 	}
+	var deploymentBinding *deployment.ActiveExecutableBinding
+	if stateDir == "" {
+		executable, err := os.Executable()
+		if err != nil {
+			return errors.New("enrollment executable path is unavailable")
+		}
+		stateDir, deploymentBinding, err = commandStateForExecutable(executable)
+		if err != nil {
+			return errors.New("enrollment instance state is unavailable")
+		}
+	}
 	if err := config.EnsureStateDirectory(stateDir); err != nil {
 		return err
 	}
@@ -388,7 +433,11 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 		return errors.New("enrollment service is unavailable")
 	}
 	defer connection.Close()
-	if _, err := io.WriteString(connection, `{"operation":"enrollment_create"}`); err != nil {
+	request, err := server.EncodeEnrollmentCreateRequest(deploymentBinding)
+	if err != nil {
+		return errors.New("enrollment service request failed")
+	}
+	if _, err := connection.Write(request); err != nil {
 		return errors.New("enrollment service request failed")
 	}
 	if unixConnection, ok := connection.(*net.UnixConn); ok {
@@ -438,6 +487,107 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 		return errors.New("enrollment service returned an invalid response")
 	}
 	return json.NewEncoder(runner.Stdout).Encode(response)
+}
+
+func (runner Runner) runEndpoint(args []string) error {
+	if len(args) == 0 {
+		return errors.New("endpoint requires show")
+	}
+	if args[0] != "show" {
+		return errors.New("endpoint supports only show")
+	}
+	return runner.runEndpointShow(args[1:])
+}
+
+func (runner Runner) runEndpointShow(args []string) error {
+	stateDir := ""
+	format := "json"
+	flags := flag.NewFlagSet("endpoint show", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.StringVar(&stateDir, "state-dir", stateDir, "absolute protected state directory; defaults to the platform state path")
+	flags.StringVar(&format, "format", format, "output format (json)")
+	if err := flags.Parse(args); err != nil {
+		return errors.New("endpoint show has invalid options")
+	}
+	if flags.NArg() != 0 {
+		return errors.New("endpoint show accepts no positional arguments")
+	}
+	if format != "json" {
+		return errors.New("endpoint show supports only --format=json")
+	}
+	if stateDir == "" {
+		executable, err := os.Executable()
+		if err != nil {
+			return errors.New("endpoint executable path is unavailable")
+		}
+		stateDir, err = stateDirForExecutable(executable)
+		if err != nil {
+			return errors.New("endpoint instance state is unavailable")
+		}
+	}
+	settings, err := instance.LoadCompletedSettings(stateDir)
+	if err != nil {
+		return errors.New("endpoint instance state is unavailable")
+	}
+	port, err := discoverableIPv4LoopbackPort(settings.Listeners)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(runner.Stdout).Encode(struct {
+		ProtocolVersion string `json:"protocol_version"`
+		InstanceID      string `json:"instance_id"`
+		VaultID         string `json:"vault_id"`
+		LoopbackPort    int    `json:"loopback_port"`
+	}{
+		ProtocolVersion: config.ProtocolMajor,
+		InstanceID:      settings.InstanceID,
+		VaultID:         settings.VaultID,
+		LoopbackPort:    port,
+	})
+}
+
+func stateDirForExecutable(executable string) (string, error) {
+	stateDir, _, err := commandStateForExecutable(executable)
+	return stateDir, err
+}
+
+func commandStateForExecutable(executable string) (string, *deployment.ActiveExecutableBinding, error) {
+	binding, err := deployment.ActiveExecutableForExecutable(executable)
+	if err == nil {
+		return binding.StateDir, &binding, nil
+	}
+	if !errors.Is(err, deployment.ErrNotDeployedExecutable) {
+		return "", nil, err
+	}
+	stateDir, err := config.DefaultStateDir()
+	return stateDir, nil, err
+}
+
+func discoverableIPv4LoopbackPort(listeners []string) (int, error) {
+	sharedPort := ""
+	hasProductIPv4Listener := false
+	for _, address := range listeners {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return 0, errors.New("endpoint listener configuration is invalid")
+		}
+		if sharedPort == "" {
+			sharedPort = port
+		} else if sharedPort != port {
+			return 0, errors.New("endpoint listeners do not share one port")
+		}
+		if host == "127.0.0.1" {
+			hasProductIPv4Listener = true
+		}
+	}
+	if !hasProductIPv4Listener {
+		return 0, errors.New("endpoint has no usable 127.0.0.1 listener")
+	}
+	port, err := strconv.Atoi(sharedPort)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, errors.New("endpoint listener port is invalid")
+	}
+	return port, nil
 }
 
 func (runner Runner) runHealth(ctx context.Context, args []string) error {
@@ -583,7 +733,7 @@ func (runner Runner) flagSet(name string) *flag.FlagSet {
 }
 
 func (runner Runner) usage() {
-	fmt.Fprintln(runner.Stderr, "usage: sshserver <init|serve|health|enrollment|service|deploy|version> [options]")
+	fmt.Fprintln(runner.Stderr, "usage: sshserver <init|serve|health|enrollment|endpoint|service|deploy|version> [options]")
 }
 
 type stringList struct {
