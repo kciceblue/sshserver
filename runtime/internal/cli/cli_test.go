@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -192,6 +193,26 @@ func TestEndpointShowReportsDefaultAndCustomLoopbackPorts(t *testing.T) {
 	}
 }
 
+func TestEndpointStateDirForExecutableFallsBackOnlyOutsideDeployment(t *testing.T) {
+	arbitrary := filepath.Join(t.TempDir(), "sshserver")
+	if err := os.WriteFile(arbitrary, []byte("test executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defaultState := filepath.Join(t.TempDir(), "default-state")
+	t.Setenv("XDG_STATE_HOME", filepath.Dir(filepath.Dir(defaultState)))
+	resolved, err := endpointStateDirForExecutable(arbitrary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := config.DefaultStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != want {
+		t.Fatalf("resolved state directory = %q, want default %q", resolved, want)
+	}
+}
+
 func TestEndpointShowIsReadOnlyAndEmitsNoSecret(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
 	if _, err := instance.Initialize(context.Background(), stateDir, []string{"127.0.0.1:40123"}); err != nil {
@@ -325,6 +346,40 @@ func TestEndpointShowFailsClosedWithoutUsableCompletedConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertEndpointShowFails(t, stateDir, "endpoint instance state is unavailable")
+	})
+
+	t.Run("FIFO protected marker", func(t *testing.T) {
+		stateDir := filepath.Join(t.TempDir(), "state")
+		if err := os.Mkdir(stateDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(config.ForStateDir(stateDir).InstallMarker, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		result := make(chan struct {
+			stdout string
+			stderr string
+			code   int
+		}, 1)
+		go func() {
+			var stdout, stderr bytes.Buffer
+			code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{
+				"endpoint", "show", "--state-dir", stateDir,
+			})
+			result <- struct {
+				stdout string
+				stderr string
+				code   int
+			}{stdout: stdout.String(), stderr: stderr.String(), code: code}
+		}()
+		select {
+		case got := <-result:
+			if got.code == 0 || got.stdout != "" || !strings.Contains(got.stderr, "endpoint instance state is unavailable") {
+				t.Fatalf("FIFO endpoint result code=%d stdout=%q stderr=%q", got.code, got.stdout, got.stderr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("endpoint discovery blocked on FIFO marker")
+		}
 	})
 }
 

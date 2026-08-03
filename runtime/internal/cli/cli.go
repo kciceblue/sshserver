@@ -470,10 +470,13 @@ func (runner Runner) runEndpointShow(args []string) error {
 		return errors.New("endpoint show supports only --format=json")
 	}
 	if stateDir == "" {
-		var err error
-		stateDir, err = config.DefaultStateDir()
+		executable, err := os.Executable()
 		if err != nil {
-			return errors.New("endpoint default state path is unavailable")
+			return errors.New("endpoint executable path is unavailable")
+		}
+		stateDir, err = endpointStateDirForExecutable(executable)
+		if err != nil {
+			return errors.New("endpoint instance state is unavailable")
 		}
 	}
 	settings, err := instance.LoadCompletedSettings(stateDir)
@@ -495,6 +498,17 @@ func (runner Runner) runEndpointShow(args []string) error {
 		VaultID:         settings.VaultID,
 		LoopbackPort:    port,
 	})
+}
+
+func endpointStateDirForExecutable(executable string) (string, error) {
+	stateDir, err := deployment.StateDirForExecutable(executable)
+	if err == nil {
+		return stateDir, nil
+	}
+	if !errors.Is(err, deployment.ErrNotDeployedExecutable) {
+		return "", err
+	}
+	return config.DefaultStateDir()
 }
 
 func discoverableIPv4LoopbackPort(listeners []string) (int, error) {

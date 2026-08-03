@@ -42,6 +42,14 @@ directory. It writes exactly one JSON object to standard output; the instance
 secret and five-minute, single-use enrollment grant are never accepted in
 arguments, environment variables, the HTTP API, or service-manager files.
 
+Normal sync discovers a configurable loopback port without minting a grant by
+invoking the exact active deployed binary with `endpoint show --format=json`.
+That read-only command resolves the recorded deployment state independently of
+ambient XDG variables and emits only the protocol version, public instance and
+vault UUIDs, and validated IPv4 loopback port. The normative command and client
+boundary are specified in
+[`../protocol/v1/endpoint-discovery.md`](../protocol/v1/endpoint-discovery.md).
+
 `init` is idempotent and refuses unsafe ownership, permissions, symlinks, hard
 links, mixed partial installations, and listener changes. Only literal IPv4 or
 IPv6 loopback listeners are accepted. The 32-byte instance secret lives in a
