@@ -205,7 +205,7 @@ func (runner Runner) runDeployStatus(ctx context.Context, args []string) error {
 	if flags.NArg() != 0 {
 		return errors.New("deploy status accepts no positional arguments")
 	}
-	lifecycle, err := values.lifecycle()
+	lifecycle, err := values.statusLifecycle()
 	if err != nil {
 		return err
 	}
@@ -269,28 +269,47 @@ type deploymentFlagValues struct {
 }
 
 func (runner Runner) newDeploymentFlags(name string) (*deploymentFlagValues, *flag.FlagSet, error) {
-	layout, err := deployment.DefaultLayout()
-	if err != nil {
-		return nil, nil, err
-	}
-	values := &deploymentFlagValues{
-		homeDir:     layout.HomeDir,
-		installRoot: layout.InstallRoot,
-		stateDir:    layout.StateDir,
-	}
+	// Parse explicit layout values before consulting environment-derived
+	// defaults. A client retaining a verified lifecycle locator must be able to
+	// refresh status after XDG or HOME changes without touching ambient paths.
+	values := &deploymentFlagValues{}
 	flags := runner.flagSet(name)
-	flags.StringVar(&values.homeDir, "home-dir", values.homeDir, "physical current-user home directory")
-	flags.StringVar(&values.installRoot, "install-root", values.installRoot, "owner-only deployment root beneath home")
-	flags.StringVar(&values.stateDir, "state-dir", values.stateDir, "protected instance state directory beneath home")
+	flags.StringVar(&values.homeDir, "home-dir", "", "physical current-user home directory (default: current user home)")
+	flags.StringVar(&values.installRoot, "install-root", "", "owner-only deployment root beneath home (default: platform data directory)")
+	flags.StringVar(&values.stateDir, "state-dir", "", "protected instance state directory beneath home (default: platform state directory)")
 	return values, flags, nil
 }
 
 func (values deploymentFlagValues) lifecycle() (*deployment.Lifecycle, error) {
-	layout, err := deployment.NewLayout(values.homeDir, values.installRoot, values.stateDir)
+	layout, err := values.layout()
 	if err != nil {
 		return nil, err
 	}
 	return deployment.NewNativeLifecycle(layout)
+}
+
+func (values deploymentFlagValues) statusLifecycle() (*deployment.Lifecycle, error) {
+	layout, err := values.layout()
+	if err != nil {
+		return nil, err
+	}
+	return deployment.NewNativeStatusLifecycle(layout)
+}
+
+func (values deploymentFlagValues) layout() (deployment.Layout, error) {
+	explicitCount := 0
+	for _, value := range []string{values.homeDir, values.installRoot, values.stateDir} {
+		if value != "" {
+			explicitCount++
+		}
+	}
+	if explicitCount == 0 {
+		return deployment.DefaultLayout()
+	}
+	if explicitCount != 3 {
+		return deployment.Layout{}, errors.New("--home-dir, --install-root, and --state-dir must be supplied together")
+	}
+	return deployment.NewLayout(values.homeDir, values.installRoot, values.stateDir)
 }
 
 func (runner Runner) runInit(ctx context.Context, args []string) error {

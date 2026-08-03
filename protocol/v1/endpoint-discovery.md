@@ -9,10 +9,28 @@ cryptography, Keychain behavior, credential custody, or storage semantics.
 
 ## Invocation and deployment binding
 
-For a lifecycle-managed installation, the client retains the absolute active
-binary path returned by the verified deployment result. On the same
-host-key-verified SSH generation used for forwarding, it invokes that exact
-binary with this argument vector and no stdin:
+For a lifecycle-managed installation, the client retains a deployment locator
+from the verified lifecycle request/result context: one exact immutable binary
+path plus the canonical home, install-root, and state-directory paths. Before
+each new channel, on the same host-key-verified SSH generation used for
+forwarding, it invokes that exact locator with this argument vector and no
+stdin:
+
+```text
+<absolute-verified-lifecycle-binary> deploy status \
+  --home-dir <canonical-home> \
+  --install-root <canonical-install-root> \
+  --state-dir <canonical-state-directory>
+```
+
+All three layout arguments are mandatory together. Their explicit form is
+parsed before deployment defaults and the read-only status path does not
+consult `HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, or `XDG_CONFIG_HOME` to
+select or validate another layout. The client strictly accepts only status
+`active` or `foreground_running`, `running: true`,
+`recovery_required: false`, no journal, and a complete validated active-release
+record. It issues a fresh active-binary capability only from that result, then
+invokes the returned exact path with:
 
 ```text
 <absolute-active-sshserver-binary> endpoint show --format=json
@@ -26,6 +44,13 @@ record. It does not recompute the deployed state directory from `XDG_STATE_HOME`
 or `XDG_DATA_HOME`. Missing, malformed, insecure, inactive, or mismatched
 deployment metadata fails closed rather than falling back to an ambient
 default.
+
+Supported apply, recover, upgrade, and rollback operations retain immutable
+release binaries; explicit uninstall removes them. A locator captured before
+an equivalent one-line or other supported out-of-app upgrade can therefore
+refresh the replacement active path. A missing or damaged locator, partial
+layout tuple, recovery journal, unhealthy status, identity mismatch, or
+uninstalled state fails closed and requires explicit deployment recovery.
 
 A directly initialized, non-lifecycle-managed binary may instead use the
 explicit form:
@@ -63,10 +88,13 @@ no filesystem path, host identifier, secret, grant, or token.
 
 ## Client requirements
 
-The client strictly decodes the response, validates the protocol plus expected
-instance and vault UUIDs, and opens a generation-bound forward only to the
-reported `127.0.0.1:<loopback_port>`. It then calls V1 capabilities through
-that forward and revalidates both identities before exposing an enrollment
-grant or bearer token. It never scans ports, resolves a hostname, follows a
-redirect, honors a proxy, or tries a direct or public endpoint. Discovery
-failure leaves the offline-first engine local and consumes no credential.
+The client performs the exact-layout status refresh above before every new
+channel, strictly decodes the endpoint response, validates the protocol plus
+expected instance and vault UUIDs, and opens a generation-bound forward only
+to the reported `127.0.0.1:<loopback_port>`. It then calls V1 capabilities
+through that forward and revalidates both identities before exposing an
+enrollment grant or bearer token. It never infers an executable from an upload
+destination, trusts PATH or a cached port, scans ports, resolves a hostname,
+follows a redirect, honors a proxy, or tries a direct or public endpoint.
+Discovery failure leaves the offline-first engine local and consumes no
+credential.

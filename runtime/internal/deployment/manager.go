@@ -117,6 +117,15 @@ type ServiceManagerAdapter struct {
 }
 
 func NewServiceManagerAdapter(platform, homeDir string, runner CommandRunner) (ServiceManagerAdapter, error) {
+	return newServiceManagerAdapter(platform, homeDir, runner, "")
+}
+
+// newServiceManagerAdapter accepts an optional canonical Linux configuration
+// home. Lifecycle mutation keeps honoring XDG_CONFIG_HOME; read-only status
+// supplies home/.config so an ambient XDG change cannot prevent an exact-layout
+// deployment refresh. IsActive addresses the fixed user-service label and does
+// not read or mutate the definition path.
+func newServiceManagerAdapter(platform, homeDir string, runner CommandRunner, linuxConfigHome string) (ServiceManagerAdapter, error) {
 	if platform != "linux" && platform != "darwin" {
 		return ServiceManagerAdapter{}, fmt.Errorf("unsupported service-manager platform %q", platform)
 	}
@@ -142,9 +151,12 @@ func NewServiceManagerAdapter(platform, homeDir string, runner CommandRunner) (S
 	}
 	if platform == "linux" {
 		adapter.commandName = "systemctl"
-		configHome := os.Getenv("XDG_CONFIG_HOME")
+		configHome := linuxConfigHome
 		if configHome == "" {
-			configHome = filepath.Join(homeDir, ".config")
+			configHome = os.Getenv("XDG_CONFIG_HOME")
+			if configHome == "" {
+				configHome = filepath.Join(homeDir, ".config")
+			}
 		}
 		if err := validateAbsoluteCanonicalPath(configHome); err != nil {
 			return ServiceManagerAdapter{}, fmt.Errorf("validate XDG configuration home: %w", err)
@@ -168,6 +180,15 @@ func NewServiceManagerAdapter(platform, homeDir string, runner CommandRunner) (S
 
 func NewNativeServiceManagerAdapter(homeDir string) (ServiceManagerAdapter, error) {
 	return NewServiceManagerAdapter(runtime.GOOS, homeDir, ExecCommandRunner{})
+}
+
+func newNativeStatusServiceManagerAdapter(homeDir string) (ServiceManagerAdapter, error) {
+	return newServiceManagerAdapter(
+		runtime.GOOS,
+		homeDir,
+		ExecCommandRunner{},
+		filepath.Join(homeDir, ".config"),
+	)
 }
 
 func (adapter ServiceManagerAdapter) Kind() ManagerKind {

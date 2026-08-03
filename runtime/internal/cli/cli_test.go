@@ -104,6 +104,59 @@ func TestDeployStatusReportsUninstalledWithoutMutatingRuntime(t *testing.T) {
 	}
 }
 
+func TestDeployStatusExplicitLayoutDoesNotConsultBrokenAmbientDefaults(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	explicitHome := t.TempDir()
+	if err := os.Chmod(explicitHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installRoot := filepath.Join(explicitHome, "deployment")
+	stateDir := filepath.Join(explicitHome, "state")
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "missing-home"))
+	t.Setenv("XDG_DATA_HOME", "relative-data-home")
+	t.Setenv("XDG_STATE_HOME", "relative-state-home")
+	t.Setenv("XDG_CONFIG_HOME", "relative-config-home")
+
+	var stdout, stderr bytes.Buffer
+	code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{
+		"deploy", "status",
+		"--home-dir", explicitHome,
+		"--install-root", installRoot,
+		"--state-dir", stateDir,
+	})
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("explicit deploy status code=%d stderr=%q", code, stderr.String())
+	}
+	var result struct {
+		Status           string `json:"status"`
+		Running          bool   `json:"running"`
+		RecoveryRequired bool   `json:"recovery_required"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "uninstalled" || result.Running || result.RecoveryRequired {
+		t.Fatalf("explicit deploy status=%+v", result)
+	}
+	if _, err := os.Lstat(installRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only explicit status created deployment root: %v", err)
+	}
+}
+
+func TestDeployStatusRejectsPartialExplicitLayoutWithoutConsultingDefaults(t *testing.T) {
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "missing-home"))
+	var stdout, stderr bytes.Buffer
+	code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{
+		"deploy", "status", "--home-dir", t.TempDir(),
+	})
+	if code == 0 || stdout.Len() != 0 || !strings.Contains(
+		stderr.String(),
+		"--home-dir, --install-root, and --state-dir must be supplied together",
+	) {
+		t.Fatalf("partial deploy status code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestDeployApplyRequiresExactPinnedInputs(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), []string{"deploy", "apply"})
