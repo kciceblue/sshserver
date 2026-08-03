@@ -172,6 +172,32 @@ func Open(ctx context.Context, stateDir string) (*Instance, error) {
 	return &Instance{Paths: paths, Settings: settings, Store: database}, nil
 }
 
+// LoadCompletedSettings reads only the protected completion marker and config
+// for an initialized instance. It deliberately avoids EnsureStateDirectory,
+// the instance secret, and SQLite so endpoint discovery cannot create, repair,
+// or otherwise mutate server state.
+func LoadCompletedSettings(stateDir string) (config.Settings, error) {
+	if err := config.ValidateStateDirectory(stateDir); err != nil {
+		return config.Settings{}, err
+	}
+	paths := config.ForStateDir(stateDir)
+	marker, err := config.LoadMarker(paths.InstallMarker)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return config.Settings{}, config.ErrUninitialized
+		}
+		return config.Settings{}, fmt.Errorf("load install marker: %w", err)
+	}
+	if marker.Phase != "ready" || marker.State != "complete" {
+		return config.Settings{}, errors.New("installation is incomplete; rerun init")
+	}
+	settings, err := config.LoadSettings(paths.Config)
+	if err != nil {
+		return config.Settings{}, err
+	}
+	return settings, nil
+}
+
 // OpenForServe holds a process lock for the full daemon lifetime so two
 // foreground or service-manager instances cannot share one SQLite state.
 func OpenForServe(ctx context.Context, stateDir string) (*Instance, error) {

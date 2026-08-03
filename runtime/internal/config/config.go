@@ -201,6 +201,17 @@ func EnsureStateDirectory(path string) error {
 			return fmt.Errorf("protect state directory: %w", err)
 		}
 	}
+	return ValidateStateDirectory(path)
+}
+
+// ValidateStateDirectory performs the state-directory ownership and mode
+// checks without creating or changing any filesystem object. Read-only CLI
+// surfaces use it instead of EnsureStateDirectory so a discovery attempt can
+// never turn a missing or insecure path into initialized state.
+func ValidateStateDirectory(path string) error {
+	if path == "" || !filepath.IsAbs(path) {
+		return errors.New("state directory must be an absolute path")
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat state directory: %w", err)

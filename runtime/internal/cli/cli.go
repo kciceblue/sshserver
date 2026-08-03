@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +54,8 @@ func (runner Runner) Run(ctx context.Context, args []string) int {
 		err = runner.runHealth(ctx, args[1:])
 	case "enrollment":
 		err = runner.runEnrollment(ctx, args[1:])
+	case "endpoint":
+		err = runner.runEndpoint(args[1:])
 	case "service":
 		err = runner.runService(args[1:])
 	case "deploy":
@@ -440,6 +443,87 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 	return json.NewEncoder(runner.Stdout).Encode(response)
 }
 
+func (runner Runner) runEndpoint(args []string) error {
+	if len(args) == 0 {
+		return errors.New("endpoint requires show")
+	}
+	if args[0] != "show" {
+		return errors.New("endpoint supports only show")
+	}
+	return runner.runEndpointShow(args[1:])
+}
+
+func (runner Runner) runEndpointShow(args []string) error {
+	stateDir := ""
+	format := "json"
+	flags := flag.NewFlagSet("endpoint show", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.StringVar(&stateDir, "state-dir", stateDir, "absolute protected state directory; defaults to the platform state path")
+	flags.StringVar(&format, "format", format, "output format (json)")
+	if err := flags.Parse(args); err != nil {
+		return errors.New("endpoint show has invalid options")
+	}
+	if flags.NArg() != 0 {
+		return errors.New("endpoint show accepts no positional arguments")
+	}
+	if format != "json" {
+		return errors.New("endpoint show supports only --format=json")
+	}
+	if stateDir == "" {
+		var err error
+		stateDir, err = config.DefaultStateDir()
+		if err != nil {
+			return errors.New("endpoint default state path is unavailable")
+		}
+	}
+	settings, err := instance.LoadCompletedSettings(stateDir)
+	if err != nil {
+		return errors.New("endpoint instance state is unavailable")
+	}
+	port, err := discoverableIPv4LoopbackPort(settings.Listeners)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(runner.Stdout).Encode(struct {
+		ProtocolVersion string `json:"protocol_version"`
+		InstanceID      string `json:"instance_id"`
+		VaultID         string `json:"vault_id"`
+		LoopbackPort    int    `json:"loopback_port"`
+	}{
+		ProtocolVersion: config.ProtocolMajor,
+		InstanceID:      settings.InstanceID,
+		VaultID:         settings.VaultID,
+		LoopbackPort:    port,
+	})
+}
+
+func discoverableIPv4LoopbackPort(listeners []string) (int, error) {
+	sharedPort := ""
+	hasProductIPv4Listener := false
+	for _, address := range listeners {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return 0, errors.New("endpoint listener configuration is invalid")
+		}
+		if sharedPort == "" {
+			sharedPort = port
+		} else if sharedPort != port {
+			return 0, errors.New("endpoint listeners do not share one port")
+		}
+		if host == "127.0.0.1" {
+			hasProductIPv4Listener = true
+		}
+	}
+	if !hasProductIPv4Listener {
+		return 0, errors.New("endpoint has no usable 127.0.0.1 listener")
+	}
+	port, err := strconv.Atoi(sharedPort)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, errors.New("endpoint listener port is invalid")
+	}
+	return port, nil
+}
+
 func (runner Runner) runHealth(ctx context.Context, args []string) error {
 	address := config.DefaultListeners()[0]
 	flags := runner.flagSet("health")
@@ -583,7 +667,7 @@ func (runner Runner) flagSet(name string) *flag.FlagSet {
 }
 
 func (runner Runner) usage() {
-	fmt.Fprintln(runner.Stderr, "usage: sshserver <init|serve|health|enrollment|service|deploy|version> [options]")
+	fmt.Fprintln(runner.Stderr, "usage: sshserver <init|serve|health|enrollment|endpoint|service|deploy|version> [options]")
 }
 
 type stringList struct {
