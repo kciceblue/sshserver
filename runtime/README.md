@@ -69,8 +69,11 @@ covering the exact identities, paths, native-manager or supervised-foreground
 outcome, existing transaction classification, remaining actions, preserved
 data, and loopback-only listeners. Preview verifies its inputs and probes the
 current-user service-manager domain without creating the install root, state
-directory, lifecycle lock or journal, service definition, instance, or release
-artifact. Discarding the result is therefore a complete cancellation.
+directory, lifecycle or initialization lock, journal, service definition,
+instance, or release artifact. Its exact action sequence records whether each
+lock must be created and always records both lock acquisitions before journal
+or idempotent release work. Discarding the result is therefore a complete
+cancellation.
 
 The transactional `deploy apply` and `deploy recover` require the SHA-256 of
 the exact canonical preview bytes, including their terminal newline. They

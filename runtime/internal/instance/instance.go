@@ -29,6 +29,13 @@ type InitializationLease struct {
 	lock     *fileLock
 }
 
+// InitializationLockCreated reports whether this exact lease atomically
+// created the persistent lock path rather than opening a previously disclosed
+// lock. Deployment confirmation uses it to enforce the previewed action plan.
+func (lease *InitializationLease) InitializationLockCreated() bool {
+	return lease != nil && lease.lock != nil && lease.lock.created
+}
+
 func AcquireInitializationLease(stateDir string) (*InitializationLease, error) {
 	paths := config.ForStateDir(stateDir)
 	if err := config.EnsureStateDirectory(paths.StateDir); err != nil {

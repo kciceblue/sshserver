@@ -494,7 +494,8 @@ func TestDeployPreviewWriterEmitsDeterministicCanonicalJSON(t *testing.T) {
 			HomeDir: home, InstallRoot: installRoot, VersionsDir: filepath.Join(installRoot, "versions"), ReleaseDir: releaseDir,
 			StateDir: stateDir, BinaryPath: binaryPath, LicensePath: filepath.Join(releaseDir, "LICENSE"), NoticePath: filepath.Join(releaseDir, "NOTICE"),
 			DeploymentState: filepath.Join(installRoot, "deployment.json"), DeploymentJournal: filepath.Join(installRoot, "deployment-journal.json"),
-			LifecycleLock: filepath.Join(installRoot, ".deployment.lock"), AdminSocket: filepath.Join(stateDir, ".enrollment.sock"),
+			LifecycleLock: filepath.Join(installRoot, ".deployment.lock"), InitializationLock: filepath.Join(stateDir, ".instance.lock"),
+			AdminSocket: filepath.Join(stateDir, ".enrollment.sock"),
 		},
 		Manager: deployment.ManagerAvailability{
 			Manager: deployment.ManagerForeground,

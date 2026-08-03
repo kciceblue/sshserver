@@ -11,7 +11,8 @@ import (
 )
 
 type fileLock struct {
-	file *os.File
+	file    *os.File
+	created bool
 }
 
 func acquireLock(stateDir string) (*fileLock, error) {
@@ -20,7 +21,12 @@ func acquireLock(stateDir string) (*fileLock, error) {
 
 func acquireNamedLock(stateDir, name, busyMessage string) (*fileLock, error) {
 	path := filepath.Join(stateDir, name)
-	fd, err := syscall.Open(path, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0o600)
+	flags := syscall.O_RDWR | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
+	fd, err := syscall.Open(path, flags|syscall.O_CREAT|syscall.O_EXCL, 0o600)
+	created := err == nil
+	if errors.Is(err, syscall.EEXIST) {
+		fd, err = syscall.Open(path, flags, 0)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open instance lock: %w", err)
 	}
@@ -46,7 +52,7 @@ func acquireNamedLock(stateDir, name, busyMessage string) (*fileLock, error) {
 		}
 		return nil, fmt.Errorf("lock instance: %w", err)
 	}
-	return &fileLock{file: file}, nil
+	return &fileLock{file: file, created: created}, nil
 }
 
 func (lock *fileLock) Close() error {

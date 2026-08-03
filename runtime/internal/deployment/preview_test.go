@@ -30,8 +30,8 @@ func TestDeploymentPreviewClassifiesFreshIdempotentAndUpgrade(t *testing.T) {
 	if fresh.Classification != PreviewFresh || !fresh.ApplyAllowed || fresh.BlockReason != "" {
 		t.Fatalf("fresh preview=%+v", fresh)
 	}
-	if fresh.Existing.LifecycleLockPresent {
-		t.Fatal("fresh preview reported an absent lifecycle lock as present")
+	if fresh.Existing.LifecycleLockPresent || fresh.Existing.InitializationLockPresent {
+		t.Fatal("fresh preview reported an absent lifecycle or initialization lock as present")
 	}
 	if fresh.Release.Release != desired.Release || fresh.Release.SourceRevision != desired.SourceRevision ||
 		fresh.Target != (PreviewTargetIdentity{OS: fixture.target.OS, Architecture: fixture.target.Architecture}) {
@@ -41,6 +41,7 @@ func TestDeploymentPreviewClassifiesFreshIdempotentAndUpgrade(t *testing.T) {
 		fresh.Paths.StateDir != fixture.layout.StateDir || fresh.Paths.BinaryPath != desired.BinaryPath ||
 		fresh.Paths.LicensePath != filepath.Join(filepath.Dir(desired.BinaryPath), "LICENSE") ||
 		fresh.Paths.NoticePath != filepath.Join(filepath.Dir(desired.BinaryPath), "NOTICE") ||
+		fresh.Paths.InitializationLock != filepath.Join(fixture.layout.StateDir, ".instance.lock") ||
 		fresh.Paths.ServiceDefinition != fixture.manager.definition {
 		t.Fatalf("fresh paths=%+v", fresh.Paths)
 	}
@@ -50,7 +51,8 @@ func TestDeploymentPreviewClassifiesFreshIdempotentAndUpgrade(t *testing.T) {
 		"activate_user_service", "verify_running_release_identity_and_loopback_health", "commit_deployment_state",
 	)
 	assertPreviewActionPrefix(t, fresh.Actions,
-		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "create_lifecycle_lock", "acquire_lifecycle_lock", "create_apply_journal",
+		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "create_lifecycle_lock", "acquire_lifecycle_lock",
+		"create_initialization_lock", "acquire_initialization_lock", "create_apply_journal",
 		"prepare_release_directory", "publish_verified_artifact",
 	)
 	assertCanonicalPreview(t, fresh)
@@ -71,11 +73,11 @@ func TestDeploymentPreviewClassifiesFreshIdempotentAndUpgrade(t *testing.T) {
 	if idempotent.Classification != PreviewIdempotent || !idempotent.ApplyAllowed {
 		t.Fatalf("idempotent preview=%+v", idempotent)
 	}
-	if !idempotent.Existing.LifecycleLockPresent {
-		t.Fatal("idempotent preview did not report the existing lifecycle lock")
+	if !idempotent.Existing.LifecycleLockPresent || !idempotent.Existing.InitializationLockPresent {
+		t.Fatal("idempotent preview did not report the existing lifecycle and initialization locks")
 	}
 	assertPreviewActionPrefix(t, idempotent.Actions,
-		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock",
+		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "acquire_initialization_lock",
 	)
 	assertPreviewActionsContain(t, idempotent.Actions, "verify_or_reuse_artifact", "verify_user_service_active")
 	for _, action := range idempotent.Actions {
@@ -96,7 +98,7 @@ func TestDeploymentPreviewClassifiesFreshIdempotentAndUpgrade(t *testing.T) {
 		t.Fatal("upgrade preview did not report the existing lifecycle lock")
 	}
 	assertPreviewActionPrefix(t, upgrade.Actions,
-		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "create_apply_journal",
+		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "acquire_initialization_lock", "create_apply_journal",
 	)
 	assertPreviewActionsContain(t, upgrade.Actions, "stop_prior_user_service", "commit_deployment_state")
 }
@@ -123,8 +125,94 @@ func TestFreshPreviewDistinguishesExistingLifecycleLockAcquisition(t *testing.T)
 		t.Fatalf("fresh existing-lock preview=%+v", preview)
 	}
 	assertPreviewActionPrefix(t, preview.Actions,
-		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "create_apply_journal",
+		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock",
+		"create_initialization_lock", "acquire_initialization_lock", "create_apply_journal",
 	)
+}
+
+func TestDeploymentPreviewDisclosesInitializationLeaseBeforeJournalOrIdempotentWork(t *testing.T) {
+	t.Run("fresh apply", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		request, _ := fixture.release(t, "v1.2.3", "initialization-lease-plan-fresh")
+		preview, err := fixture.lifecycle.Preview(context.Background(), request.previewRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		initializationLock := filepath.Join(fixture.layout.StateDir, ".instance.lock")
+		if preview.Paths.InitializationLock != initializationLock || preview.Existing.InitializationLockPresent {
+			t.Fatalf("fresh initialization-lock snapshot paths=%+v existing=%+v", preview.Paths, preview.Existing)
+		}
+		assertPreviewActionPrefix(t, preview.Actions,
+			"prepare_install_root", "prepare_versions_directory", "prepare_state_directory",
+			"create_lifecycle_lock", "acquire_lifecycle_lock", "create_initialization_lock", "acquire_initialization_lock",
+			"create_apply_journal",
+		)
+
+		originalAcquire := fixture.lifecycle.acquireInstanceLease
+		acquiredBeforeJournal := false
+		fixture.lifecycle.acquireInstanceLease = func(stateDir string) (instanceInitializationLease, error) {
+			if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+				return nil, fmt.Errorf("initialization lease reached after journal creation: %w", err)
+			}
+			acquiredBeforeJournal = true
+			return originalAcquire(stateDir)
+		}
+		canonical, err := preview.CanonicalBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		repeated, err := fixture.lifecycle.Preview(context.Background(), request.previewRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		repeatedCanonical, err := repeated.CanonicalBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(canonical, repeatedCanonical) {
+			t.Fatalf("fresh preview changed without target mutation\nfirst=%s\nsecond=%s", canonical, repeatedCanonical)
+		}
+		request.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
+		fixture.lifecycle.failAfterPhase = PhasePlanned
+		if _, err := fixture.lifecycle.Apply(context.Background(), request); !errors.Is(err, ErrInjectedDeploymentCrash) {
+			t.Fatalf("fresh planned crash error=%v acquired_before_journal=%t", err, acquiredBeforeJournal)
+		}
+		if !acquiredBeforeJournal {
+			t.Fatal("fresh apply did not acquire its initialization lease")
+		}
+		if err := config.ValidateProtectedFile(initializationLock, 0o600); err != nil {
+			t.Fatalf("fresh apply initialization lock: %v", err)
+		}
+	})
+
+	t.Run("idempotent repair recreates missing lock", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		request, _ := fixture.release(t, "v1.2.3", "initialization-lease-plan-idempotent")
+		if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
+			t.Fatal(err)
+		}
+		initializationLock := filepath.Join(fixture.layout.StateDir, ".instance.lock")
+		if err := os.Remove(initializationLock); err != nil {
+			t.Fatal(err)
+		}
+		preview, err := fixture.lifecycle.Preview(context.Background(), requestForPreview(fixture.layout, request))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if preview.Classification != PreviewIdempotent || preview.Existing.InitializationLockPresent {
+			t.Fatalf("idempotent missing-lock preview=%+v", preview)
+		}
+		assertPreviewActionPrefix(t, preview.Actions,
+			"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock",
+			"create_initialization_lock", "acquire_initialization_lock", "prepare_release_directory",
+		)
+		if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
+			t.Fatalf("idempotent missing-lock apply: %v", err)
+		}
+		if err := config.ValidateProtectedFile(initializationLock, 0o600); err != nil {
+			t.Fatalf("recreated initialization lock: %v", err)
+		}
+	})
 }
 
 func TestFreshAndUpgradeDestinationCollisionsBlockBeforeJournal(t *testing.T) {
@@ -272,7 +360,7 @@ func TestIdempotentRepairPreviewIncludesDirectoryPreparationWithoutMutation(t *t
 		t.Fatalf("directory-repair preview=%+v", preview)
 	}
 	assertPreviewActionPrefix(t, preview.Actions,
-		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "prepare_release_directory",
+		"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "acquire_initialization_lock", "prepare_release_directory",
 		"verify_or_reuse_artifact", "verify_or_reuse_license", "verify_or_reuse_notice", "verify_installed_release_identity",
 	)
 	if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
@@ -774,7 +862,7 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 			t.Fatalf("resume preview=%+v", preview)
 		}
 		assertPreviewActionPrefix(t, preview.Actions,
-			"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "resume_apply_journal",
+			"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "acquire_initialization_lock", "resume_apply_journal",
 		)
 		assertPreviewActionsContain(t, preview.Actions, "resume_apply_journal", "initialize_or_resume_loopback_instance", "remove_apply_journal")
 	})
@@ -796,7 +884,8 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertPreviewActionPrefix(t, preview.Actions,
-			"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "resume_apply_journal", "rebind_apply_journal_inputs",
+			"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "acquire_initialization_lock",
+			"resume_apply_journal", "rebind_apply_journal_inputs",
 		)
 		var rebind *PreviewAction
 		for index := range preview.Actions {
@@ -973,7 +1062,8 @@ func TestDeploymentPreviewForegroundJournalRecoveryRequiresStoppedRuntime(t *tes
 				assertPreviewActionsContain(t, preview.Actions, "verify_prior_foreground_stopped")
 				if phase == PhasePlanned {
 					assertPreviewActionPrefix(t, preview.Actions,
-						"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "resume_apply_journal", "prepare_release_directory", "publish_verified_artifact",
+						"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "acquire_initialization_lock",
+						"resume_apply_journal", "prepare_release_directory", "publish_verified_artifact",
 					)
 				} else {
 					assertPreviewActionsExclude(t, preview.Actions, "prepare_release_directory")

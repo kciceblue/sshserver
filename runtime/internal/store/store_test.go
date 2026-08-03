@@ -209,6 +209,85 @@ func TestValidateExistingIsReadOnlyAndRejectsForeignOrMalformedState(t *testing.
 	}
 }
 
+func TestValidateExistingRejectsClosedDatabaseSameMetadataContentRewrite(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "server.db")
+	opened, err := Open(ctx, path, testIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	originalInfo, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalPayload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foreignIdentity := testIdentity
+	foreignIdentity.InstanceID = "00000000-0000-4000-8000-000000000005"
+	foreignPath := filepath.Join(t.TempDir(), "server.db")
+	foreign, err := Open(ctx, foreignPath, foreignIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := foreign.Close(); err != nil {
+		t.Fatal(err)
+	}
+	foreignPayload, err := os.ReadFile(foreignPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(foreignPayload) != len(originalPayload) || bytes.Equal(foreignPayload, originalPayload) {
+		t.Fatalf("foreign fixture bytes=%d original=%d equal=%t", len(foreignPayload), len(originalPayload), bytes.Equal(foreignPayload, originalPayload))
+	}
+
+	rewritten := false
+	err = validateExisting(ctx, path, testIdentity, func() {
+		file, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+		if openErr != nil {
+			t.Fatalf("open closed database rewrite: %v", openErr)
+		}
+		if _, writeErr := file.Write(foreignPayload); writeErr != nil {
+			file.Close()
+			t.Fatalf("rewrite closed database: %v", writeErr)
+		}
+		if closeErr := file.Close(); closeErr != nil {
+			t.Fatalf("close rewritten closed database: %v", closeErr)
+		}
+		if chtimesErr := os.Chtimes(path, originalInfo.ModTime(), originalInfo.ModTime()); chtimesErr != nil {
+			t.Fatalf("restore closed database timestamp: %v", chtimesErr)
+		}
+		currentInfo, statErr := os.Lstat(path)
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		if !os.SameFile(originalInfo, currentInfo) || currentInfo.Size() != originalInfo.Size() ||
+			!currentInfo.ModTime().Equal(originalInfo.ModTime()) {
+			t.Fatalf("rewrite did not preserve inode/size/mtime: before=%+v after=%+v", originalInfo, currentInfo)
+		}
+		rewritten = true
+	})
+	if !rewritten {
+		t.Fatal("closed-database rewrite hook did not run")
+	}
+	if err == nil || !strings.Contains(err.Error(), "contents changed during read-only validation") {
+		t.Fatalf("closed-database same-metadata rewrite error=%v", err)
+	}
+	currentPayload, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(currentPayload, foreignPayload) {
+		t.Fatal("closed-database rewrite fixture did not remain at the source path")
+	}
+}
+
 func TestValidateExistingReadsProtectedActiveWALWithoutCreatingFiles(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

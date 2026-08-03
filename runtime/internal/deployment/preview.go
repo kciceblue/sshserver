@@ -34,6 +34,7 @@ var errInstalledReleaseFilesMissing = errors.New("installed release files are mi
 var previewActionOperations = map[string]bool{
 	"prepare_install_root": true, "prepare_versions_directory": true, "prepare_release_directory": true,
 	"prepare_state_directory": true, "create_lifecycle_lock": true, "acquire_lifecycle_lock": true,
+	"create_initialization_lock": true, "acquire_initialization_lock": true,
 	"create_apply_journal": true, "resume_apply_journal": true, "rebind_apply_journal_inputs": true,
 	"recover_existing_transaction": true, "publish_verified_artifact": true, "publish_verified_license": true,
 	"publish_verified_notice": true, "checkpoint_apply_journal": true, "initialize_or_resume_loopback_instance": true,
@@ -56,6 +57,7 @@ var previewBlockReasons = map[string]bool{
 	"installed_release_verification_failed":                         true,
 	"installed_release_verification_failed_during_recovery":         true,
 	"instance_configuration_is_invalid":                             true,
+	"instance_initialization_lock_is_invalid":                       true,
 	"instance_install_marker_is_invalid":                            true,
 	"instance_state_directory_is_invalid":                           true,
 	"partial_instance_has_unrecoverable_data_without_configuration": true,
@@ -94,9 +96,10 @@ type PreviewRequest struct {
 }
 
 type previewInstanceSnapshot struct {
-	state       string
-	listeners   []string
-	blockReason string
+	state                     string
+	listeners                 []string
+	blockReason               string
+	initializationLockPresent bool
 }
 
 type PreviewReleaseIdentity struct {
@@ -141,26 +144,28 @@ type PreviewInputs struct {
 }
 
 type PreviewPaths struct {
-	HomeDir           string `json:"home_dir"`
-	InstallRoot       string `json:"install_root"`
-	VersionsDir       string `json:"versions_dir"`
-	ReleaseDir        string `json:"release_dir"`
-	StateDir          string `json:"state_dir"`
-	BinaryPath        string `json:"binary_path"`
-	LicensePath       string `json:"license_path"`
-	NoticePath        string `json:"notice_path"`
-	ServiceDefinition string `json:"service_definition_path"`
-	DeploymentState   string `json:"deployment_state_path"`
-	DeploymentJournal string `json:"deployment_journal_path"`
-	LifecycleLock     string `json:"lifecycle_lock_path"`
-	AdminSocket       string `json:"admin_socket_path"`
+	HomeDir            string `json:"home_dir"`
+	InstallRoot        string `json:"install_root"`
+	VersionsDir        string `json:"versions_dir"`
+	ReleaseDir         string `json:"release_dir"`
+	StateDir           string `json:"state_dir"`
+	BinaryPath         string `json:"binary_path"`
+	LicensePath        string `json:"license_path"`
+	NoticePath         string `json:"notice_path"`
+	ServiceDefinition  string `json:"service_definition_path"`
+	DeploymentState    string `json:"deployment_state_path"`
+	DeploymentJournal  string `json:"deployment_journal_path"`
+	LifecycleLock      string `json:"lifecycle_lock_path"`
+	InitializationLock string `json:"initialization_lock_path"`
+	AdminSocket        string `json:"admin_socket_path"`
 }
 
 type PreviewExisting struct {
-	InstanceState        string             `json:"instance_state"`
-	LifecycleLockPresent bool               `json:"lifecycle_lock_present"`
-	State                *DeploymentState   `json:"state"`
-	Journal              *DeploymentJournal `json:"journal"`
+	InstanceState             string             `json:"instance_state"`
+	LifecycleLockPresent      bool               `json:"lifecycle_lock_present"`
+	InitializationLockPresent bool               `json:"initialization_lock_present"`
+	State                     *DeploymentState   `json:"state"`
+	Journal                   *DeploymentJournal `json:"journal"`
 }
 
 type PreviewAction struct {
@@ -330,12 +335,15 @@ func (lifecycle *Lifecycle) previewSnapshotWithInstance(
 	}
 	instance := previewInstanceSnapshot{}
 	if instanceOverride == nil {
-		instance.state, instance.listeners, instance.blockReason = inspectPreviewInstance(ctx, lifecycle.layout.StateDir)
+		instance = inspectPreviewInstance(ctx, lifecycle.layout.StateDir)
 	} else {
 		instance = *instanceOverride
 		instance.listeners = slices.Clone(instance.listeners)
 	}
-	preview, err := lifecycle.basePreview(request, manifest, desired, artifact, availability, state, statePresent, journal, journalPresent, instance.state, lifecycleLockPresent, instance.listeners)
+	preview, err := lifecycle.basePreview(
+		request, manifest, desired, artifact, availability, state, statePresent, journal, journalPresent,
+		instance.state, lifecycleLockPresent, instance.initializationLockPresent, instance.listeners,
+	)
 	if err != nil {
 		return DeploymentPreview{}, err
 	}
@@ -416,6 +424,7 @@ func (lifecycle *Lifecycle) basePreview(
 	journalPresent bool,
 	instanceState string,
 	lifecycleLockPresent bool,
+	initializationLockPresent bool,
 	listeners []string,
 ) (DeploymentPreview, error) {
 	releaseDir, err := lifecycle.layout.VersionDir(desired.Release)
@@ -458,12 +467,14 @@ func (lifecycle *Lifecycle) basePreview(
 			ReleaseDir: releaseDir, StateDir: lifecycle.layout.StateDir, BinaryPath: desired.BinaryPath, LicensePath: licensePath,
 			NoticePath: noticePath, ServiceDefinition: availability.ServiceDefinition, DeploymentState: lifecycle.layout.StatePath,
 			DeploymentJournal: lifecycle.layout.JournalPath, LifecycleLock: lifecycle.layout.LockPath,
-			AdminSocket: config.ForStateDir(lifecycle.layout.StateDir).AdminSocket,
+			InitializationLock: filepath.Join(lifecycle.layout.StateDir, ".instance.lock"),
+			AdminSocket:        config.ForStateDir(lifecycle.layout.StateDir).AdminSocket,
 		},
 		Manager: availability,
 		Existing: PreviewExisting{
 			InstanceState: instanceState, LifecycleLockPresent: lifecycleLockPresent,
-			State: statePointer, Journal: journalPointer,
+			InitializationLockPresent: initializationLockPresent,
+			State:                     statePointer, Journal: journalPointer,
 		},
 		Actions: []PreviewAction{},
 		Assertions: PreviewAssertions{
@@ -592,6 +603,9 @@ func previewApplyActions(preview DeploymentPreview, prior *DeploymentState, jour
 		for _, operation := range previewLifecycleLockOperations(preview) {
 			appendAction("state", operation, preview.Paths.LifecycleLock)
 		}
+		for _, operation := range previewInitializationLockOperations(preview) {
+			appendAction("state", operation, preview.Paths.InitializationLock)
+		}
 		appendAction("state", "create_apply_journal", preview.Paths.DeploymentJournal, string(PhasePlanned))
 	} else {
 		// Apply prepares every structural directory before resuming a journal;
@@ -601,6 +615,9 @@ func previewApplyActions(preview DeploymentPreview, prior *DeploymentState, jour
 		appendAction("filesystem", "prepare_state_directory", preview.Paths.StateDir)
 		for _, operation := range previewLifecycleLockOperations(preview) {
 			appendAction("state", operation, preview.Paths.LifecycleLock)
+		}
+		for _, operation := range previewInitializationLockOperations(preview) {
+			appendAction("state", operation, preview.Paths.InitializationLock)
 		}
 		appendAction("state", "resume_apply_journal", preview.Paths.DeploymentJournal, journal.TransactionID, string(journal.Phase))
 		if journal.Phase == PhasePlanned &&
@@ -679,6 +696,9 @@ func previewIdempotentActions(preview DeploymentPreview, state DeploymentState) 
 	for _, operation := range previewLifecycleLockOperations(preview) {
 		appendAction("state", operation, preview.Paths.LifecycleLock)
 	}
+	for _, operation := range previewInitializationLockOperations(preview) {
+		appendAction("state", operation, preview.Paths.InitializationLock)
+	}
 	appendAction("filesystem", "prepare_release_directory", preview.Paths.ReleaseDir)
 	appendAction("filesystem", "verify_or_reuse_artifact", preview.Paths.BinaryPath, preview.Inputs.Artifact.SourcePath)
 	appendAction("filesystem", "verify_or_reuse_license", preview.Paths.LicensePath, preview.Inputs.License.SourcePath)
@@ -696,6 +716,13 @@ func previewLifecycleLockOperations(preview DeploymentPreview) []string {
 		return []string{"acquire_lifecycle_lock"}
 	}
 	return []string{"create_lifecycle_lock", "acquire_lifecycle_lock"}
+}
+
+func previewInitializationLockOperations(preview DeploymentPreview) []string {
+	if preview.Existing.InitializationLockPresent {
+		return []string{"acquire_initialization_lock"}
+	}
+	return []string{"create_initialization_lock", "acquire_initialization_lock"}
 }
 
 func previewRecoveryActions(preview DeploymentPreview, journal DeploymentJournal) []PreviewAction {
@@ -796,15 +823,28 @@ func loadPreviewJournal(layout Layout) (DeploymentJournal, bool, error) {
 	return journal, err == nil, err
 }
 
-func inspectPreviewInstance(ctx context.Context, stateDir string) (string, []string, string) {
+func inspectPreviewInstance(ctx context.Context, stateDir string) previewInstanceSnapshot {
 	listeners := config.DefaultListeners()
 	slices.Sort(listeners)
 	info, err := os.Lstat(stateDir)
 	if errors.Is(err, os.ErrNotExist) {
-		return "missing", listeners, ""
+		return previewInstanceSnapshot{state: "missing", listeners: listeners}
 	}
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || config.ValidateStateDirectory(stateDir) != nil {
-		return "invalid", listeners, "instance_state_directory_is_invalid"
+		return previewInstanceSnapshot{state: "invalid", listeners: listeners, blockReason: "instance_state_directory_is_invalid"}
+	}
+	initializationLockPresent := false
+	initializationLockPath := filepath.Join(stateDir, ".instance.lock")
+	if err := config.ValidateProtectedFile(initializationLockPath, 0o600); err == nil {
+		initializationLockPresent = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return previewInstanceSnapshot{state: "invalid", listeners: listeners, blockReason: "instance_initialization_lock_is_invalid"}
+	}
+	result := func(state, blockReason string) previewInstanceSnapshot {
+		return previewInstanceSnapshot{
+			state: state, listeners: listeners, blockReason: blockReason,
+			initializationLockPresent: initializationLockPresent,
+		}
 	}
 	paths := config.ForStateDir(stateDir)
 	marker, markerErr := config.LoadMarker(paths.InstallMarker)
@@ -813,55 +853,55 @@ func inspectPreviewInstance(ctx context.Context, stateDir string) (string, []str
 		listeners = slices.Clone(settings.Listeners)
 		slices.Sort(listeners)
 	} else if !errors.Is(settingsErr, config.ErrUninitialized) {
-		return "invalid", listeners, "instance_configuration_is_invalid"
+		return result("invalid", "instance_configuration_is_invalid")
 	}
 	if markerErr == nil {
 		if marker.Phase == "ready" {
 			if settingsErr != nil {
-				return "invalid", listeners, "completed_instance_configuration_is_missing"
+				return result("invalid", "completed_instance_configuration_is_missing")
 			}
 			secret, err := config.ReadSecret(paths.InstanceSecret)
 			if err != nil {
-				return "invalid", listeners, "completed_instance_secret_is_invalid"
+				return result("invalid", "completed_instance_secret_is_invalid")
 			}
 			clear(secret)
 			for _, databasePath := range []string{paths.Database, paths.Database + "-wal", paths.Database + "-shm", paths.Database + "-journal"} {
 				if err := config.ValidateProtectedFile(databasePath, 0o600); err != nil &&
 					(databasePath == paths.Database || !errors.Is(err, os.ErrNotExist)) {
-					return "invalid", listeners, "completed_instance_database_is_invalid"
+					return result("invalid", "completed_instance_database_is_invalid")
 				}
 			}
 			if err := store.ValidateExisting(ctx, paths.Database, store.Identity{
 				InstanceID: settings.InstanceID,
 				VaultID:    settings.VaultID,
 			}); err != nil {
-				return "invalid", listeners, "completed_instance_database_is_invalid"
+				return result("invalid", "completed_instance_database_is_invalid")
 			}
-			return "ready", listeners, ""
+			return result("ready", "")
 		}
 		if settingsErr != nil && partialInstanceDataExists(paths) {
-			return "invalid", listeners, "partial_instance_has_unrecoverable_data_without_configuration"
+			return result("invalid", "partial_instance_has_unrecoverable_data_without_configuration")
 		}
 		if settingsErr == nil {
 			if blockReason := validateResumableInstanceFiles(ctx, paths, settings); blockReason != "" {
-				return "invalid", listeners, blockReason
+				return result("invalid", blockReason)
 			}
 		}
-		return "initializing", listeners, ""
+		return result("initializing", "")
 	}
 	if !errors.Is(markerErr, os.ErrNotExist) {
-		return "invalid", listeners, "instance_install_marker_is_invalid"
+		return result("invalid", "instance_install_marker_is_invalid")
 	}
 	if settingsErr != nil && partialInstanceDataExists(paths) {
-		return "invalid", listeners, "partial_instance_has_unrecoverable_data_without_configuration"
+		return result("invalid", "partial_instance_has_unrecoverable_data_without_configuration")
 	}
 	if settingsErr == nil {
 		if blockReason := validateResumableInstanceFiles(ctx, paths, settings); blockReason != "" {
-			return "invalid", listeners, blockReason
+			return result("invalid", blockReason)
 		}
-		return "resume", listeners, ""
+		return result("resume", "")
 	}
-	return "uninitialized", listeners, ""
+	return result("uninitialized", "")
 }
 
 func pathExists(path string) bool {
@@ -1120,7 +1160,9 @@ func (preview DeploymentPreview) Validate() error {
 	}
 	releaseDir, _ := layout.VersionDir(preview.Release.Release)
 	if preview.Paths.ReleaseDir != releaseDir || preview.Paths.LicensePath != filepath.Join(releaseDir, "LICENSE") ||
-		preview.Paths.NoticePath != filepath.Join(releaseDir, "NOTICE") || preview.Paths.AdminSocket != config.ForStateDir(layout.StateDir).AdminSocket {
+		preview.Paths.NoticePath != filepath.Join(releaseDir, "NOTICE") ||
+		preview.Paths.InitializationLock != filepath.Join(layout.StateDir, ".instance.lock") ||
+		preview.Paths.AdminSocket != config.ForStateDir(layout.StateDir).AdminSocket {
 		return errors.New("deployment preview derived paths are invalid")
 	}
 	for _, path := range []string{preview.Inputs.Manifest.Path, preview.Inputs.Artifact.SourcePath, preview.Inputs.License.SourcePath, preview.Inputs.Notice.SourcePath} {

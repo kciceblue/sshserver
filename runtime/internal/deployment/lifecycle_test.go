@@ -344,6 +344,32 @@ func TestApplyRevalidatesInstanceUnderInitializationLeaseBeforeJournal(t *testin
 	}
 }
 
+func TestApplyRejectsInitializationLockCreationRaceBeforeJournal(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	request, desired := fixture.release(t, "v1.2.3", "initialization-lock-creation-race")
+	originalAcquire := fixture.lifecycle.acquireInstanceLease
+	fixture.lifecycle.acquireInstanceLease = func(stateDir string) (instanceInitializationLease, error) {
+		if err := os.WriteFile(filepath.Join(stateDir, ".instance.lock"), nil, 0o600); err != nil {
+			return nil, err
+		}
+		return originalAcquire(stateDir)
+	}
+
+	_, err := applyConfirmed(t, fixture.lifecycle, request)
+	if !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || !strings.Contains(err.Error(), "initialization lock creation") {
+		t.Fatalf("initialization-lock creation race error=%v", err)
+	}
+	if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+		t.Fatalf("initialization-lock creation race created journal: %v", err)
+	}
+	if _, err := os.Lstat(desired.BinaryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("initialization-lock creation race published desired binary: %v", err)
+	}
+	if fixture.stageCalls != 0 || fixture.supportStageCalls != 0 || fixture.initializeCalls != 0 {
+		t.Fatalf("initialization-lock creation race reached stage/support/init=%d/%d/%d", fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls)
+	}
+}
+
 func TestApplyResumesReviewedDatabaseStatesUnderInitializationLease(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string
@@ -1113,11 +1139,16 @@ type lifecycleFixture struct {
 
 type testInitializationLease struct {
 	initialize func(context.Context, []string) (config.Settings, error)
+	created    bool
 	close      func() error
 }
 
 func (lease *testInitializationLease) Initialize(ctx context.Context, listeners []string) (config.Settings, error) {
 	return lease.initialize(ctx, listeners)
+}
+
+func (lease *testInitializationLease) InitializationLockCreated() bool {
+	return lease.created
 }
 
 func (lease *testInitializationLease) Close() error {
@@ -1168,7 +1199,8 @@ func newLifecycleFixture(t *testing.T, foreground bool) *lifecycleFixture {
 				fixture.initializeCalls++
 				return lease.Initialize(ctx, listeners)
 			},
-			close: lease.Close,
+			created: lease.InitializationLockCreated(),
+			close:   lease.Close,
 		}, nil
 	}
 	lifecycle.renderService = func(_, binary, _ string) ([]byte, error) { return []byte(binary), nil }

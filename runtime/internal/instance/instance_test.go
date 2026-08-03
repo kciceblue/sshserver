@@ -17,6 +17,10 @@ func TestInitializationLeaseSerializesValidationThroughInitialize(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !lease.InitializationLockCreated() {
+		lease.Close()
+		t.Fatal("first initialization lease did not report creating its lock")
+	}
 	if _, err := Initialize(ctx, stateDir, nil); err == nil || !strings.Contains(err.Error(), "another initialization is already running") {
 		lease.Close()
 		t.Fatalf("parallel initializer error=%v", err)
@@ -38,6 +42,17 @@ func TestInitializationLeaseSerializesValidationThroughInitialize(t *testing.T) 
 	}
 	if _, err := Initialize(ctx, stateDir, nil); err != nil {
 		t.Fatalf("initializer after lease release: %v", err)
+	}
+	reopened, err := AcquireInitializationLease(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.InitializationLockCreated() {
+		reopened.Close()
+		t.Fatal("reopened initialization lease reported recreating its existing lock")
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

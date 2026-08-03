@@ -36,6 +36,7 @@ type serviceController interface {
 
 type instanceInitializationLease interface {
 	Initialize(context.Context, []string) (config.Settings, error)
+	InitializationLockCreated() bool
 	Close() error
 }
 
@@ -708,15 +709,15 @@ func (lifecycle *Lifecycle) verifyApplyConfirmationInputs(request ApplyRequest, 
 }
 
 func lockedConfirmationInstanceSnapshot(ctx context.Context, layout Layout, confirmedState string) previewInstanceSnapshot {
-	state, listeners, blockReason := inspectPreviewInstance(ctx, layout.StateDir)
+	current := inspectPreviewInstance(ctx, layout.StateDir)
 	// A fresh apply must create the state directory and its owner-only
 	// initialization lock before it can exclude a concurrent initializer. Treat
 	// only that exact, otherwise-empty structural delta as the original missing
 	// state. Every other file or state transition remains visible to the digest.
-	if confirmedState == "missing" && state == "uninitialized" && blockReason == "" && onlyInitializationLockPresent(layout.StateDir) {
-		state = "missing"
+	if confirmedState == "missing" && current.state == "uninitialized" && current.blockReason == "" && onlyInitializationLockPresent(layout.StateDir) {
+		current.state = "missing"
 	}
-	return previewInstanceSnapshot{state: state, listeners: listeners, blockReason: blockReason}
+	return current
 }
 
 func onlyInitializationLockPresent(stateDir string) bool {
@@ -753,8 +754,8 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	if err := preflightDesiredReleaseDestinations(ctx, lifecycle.layout, desired); err != nil {
 		return ApplyResult{}, err
 	}
-	if _, _, instanceBlock := inspectPreviewInstance(ctx, lifecycle.layout.StateDir); instanceBlock != "" {
-		return ApplyResult{}, fmt.Errorf("deployment instance preflight is blocked: %s", instanceBlock)
+	if instance := inspectPreviewInstance(ctx, lifecycle.layout.StateDir); instance.blockReason != "" {
+		return ApplyResult{}, fmt.Errorf("deployment instance preflight is blocked: %s", instance.blockReason)
 	}
 	if err := validateExistingDeploymentLock(lifecycle.layout); err != nil {
 		return ApplyResult{}, err
@@ -884,10 +885,18 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment instance lease: %w", closeErr))
 		}
 	}()
+	if instanceLease.InitializationLockCreated() == confirmedPreview.Existing.InitializationLockPresent {
+		return ApplyResult{}, fmt.Errorf("initialization lock creation no longer matches the confirmed deployment preview: %w", ErrDeploymentPreviewConfirmationMismatch)
+	}
 	if err := lifecycle.verifyApplyConfirmationInputs(request, desired); err != nil {
 		return ApplyResult{}, err
 	}
 	instanceSnapshot := lockedConfirmationInstanceSnapshot(ctx, lifecycle.layout, confirmedPreview.Existing.InstanceState)
+	// Acquiring the lease necessarily leaves its structural lock present. Keep
+	// the final confirmation bound to the pre-acquisition presence recorded in
+	// the user's exact plan, just as the missing state-directory normalization
+	// above accounts only for Apply's own narrowly disclosed preparation.
+	instanceSnapshot.initializationLockPresent = confirmedPreview.Existing.InitializationLockPresent
 	finalPreview, err := lifecycle.previewSnapshotWithInstance(
 		ctx, previewRequest, manifest, desired, artifact, lifecycleLockPresent, &instanceSnapshot,
 	)
