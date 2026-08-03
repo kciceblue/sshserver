@@ -922,6 +922,15 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 		}
 		return settings, initializeErr
 	}
+	reattestRunApplyError := func(runErr error) error {
+		if runErr == nil {
+			return nil
+		}
+		if attestErr := attestInstanceLease(); attestErr != nil {
+			return attestErr
+		}
+		return runErr
+	}
 	if err := lifecycle.verifyApplyConfirmationInputs(request, desired); err != nil {
 		return ApplyResult{}, err
 	}
@@ -988,6 +997,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 			}
 		}
 		result, err := lifecycle.runApply(ctx, &journal, initializeInstance, attestInstanceLease)
+		err = reattestRunApplyError(err)
 		if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || journal.Phase == PhaseStateSaved {
 			return result, err
 		}
@@ -1045,6 +1055,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 		return ApplyResult{}, err
 	}
 	result, err = lifecycle.runApply(ctx, &journal, initializeInstance, attestInstanceLease)
+	err = reattestRunApplyError(err)
 	if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || journal.Phase == PhaseStateSaved {
 		return result, err
 	}

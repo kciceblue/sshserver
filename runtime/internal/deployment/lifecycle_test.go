@@ -527,7 +527,7 @@ func TestApplyReattestsInitializationLeaseAtJournalAndStagingBoundaries(t *testi
 			return replaceInitializationLockAtAttestation(lease, stateDir, 3, attestationCalls, replacement), nil
 		}
 	}
-	finishReplacement := func(t *testing.T, err error, attestationCalls int, replacement *instance.InitializationLease) {
+	finishReplacement := func(t *testing.T, err error, attestationCalls, wantAttestationCalls int, replacement *instance.InitializationLease) {
 		t.Helper()
 		if replacement == nil {
 			t.Fatal("replacement initialization lock was not acquired at the mutation boundary")
@@ -535,7 +535,7 @@ func TestApplyReattestsInitializationLeaseAtJournalAndStagingBoundaries(t *testi
 		if closeErr := replacement.Close(); closeErr != nil {
 			t.Fatal(closeErr)
 		}
-		if attestationCalls != 3 || !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) ||
+		if attestationCalls != wantAttestationCalls || !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) ||
 			!strings.Contains(err.Error(), "leased initialization lock path changed") {
 			t.Fatalf("boundary attestation calls=%d error=%v", attestationCalls, err)
 		}
@@ -550,7 +550,7 @@ func TestApplyReattestsInitializationLeaseAtJournalAndStagingBoundaries(t *testi
 		stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
 
 		_, err := applyConfirmed(t, fixture.lifecycle, request)
-		finishReplacement(t, err, attestationCalls, replacement)
+		finishReplacement(t, err, attestationCalls, 3, replacement)
 		if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
 			t.Fatalf("new-journal boundary created journal: %v", err)
 		}
@@ -594,7 +594,11 @@ func TestApplyReattestsInitializationLeaseAtJournalAndStagingBoundaries(t *testi
 			stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
 
 			_, err = applyConfirmed(t, fixture.lifecycle, request)
-			finishReplacement(t, err, attestationCalls, replacement)
+			wantAttestationCalls := 4
+			if rebind {
+				wantAttestationCalls = 3
+			}
+			finishReplacement(t, err, attestationCalls, wantAttestationCalls, replacement)
 			journalAfter, readErr := os.ReadFile(fixture.layout.JournalPath)
 			if readErr != nil || !bytes.Equal(journalAfter, journalBefore) {
 				t.Fatalf("%s changed journal bytes err=%v", name, readErr)
@@ -628,7 +632,7 @@ func TestApplyReattestsInitializationLeaseAtJournalAndStagingBoundaries(t *testi
 		stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
 
 		_, err = applyConfirmed(t, fixture.lifecycle, request)
-		finishReplacement(t, err, attestationCalls, replacement)
+		finishReplacement(t, err, attestationCalls, 3, replacement)
 		if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
 			t.Fatalf("idempotent boundary created journal: %v", err)
 		}
@@ -707,6 +711,154 @@ func TestApplyPreservesArtifactStagedJournalWhenInitializationLeasePathChanges(t
 			t.Fatalf("initialization attestation mutated instance path %s: %v", path, err)
 		}
 	}
+}
+
+func TestApplyReattestsInitializationLeaseAfterRunApplyFailureBeforeRollback(t *testing.T) {
+	replaceInitializationLock := func(stateDir string) (*instance.InitializationLease, error) {
+		lockPath := filepath.Join(stateDir, ".instance.lock")
+		if err := os.Remove(lockPath); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+			return nil, err
+		}
+		return instance.AcquireInitializationLeaseWithLockPresence(stateDir, true)
+	}
+	assertLeaseMismatch := func(t *testing.T, err error, replacement *instance.InitializationLease) {
+		t.Helper()
+		if replacement == nil {
+			t.Fatal("replacement initialization lock was not acquired during the failing operation")
+		}
+		if closeErr := replacement.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || !strings.Contains(err.Error(), "leased initialization lock path changed") {
+			t.Fatalf("post-runApply lease attestation error=%v", err)
+		}
+	}
+	assertNoManagerRollback := func(t *testing.T, calls []string) {
+		t.Helper()
+		for _, call := range calls {
+			if call == "install" || call == "activate" || call == "remove" {
+				t.Fatalf("orphaned initialization lease reached manager rollback: %v", calls)
+			}
+		}
+	}
+
+	for _, matchingJournal := range []bool{false, true} {
+		name := "new transaction artifact publication"
+		if matchingJournal {
+			name = "matching journal artifact publication"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newLifecycleFixture(t, false)
+			request, desired := fixture.release(t, "v1.2.3", "post-runApply-artifact-failure")
+			var journalBefore []byte
+			if matchingJournal {
+				fixture.lifecycle.failAfterPhase = PhasePlanned
+				if _, err := applyConfirmed(t, fixture.lifecycle, request); !errors.Is(err, ErrInjectedDeploymentCrash) {
+					t.Fatalf("injected planned apply error=%v", err)
+				}
+				fixture.lifecycle.failAfterPhase = ""
+				var err error
+				journalBefore, err = os.ReadFile(fixture.layout.JournalPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			originalStage := fixture.lifecycle.stageArtifact
+			var replacement *instance.InitializationLease
+			fixture.lifecycle.stageArtifact = func(source, destination, artifactName string, artifactBytes int64, artifactSHA256 string) (string, error) {
+				var err error
+				replacement, err = replaceInitializationLock(fixture.layout.StateDir)
+				if err != nil {
+					return "", err
+				}
+				if _, err := originalStage(source, destination, artifactName, artifactBytes, artifactSHA256); err != nil {
+					return "", err
+				}
+				return "", errors.New("injected artifact publication failure")
+			}
+			stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+			managerCallsBefore := len(fixture.manager.calls)
+
+			_, err := applyConfirmed(t, fixture.lifecycle, request)
+			assertLeaseMismatch(t, err, replacement)
+			journal, err := LoadJournal(fixture.layout)
+			if err != nil || journal.Phase != PhasePlanned || journal.Desired == nil || *journal.Desired != desired {
+				t.Fatalf("artifact failure recovery journal=%+v err=%v", journal, err)
+			}
+			if matchingJournal {
+				journalAfter, err := os.ReadFile(fixture.layout.JournalPath)
+				if err != nil || !bytes.Equal(journalAfter, journalBefore) {
+					t.Fatalf("matching artifact failure changed journal bytes: equal=%v err=%v", bytes.Equal(journalAfter, journalBefore), err)
+				}
+			}
+			if fixture.stageCalls-stageBefore != 1 || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+				t.Fatalf("artifact failure stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+			}
+			if _, err := LoadState(fixture.layout); !errors.Is(err, ErrNoDeploymentState) {
+				t.Fatalf("artifact failure created deployment state: %v", err)
+			}
+			assertNoManagerRollback(t, fixture.manager.calls[managerCallsBefore:])
+		})
+	}
+
+	t.Run("service rendering after prior service stopped", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		installedRequest, installed := fixture.release(t, "v1.2.3", "post-runApply-service-installed")
+		if _, err := applyConfirmed(t, fixture.lifecycle, installedRequest); err != nil {
+			t.Fatal(err)
+		}
+		stateBefore, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upgrade, desired := fixture.release(t, "v1.2.4", "post-runApply-service-upgrade")
+		originalRender := fixture.lifecycle.renderService
+		var replacement *instance.InitializationLease
+		renderCalls := 0
+		fixture.lifecycle.renderService = func(targetOS, binaryPath, stateDir string) ([]byte, error) {
+			renderCalls++
+			if renderCalls == 1 {
+				var err error
+				replacement, err = replaceInitializationLock(stateDir)
+				if err != nil {
+					return nil, err
+				}
+				return nil, errors.New("injected service rendering failure")
+			}
+			return originalRender(targetOS, binaryPath, stateDir)
+		}
+		managerCallsBefore := len(fixture.manager.calls)
+
+		_, err = applyConfirmed(t, fixture.lifecycle, upgrade)
+		assertLeaseMismatch(t, err, replacement)
+		journal, err := LoadJournal(fixture.layout)
+		if err != nil || journal.Phase != PhasePriorServiceStopped || journal.Desired == nil || *journal.Desired != desired ||
+			journal.PriorState == nil || journal.PriorState.Active == nil || *journal.PriorState.Active != installed {
+			t.Fatalf("service failure recovery journal=%+v err=%v", journal, err)
+		}
+		stateAfter, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil || !bytes.Equal(stateAfter, stateBefore) {
+			t.Fatalf("service failure changed deployment state: equal=%v err=%v", bytes.Equal(stateAfter, stateBefore), err)
+		}
+		if fixture.manager.active {
+			t.Fatal("service failure rollback reactivated the stopped prior service under an orphaned lease")
+		}
+		if renderCalls != 1 {
+			t.Fatalf("service failure entered rollback rendering: calls=%d", renderCalls)
+		}
+		calls := fixture.manager.calls[managerCallsBefore:]
+		stopped := false
+		for _, call := range calls {
+			stopped = stopped || call == "stop"
+		}
+		if !stopped {
+			t.Fatalf("service failure did not reach the post-stop window: %v", calls)
+		}
+		assertNoManagerRollback(t, calls)
+	})
 }
 
 func TestApplyResumesReviewedDatabaseStatesUnderInitializationLease(t *testing.T) {
