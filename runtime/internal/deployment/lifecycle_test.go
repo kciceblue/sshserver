@@ -861,6 +861,196 @@ func TestApplyReattestsInitializationLeaseAfterRunApplyFailureBeforeRollback(t *
 	})
 }
 
+func TestApplyReattestsInitializationLeaseAtRollbackMutationBoundaries(t *testing.T) {
+	replaceInitializationLock := func(stateDir string) (*instance.InitializationLease, error) {
+		lockPath := filepath.Join(stateDir, ".instance.lock")
+		if err := os.Remove(lockPath); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+			return nil, err
+		}
+		return instance.AcquireInitializationLeaseWithLockPresence(stateDir, true)
+	}
+	installRollbackReplacement := func(
+		fixture *lifecycleFixture,
+		failureObserved *bool,
+		replaceWhen func(int) bool,
+	) **instance.InitializationLease {
+		replacement := new(*instance.InitializationLease)
+		postFailureAttestations := 0
+		originalAcquire := fixture.lifecycle.acquireInstanceLease
+		fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
+			lease, err := originalAcquire(stateDir, initializationLockPresent)
+			if err != nil {
+				return nil, err
+			}
+			return &testInitializationLease{
+				initialize: lease.Initialize,
+				created:    lease.InitializationLockCreated(),
+				attest: func() error {
+					if *failureObserved {
+						postFailureAttestations++
+						if *replacement == nil && replaceWhen(postFailureAttestations) {
+							acquired, replaceErr := replaceInitializationLock(stateDir)
+							if replaceErr != nil {
+								return replaceErr
+							}
+							*replacement = acquired
+						}
+					}
+					return lease.AttestLockPath()
+				},
+				close: lease.Close,
+			}, nil
+		}
+		return replacement
+	}
+	assertReplacementMismatch := func(t *testing.T, err error, replacement **instance.InitializationLease) {
+		t.Helper()
+		if replacement == nil || *replacement == nil {
+			t.Fatal("rollback mutation boundary did not acquire the replacement initialization lock")
+		}
+		if closeErr := (*replacement).Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || !strings.Contains(err.Error(), "leased initialization lock path changed") {
+			t.Fatalf("rollback mutation attestation error=%v", err)
+		}
+	}
+
+	t.Run("journal removal", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		request, desired := fixture.release(t, "v1.2.3", "rollback-boundary-journal")
+		failureObserved := false
+		replacement := installRollbackReplacement(fixture, &failureObserved, func(postFailureAttestations int) bool {
+			// The first attestation is the post-runApply classification; the
+			// second is immediately before rollback removes the journal.
+			return postFailureAttestations == 2
+		})
+		originalStage := fixture.lifecycle.stageArtifact
+		fixture.lifecycle.stageArtifact = func(source, destination, artifactName string, artifactBytes int64, artifactSHA256 string) (string, error) {
+			if _, err := originalStage(source, destination, artifactName, artifactBytes, artifactSHA256); err != nil {
+				return "", err
+			}
+			failureObserved = true
+			return "", errors.New("injected artifact failure before rollback journal removal")
+		}
+
+		_, err := applyConfirmed(t, fixture.lifecycle, request)
+		assertReplacementMismatch(t, err, replacement)
+		journal, err := LoadJournal(fixture.layout)
+		if err != nil || journal.Phase != PhasePlanned || journal.Desired == nil || *journal.Desired != desired {
+			t.Fatalf("journal-boundary recovery evidence=%+v err=%v", journal, err)
+		}
+		if _, err := LoadState(fixture.layout); !errors.Is(err, ErrNoDeploymentState) {
+			t.Fatalf("journal-boundary rollback created state: %v", err)
+		}
+	})
+
+	t.Run("service removal", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		installedRequest, installed := fixture.release(t, "v1.2.3", "rollback-boundary-service-installed")
+		if _, err := applyConfirmed(t, fixture.lifecycle, installedRequest); err != nil {
+			t.Fatal(err)
+		}
+		stateBefore, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upgrade, desired := fixture.release(t, "v1.2.4", "rollback-boundary-service-upgrade")
+		failureObserved := false
+		replacement := installRollbackReplacement(fixture, &failureObserved, func(postFailureAttestations int) bool {
+			// The first attestation accepts the ordinary runApply error; the
+			// second protects rollback's first service mutation.
+			return postFailureAttestations == 2
+		})
+		fixture.lifecycle.renderService = func(_, binaryPath, _ string) ([]byte, error) {
+			if binaryPath == desired.BinaryPath {
+				failureObserved = true
+				return nil, errors.New("injected service rendering failure before rollback removal")
+			}
+			return []byte(binaryPath), nil
+		}
+		managerCallsBefore := len(fixture.manager.calls)
+
+		_, err = applyConfirmed(t, fixture.lifecycle, upgrade)
+		assertReplacementMismatch(t, err, replacement)
+		journal, err := LoadJournal(fixture.layout)
+		if err != nil || journal.Phase != PhasePriorServiceStopped || journal.PriorState == nil ||
+			journal.PriorState.Active == nil || *journal.PriorState.Active != installed {
+			t.Fatalf("service-boundary recovery evidence=%+v err=%v", journal, err)
+		}
+		stateAfter, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil || !bytes.Equal(stateAfter, stateBefore) {
+			t.Fatalf("service-boundary rollback changed state: equal=%v err=%v", bytes.Equal(stateAfter, stateBefore), err)
+		}
+		if fixture.manager.active {
+			t.Fatal("service-boundary rollback reactivated the stopped prior service")
+		}
+		calls := fixture.manager.calls[managerCallsBefore:]
+		for _, call := range calls {
+			if call == "remove" || call == "install" || call == "activate" {
+				t.Fatalf("service-boundary rollback mutated manager state: %v", calls)
+			}
+		}
+	})
+
+	t.Run("deployment state save", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		installedRequest, installed := fixture.release(t, "v1.2.3", "rollback-boundary-state-installed")
+		if _, err := applyConfirmed(t, fixture.lifecycle, installedRequest); err != nil {
+			t.Fatal(err)
+		}
+		stateBefore, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stateInfoBefore, err := os.Stat(fixture.layout.StatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		upgrade, desired := fixture.release(t, "v1.2.4", "rollback-boundary-state-upgrade")
+		failureObserved := false
+		replacement := installRollbackReplacement(fixture, &failureObserved, func(_ int) bool {
+			// Rollback reactivates the prior service before attempting to save
+			// its state. Replace the lock only at that state-save boundary.
+			return fixture.manager.active
+		})
+		renderCalls := 0
+		fixture.lifecycle.renderService = func(_, binaryPath, _ string) ([]byte, error) {
+			renderCalls++
+			if binaryPath == desired.BinaryPath {
+				failureObserved = true
+				return nil, errors.New("injected service rendering failure before rollback state save")
+			}
+			return []byte(binaryPath), nil
+		}
+
+		_, err = applyConfirmed(t, fixture.lifecycle, upgrade)
+		assertReplacementMismatch(t, err, replacement)
+		journal, err := LoadJournal(fixture.layout)
+		if err != nil || journal.Phase != PhasePriorServiceStopped || journal.PriorState == nil ||
+			journal.PriorState.Active == nil || *journal.PriorState.Active != installed {
+			t.Fatalf("state-boundary recovery evidence=%+v err=%v", journal, err)
+		}
+		stateAfter, err := os.ReadFile(fixture.layout.StatePath)
+		if err != nil || !bytes.Equal(stateAfter, stateBefore) {
+			t.Fatalf("state-boundary rollback changed state bytes: equal=%v err=%v", bytes.Equal(stateAfter, stateBefore), err)
+		}
+		stateInfoAfter, err := os.Stat(fixture.layout.StatePath)
+		if err != nil || !os.SameFile(stateInfoBefore, stateInfoAfter) {
+			t.Fatalf("state-boundary rollback replaced deployment state: same=%v err=%v", err == nil && os.SameFile(stateInfoBefore, stateInfoAfter), err)
+		}
+		if !fixture.manager.active || fixture.manager.current != identityFor(installed) {
+			t.Fatalf("state-boundary setup did not complete service rollback: active=%t identity=%+v", fixture.manager.active, fixture.manager.current)
+		}
+		if renderCalls != 2 {
+			t.Fatalf("state-boundary rollback render calls=%d", renderCalls)
+		}
+	})
+}
+
 func TestApplyResumesReviewedDatabaseStatesUnderInitializationLease(t *testing.T) {
 	for _, testCase := range []struct {
 		name   string

@@ -1001,7 +1001,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 		if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || journal.Phase == PhaseStateSaved {
 			return result, err
 		}
-		rollbackErr := lifecycle.restorePriorAfterFailedApply(ctx, journal)
+		rollbackErr := lifecycle.restorePriorAfterFailedApply(ctx, journal, attestInstanceLease)
 		return ApplyResult{}, errors.Join(err, rollbackErr)
 	}
 	if !errors.Is(journalErr, ErrNoDeploymentJournal) {
@@ -1059,7 +1059,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	if err == nil || errors.Is(err, ErrInjectedDeploymentCrash) || errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) || journal.Phase == PhaseStateSaved {
 		return result, err
 	}
-	rollbackErr := lifecycle.restorePriorAfterFailedApply(ctx, journal)
+	rollbackErr := lifecycle.restorePriorAfterFailedApply(ctx, journal, attestInstanceLease)
 	return ApplyResult{}, errors.Join(err, rollbackErr)
 }
 
@@ -1475,7 +1475,46 @@ func (lifecycle *Lifecycle) validateCommittedStateValue(journal DeploymentJourna
 	return nil
 }
 
-func (lifecycle *Lifecycle) restorePriorAfterFailedApply(ctx context.Context, journal DeploymentJournal) error {
+func (lifecycle *Lifecycle) restorePriorAfterFailedApply(ctx context.Context, journal DeploymentJournal, attest func() error) error {
+	if attest == nil {
+		return errors.New("rollback recovery requires initialization lease attestation")
+	}
+	removeJournal := func() error {
+		if err := attest(); err != nil {
+			return err
+		}
+		return RemoveJournal(lifecycle.layout)
+	}
+	removeState := func() error {
+		if err := attest(); err != nil {
+			return err
+		}
+		return RemoveState(lifecycle.layout)
+	}
+	saveState := func(state DeploymentState) error {
+		if err := attest(); err != nil {
+			return err
+		}
+		return SaveState(lifecycle.layout, state)
+	}
+	installDefinition := func(payload []byte) (string, error) {
+		if err := attest(); err != nil {
+			return "", err
+		}
+		return lifecycle.manager.InstallDefinition(payload)
+	}
+	activate := func() error {
+		if err := attest(); err != nil {
+			return err
+		}
+		return lifecycle.manager.Activate(ctx)
+	}
+	removeService := func() error {
+		if err := attest(); err != nil {
+			return err
+		}
+		return lifecycle.manager.Remove(ctx)
+	}
 	if !applyPhaseReached(journal.Phase, PhasePriorServiceStopped) {
 		if applyPhaseReached(journal.Phase, PhaseInstanceReady) && journal.PriorState != nil &&
 			journal.PriorState.Status == StatusActive && journal.PriorState.Active != nil {
@@ -1487,7 +1526,7 @@ func (lifecycle *Lifecycle) restorePriorAfterFailedApply(ctx context.Context, jo
 			if active {
 				identity, probeErr := lifecycle.probeRunning(ctx, lifecycle.layout.StateDir)
 				if probeErr == nil && ValidateReleaseIdentity(identity, prior) == nil {
-					return RemoveJournal(lifecycle.layout)
+					return removeJournal()
 				}
 			}
 			if err := lifecycle.verifyDesired(ctx, prior); err != nil {
@@ -1497,28 +1536,28 @@ func (lifecycle *Lifecycle) restorePriorAfterFailedApply(ctx context.Context, jo
 			if err != nil {
 				return err
 			}
-			if _, err := lifecycle.manager.InstallDefinition(payload); err != nil {
+			if _, err := installDefinition(payload); err != nil {
 				return fmt.Errorf("restore prior definition after interrupted stop: %w", err)
 			}
-			if err := lifecycle.manager.Activate(ctx); err != nil {
+			if err := activate(); err != nil {
 				return fmt.Errorf("reactivate prior release after interrupted stop: %w", err)
 			}
 			if err := lifecycle.waitForRunning(ctx, prior); err != nil {
 				return fmt.Errorf("attest prior release after interrupted stop: %w", err)
 			}
 		}
-		return RemoveJournal(lifecycle.layout)
+		return removeJournal()
 	}
 	if journal.Manager != ManagerForeground {
-		if err := lifecycle.manager.Remove(ctx); err != nil {
+		if err := removeService(); err != nil {
 			return fmt.Errorf("rollback failed deployment service: %w", err)
 		}
 	}
 	if journal.PriorState == nil {
-		if err := RemoveState(lifecycle.layout); err != nil {
+		if err := removeState(); err != nil {
 			return err
 		}
-		return RemoveJournal(lifecycle.layout)
+		return removeJournal()
 	}
 	prior := *journal.PriorState
 	if prior.Status == StatusActive && prior.Active != nil {
@@ -1529,20 +1568,20 @@ func (lifecycle *Lifecycle) restorePriorAfterFailedApply(ctx context.Context, jo
 		if err != nil {
 			return err
 		}
-		if _, err := lifecycle.manager.InstallDefinition(payload); err != nil {
+		if _, err := installDefinition(payload); err != nil {
 			return fmt.Errorf("restore prior service definition: %w", err)
 		}
-		if err := lifecycle.manager.Activate(ctx); err != nil {
+		if err := activate(); err != nil {
 			return fmt.Errorf("reactivate prior release: %w", err)
 		}
 		if err := lifecycle.waitForRunning(ctx, *prior.Active); err != nil {
 			return fmt.Errorf("attest prior release after rollback: %w", err)
 		}
 	}
-	if err := SaveState(lifecycle.layout, prior); err != nil {
+	if err := saveState(prior); err != nil {
 		return err
 	}
-	return RemoveJournal(lifecycle.layout)
+	return removeJournal()
 }
 
 func (lifecycle *Lifecycle) checkpoint(journal *DeploymentJournal, phase Phase) error {
