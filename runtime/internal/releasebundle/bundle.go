@@ -10,8 +10,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	runtimedebug "runtime/debug"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -20,6 +22,8 @@ import (
 )
 
 const maxBundleArtifactBytes = 256 * 1024 * 1024
+
+var goPseudoVersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+-(?:[0-9A-Za-z.-]+\.)?([0-9]{14})-([0-9a-f]{12})$`)
 
 type Options struct {
 	ArtifactDir    string
@@ -302,11 +306,7 @@ func validateGoBuildInfo(info *runtimedebug.BuildInfo, target deployment.Target,
 		return fmt.Errorf("%s Go version %q does not match %q", targetKey(target), info.GoVersion, toolchain)
 	}
 	const runtimeModule = "github.com/kciceblue/sshserver/runtime"
-	// Go has emitted both an empty version and "(devel)" for a local main
-	// module across supported patch toolchains. Neither denotes a fetched module
-	// version; the clean-source gate and encoded revision bind the local tree.
-	localMainVersion := info.Main.Version == "" || info.Main.Version == "(devel)"
-	if info.Path != runtimeModule+"/cmd/sshserver" || info.Main.Path != runtimeModule || !localMainVersion || info.Main.Replace != nil {
+	if info.Path != runtimeModule+"/cmd/sshserver" || info.Main.Path != runtimeModule || info.Main.Replace != nil {
 		return fmt.Errorf(
 			"%s main package metadata is not the exact local sshserver runtime module (path=%q main=%q version=%q replaced=%t)",
 			targetKey(target), info.Path, info.Main.Path, info.Main.Version, info.Main.Replace != nil,
@@ -345,6 +345,16 @@ func validateGoBuildInfo(info *runtimedebug.BuildInfo, target deployment.Target,
 			return fmt.Errorf("%s build metadata has incomplete, mismatched, or dirty VCS provenance", targetKey(target))
 		}
 	}
+	// Supported patch toolchains have emitted an empty version, "(devel)", or
+	// a VCS-derived pseudo-version for this local nested main module. A pseudo-
+	// version must carry the attested revision prefix and, when present, the
+	// exact VCS timestamp. Arbitrary fetched module versions remain forbidden.
+	if !validLocalMainVersion(info.Main.Version, sourceRevision, settings["vcs.time"]) {
+		return fmt.Errorf(
+			"%s main package metadata is not the exact local sshserver runtime module (path=%q main=%q version=%q replaced=%t)",
+			targetKey(target), info.Path, info.Main.Path, info.Main.Version, info.Main.Replace != nil,
+		)
+	}
 	baselineKey, baselineValue := "GOAMD64", "v1"
 	if target.Architecture == "arm64" {
 		baselineKey, baselineValue = "GOARM64", "v8.0"
@@ -358,6 +368,24 @@ func validateGoBuildInfo(info *runtimedebug.BuildInfo, target deployment.Target,
 		}
 	}
 	return nil
+}
+
+func validLocalMainVersion(version, sourceRevision, vcsTime string) bool {
+	if version == "" || version == "(devel)" {
+		return true
+	}
+	matches := goPseudoVersionPattern.FindStringSubmatch(version)
+	if len(matches) != 3 || len(sourceRevision) != 40 || matches[2] != sourceRevision[:12] {
+		return false
+	}
+	if _, err := time.Parse("20060102150405", matches[1]); err != nil {
+		return false
+	}
+	if vcsTime == "" {
+		return true
+	}
+	parsed, err := time.Parse(time.RFC3339, vcsTime)
+	return err == nil && parsed.UTC().Format("20060102150405") == matches[1]
 }
 
 type bundleOutput struct {

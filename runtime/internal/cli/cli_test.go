@@ -57,6 +57,7 @@ func TestVersionJSONReportsExactBuildIdentity(t *testing.T) {
 }
 
 func TestDeployStatusReportsUninstalledWithoutMutatingRuntime(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)

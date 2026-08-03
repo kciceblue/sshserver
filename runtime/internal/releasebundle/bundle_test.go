@@ -266,6 +266,12 @@ func TestFrozenGoBuildMetadataValidationIsExact(t *testing.T) {
 	}{
 		{name: "main package", mutate: func(info *debug.BuildInfo) { info.Path += "/other" }},
 		{name: "module version", mutate: func(info *debug.BuildInfo) { info.Main.Version = "v1.2.3" }},
+		{name: "pseudo-version revision", mutate: func(info *debug.BuildInfo) {
+			info.Main.Version = "v0.0.0-20260803000000-" + strings.Repeat("b", 12)
+		}},
+		{name: "pseudo-version timestamp", mutate: func(info *debug.BuildInfo) {
+			info.Main.Version = "v0.0.0-20260804000000-" + sourceRevision[:12]
+		}},
 		{name: "duplicate", mutate: func(info *debug.BuildInfo) {
 			info.Settings = append(info.Settings, debug.BuildSetting{Key: "GOOS", Value: "linux"})
 		}},
@@ -291,6 +297,18 @@ func TestFrozenGoBuildMetadataValidationIsExact(t *testing.T) {
 	if err := validateGoBuildInfo(&emptyMainVersion, target, sourceRevision, toolchain); err != nil {
 		t.Fatalf("supported empty local main-module version was rejected: %v", err)
 	}
+	pseudoMainVersion := *valid
+	pseudoMainVersion.Settings = append([]debug.BuildSetting(nil), valid.Settings...)
+	pseudoMainVersion.Main.Version = "v0.0.0-20260803000000-" + sourceRevision[:12]
+	if err := validateGoBuildInfo(&pseudoMainVersion, target, sourceRevision, toolchain); err != nil {
+		t.Fatalf("exact VCS-derived local main-module version was rejected: %v", err)
+	}
+	pseudoWithoutVCS := withoutVCS
+	pseudoWithoutVCS.Settings = append([]debug.BuildSetting(nil), withoutVCS.Settings...)
+	pseudoWithoutVCS.Main.Version = pseudoMainVersion.Main.Version
+	if err := validateGoBuildInfo(&pseudoWithoutVCS, target, sourceRevision, toolchain); err != nil {
+		t.Fatalf("exact pseudo-version without nested-module VCS fields was rejected: %v", err)
+	}
 	if err := verifyGoBuildMetadata([]byte("not a Go executable"), target, release, sourceRevision, toolchain, identity); err == nil {
 		t.Fatal("non-Go artifact metadata accepted")
 	}
@@ -307,12 +325,12 @@ func TestRealFourTargetBuildsContainExactFrozenAttestations(t *testing.T) {
 		t.Fatal(err)
 	}
 	toolchain := strings.TrimSpace(string(output))
-	release := "v0.0.0-metadata-test"
-	sourceRevision := strings.Repeat("b", 40)
 	runtimeRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
 	}
+	release := "v0.0.0-metadata-test"
+	sourceRevision := currentTestSourceRevision(runtimeRoot)
 	for _, target := range deployment.SupportedTargets() {
 		t.Run(target.OS+"-"+target.Architecture, func(t *testing.T) {
 			identity, err := deployment.DeriveBuildIdentity(release, sourceRevision, toolchain, target)
@@ -360,6 +378,18 @@ func TestRealFourTargetBuildsContainExactFrozenAttestations(t *testing.T) {
 			}
 		})
 	}
+}
+
+func currentTestSourceRevision(runtimeRoot string) string {
+	command := exec.Command("git", "-C", runtimeRoot, "rev-parse", "--verify", "HEAD")
+	output, err := command.Output()
+	revision := strings.TrimSpace(string(output))
+	if err == nil && len(revision) == 40 && strings.IndexFunc(revision, func(character rune) bool {
+		return character < '0' || character > '9' && character < 'a' || character > 'f'
+	}) == -1 {
+		return revision
+	}
+	return strings.Repeat("b", 40)
 }
 
 func testGoBuildInfo(target deployment.Target, sourceRevision, toolchain string) *debug.BuildInfo {
