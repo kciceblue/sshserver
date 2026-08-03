@@ -147,6 +147,7 @@ func TestRealNativeBinaryStagesAttestsRunsAndUninstalls(t *testing.T) {
 	}
 	lifecycle := newLifecycle(layout, target, manager)
 	applyRequest := ApplyRequest{
+		ManifestPath:    manifestSource,
 		ManifestPayload: manifestPayload,
 		ManifestSHA256:  SHA256Hex(manifestPayload),
 		ArtifactPath:    binarySource,
@@ -186,7 +187,7 @@ func TestRealNativeBinaryStagesAttestsRunsAndUninstalls(t *testing.T) {
 		}
 	}
 
-	result, err := lifecycle.Apply(context.Background(), applyRequest)
+	result, err := applyConfirmed(t, lifecycle, applyRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +232,7 @@ func TestRealNativeBinaryStagesAttestsRunsAndUninstalls(t *testing.T) {
 			assertPreviewAction(t, repairPreview.Actions, "verify_or_reuse_artifact", installedBinary, binarySource)
 			assertPreviewAction(t, repairPreview.Actions, "verify_or_reuse_license", installedLicense, licenseSource)
 			assertPreviewAction(t, repairPreview.Actions, "verify_or_reuse_notice", installedNotice, noticeSource)
-			if _, err := lifecycle.Apply(context.Background(), applyRequest); err != nil {
+			if _, err := applyConfirmed(t, lifecycle, applyRequest); err != nil {
 				t.Fatalf("repair missing %s: %v", repair.name, err)
 			}
 			if err := repair.verify(); err != nil {
@@ -257,13 +258,13 @@ func TestRealNativeBinaryStagesAttestsRunsAndUninstalls(t *testing.T) {
 		tamperedPreview.BlockReason != "installed_release_verification_failed" {
 		t.Fatalf("tampered installed NOTICE preview=%+v", tamperedPreview)
 	}
-	if _, err := lifecycle.Apply(context.Background(), applyRequest); err == nil {
+	if _, err := applyConfirmed(t, lifecycle, applyRequest); err == nil {
 		t.Fatal("idempotent apply replaced a present tampered NOTICE")
 	}
 	if err := os.Remove(installedNotice); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lifecycle.Apply(context.Background(), applyRequest); err != nil {
+	if _, err := applyConfirmed(t, lifecycle, applyRequest); err != nil {
 		t.Fatalf("repair removed tampered NOTICE: %v", err)
 	}
 

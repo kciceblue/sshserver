@@ -34,7 +34,7 @@ var errInstalledReleaseFilesMissing = errors.New("installed release files are mi
 var previewActionOperations = map[string]bool{
 	"prepare_install_root": true, "prepare_versions_directory": true, "prepare_release_directory": true,
 	"prepare_state_directory": true, "create_lifecycle_lock": true, "acquire_lifecycle_lock": true,
-	"create_apply_journal": true, "resume_apply_journal": true,
+	"create_apply_journal": true, "resume_apply_journal": true, "rebind_apply_journal_inputs": true,
 	"recover_existing_transaction": true, "publish_verified_artifact": true, "publish_verified_license": true,
 	"publish_verified_notice": true, "checkpoint_apply_journal": true, "initialize_or_resume_loopback_instance": true,
 	"stop_prior_user_service": true, "verify_prior_foreground_stopped": true, "return_supervised_foreground_command": true,
@@ -91,6 +91,12 @@ type PreviewRequest struct {
 	ArtifactPath    string
 	LicensePath     string
 	NoticePath      string
+}
+
+type previewInstanceSnapshot struct {
+	state       string
+	listeners   []string
+	blockReason string
 }
 
 type PreviewReleaseIdentity struct {
@@ -278,6 +284,22 @@ func (lifecycle *Lifecycle) previewSnapshot(
 	artifact ReleaseArtifact,
 	lifecycleLockPresent bool,
 ) (DeploymentPreview, error) {
+	return lifecycle.previewSnapshotWithInstance(ctx, request, manifest, desired, artifact, lifecycleLockPresent, nil)
+}
+
+// previewSnapshotWithInstance rebuilds the canonical plan without acquiring a
+// lifecycle lock. Apply uses it while already holding the exclusive lifecycle
+// and initialization locks, supplying the narrowly normalized instance state
+// caused by acquiring those structural locks itself.
+func (lifecycle *Lifecycle) previewSnapshotWithInstance(
+	ctx context.Context,
+	request PreviewRequest,
+	manifest ReleaseManifest,
+	desired InstalledRelease,
+	artifact ReleaseArtifact,
+	lifecycleLockPresent bool,
+	instanceOverride *previewInstanceSnapshot,
+) (DeploymentPreview, error) {
 	// Repeat the read-only layout validation inside the synchronized snapshot.
 	// The preliminary validation in Preview makes opening an existing lock safe;
 	// this validation covers directories created by a racing first apply.
@@ -306,8 +328,14 @@ func (lifecycle *Lifecycle) previewSnapshot(
 	if err != nil {
 		return DeploymentPreview{}, err
 	}
-	instanceState, listeners, instanceBlock := inspectPreviewInstance(ctx, lifecycle.layout.StateDir)
-	preview, err := lifecycle.basePreview(request, manifest, desired, artifact, availability, state, statePresent, journal, journalPresent, instanceState, lifecycleLockPresent, listeners)
+	instance := previewInstanceSnapshot{}
+	if instanceOverride == nil {
+		instance.state, instance.listeners, instance.blockReason = inspectPreviewInstance(ctx, lifecycle.layout.StateDir)
+	} else {
+		instance = *instanceOverride
+		instance.listeners = slices.Clone(instance.listeners)
+	}
+	preview, err := lifecycle.basePreview(request, manifest, desired, artifact, availability, state, statePresent, journal, journalPresent, instance.state, lifecycleLockPresent, instance.listeners)
 	if err != nil {
 		return DeploymentPreview{}, err
 	}
@@ -324,8 +352,8 @@ func (lifecycle *Lifecycle) previewSnapshot(
 				return finishRecoveryUnavailable(preview, "recovery_release_verification_failed")
 			}
 		}
-		if instanceBlock != "" {
-			return finishRecoveryUnavailable(preview, instanceBlock)
+		if instance.blockReason != "" {
+			return finishRecoveryUnavailable(preview, instance.blockReason)
 		}
 		if journal.Operation == OperationApply && journal.Desired != nil && *journal.Desired == desired &&
 			!applyPhaseReached(journal.Phase, PhaseArtifactStaged) {
@@ -343,8 +371,8 @@ func (lifecycle *Lifecycle) previewSnapshot(
 			}
 		}
 	}
-	if instanceBlock != "" {
-		return lifecycle.finishBlockedPreview(preview, instanceBlock)
+	if instance.blockReason != "" {
+		return lifecycle.finishBlockedPreview(preview, instance.blockReason)
 	}
 	if err := preflightDesiredReleaseDestinations(ctx, lifecycle.layout, desired); err != nil {
 		return lifecycle.finishBlockedPreview(preview, "installed_release_verification_failed")
@@ -566,10 +594,24 @@ func previewApplyActions(preview DeploymentPreview, prior *DeploymentState, jour
 		}
 		appendAction("state", "create_apply_journal", preview.Paths.DeploymentJournal, string(PhasePlanned))
 	} else {
+		// Apply prepares every structural directory before resuming a journal;
+		// keep those potentially persistent repairs inside the confirmed plan.
+		appendAction("filesystem", "prepare_install_root", preview.Paths.InstallRoot)
+		appendAction("filesystem", "prepare_versions_directory", preview.Paths.VersionsDir)
+		appendAction("filesystem", "prepare_state_directory", preview.Paths.StateDir)
 		for _, operation := range previewLifecycleLockOperations(preview) {
 			appendAction("state", operation, preview.Paths.LifecycleLock)
 		}
 		appendAction("state", "resume_apply_journal", preview.Paths.DeploymentJournal, journal.TransactionID, string(journal.Phase))
+		if journal.Phase == PhasePlanned &&
+			(journal.SourcePath != preview.Inputs.Artifact.SourcePath ||
+				journal.LicenseSourcePath != preview.Inputs.License.SourcePath ||
+				journal.NoticeSourcePath != preview.Inputs.Notice.SourcePath) {
+			appendAction(
+				"state", "rebind_apply_journal_inputs", preview.Paths.DeploymentJournal,
+				preview.Inputs.Artifact.SourcePath, preview.Inputs.License.SourcePath, preview.Inputs.Notice.SourcePath,
+			)
+		}
 		prior = journal.PriorState
 	}
 	phase := Phase("")

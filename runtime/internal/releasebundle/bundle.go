@@ -1,5 +1,5 @@
 // Package releasebundle generates deterministic, immutable server release
-// metadata and target-specific SSH activation commands.
+// metadata and target-specific SSH preview commands.
 package releasebundle
 
 import (
@@ -37,17 +37,18 @@ type Options struct {
 }
 
 type Result struct {
-	ManifestPath     string                 `json:"manifest_path"`
-	ManifestSHA256   string                 `json:"manifest_sha256"`
-	ActivationPaths  map[string]string      `json:"activation_paths"`
-	ActivationSHA256 map[string]string      `json:"activation_sha256"`
-	UploadFiles      map[string]UploadFiles `json:"upload_files"`
+	ManifestPath   string                 `json:"manifest_path"`
+	ManifestSHA256 string                 `json:"manifest_sha256"`
+	PreviewPaths   map[string]string      `json:"preview_paths"`
+	PreviewSHA256  map[string]string      `json:"preview_sha256"`
+	UploadFiles    map[string]UploadFiles `json:"upload_files"`
 }
 
 // UploadFiles are the exact owner-only names that the SSH client must create
-// in the selected sync host's physical home before invoking ActivationLine.
-// The remote command performs no network fetch and executes no transfer or
-// checksum utility; the authenticated SSH client verifies bytes before upload.
+// in the selected sync host's physical home before invoking PreviewLine and,
+// after confirmation, ActivationLine. The remote commands perform no network
+// fetch and execute no transfer or checksum utility; the authenticated SSH
+// client verifies bytes before upload.
 type UploadFiles struct {
 	Directory     string `json:"directory"`
 	DirectoryMode string `json:"directory_mode"`
@@ -173,11 +174,11 @@ func generate(options Options, verifyMetadata metadataVerifier) (Result, error) 
 	}
 	manifestSHA256 := deployment.SHA256Hex(manifestPayload)
 	result := Result{
-		ManifestPath:     filepath.Join(options.DistDir, "release-manifest.json"),
-		ManifestSHA256:   manifestSHA256,
-		ActivationPaths:  make(map[string]string),
-		ActivationSHA256: make(map[string]string),
-		UploadFiles:      make(map[string]UploadFiles),
+		ManifestPath:   filepath.Join(options.DistDir, "release-manifest.json"),
+		ManifestSHA256: manifestSHA256,
+		PreviewPaths:   make(map[string]string),
+		PreviewSHA256:  make(map[string]string),
+		UploadFiles:    make(map[string]UploadFiles),
 	}
 	outputs = append(outputs, bundleOutput{name: "release-manifest.json", payload: manifestPayload, mode: 0o400})
 	for _, target := range deployment.SupportedTargets() {
@@ -185,16 +186,16 @@ func generate(options Options, verifyMetadata metadataVerifier) (Result, error) 
 		if err != nil {
 			return Result{}, err
 		}
-		activation, err := ActivationLine(manifest, int64(len(manifestPayload)), manifestSHA256, artifact)
+		preview, err := PreviewLine(manifest, int64(len(manifestPayload)), manifestSHA256, artifact)
 		if err != nil {
 			return Result{}, err
 		}
 		key := targetKey(target)
-		name := "activation-" + target.OS + "-" + target.Architecture + ".txt"
+		name := "preview-" + target.OS + "-" + target.Architecture + ".txt"
 		path := filepath.Join(options.DistDir, name)
-		outputs = append(outputs, bundleOutput{name: name, payload: activation, mode: 0o400})
-		result.ActivationPaths[key] = path
-		result.ActivationSHA256[key] = deployment.SHA256Hex(activation)
+		outputs = append(outputs, bundleOutput{name: name, payload: preview, mode: 0o400})
+		result.PreviewPaths[key] = path
+		result.PreviewSHA256[key] = deployment.SHA256Hex(preview)
 		result.UploadFiles[key] = uploadFiles(manifest, manifestSHA256, artifact)
 	}
 	for _, output := range outputs {
@@ -221,31 +222,44 @@ func generate(options Options, verifyMetadata metadataVerifier) (Result, error) 
 	return result, nil
 }
 
-// ActivationLine is the shell-neutral SSH exec command for release bytes that
-// the client has already SHA-256 verified and uploaded over its authenticated
-// SSH connection. The release binary re-verifies every named input before it
-// publishes anything. Download, target detection, upload, and local checksum
-// verification remain client-side so a clean sync host needs only SSH.
-func ActivationLine(manifest deployment.ReleaseManifest, manifestBytes int64, manifestSHA256 string, artifact deployment.ReleaseArtifact) ([]byte, error) {
-	if err := manifest.Validate(); err != nil {
-		return nil, err
-	}
-	canonical, err := manifest.CanonicalBytes()
+// PreviewLine is the deterministic, shell-neutral SSH exec command for release
+// bytes already verified and uploaded by the authenticated client. It performs
+// no mutation and produces the canonical bytes whose digest ActivationLine
+// must carry after the user confirms them.
+func PreviewLine(manifest deployment.ReleaseManifest, manifestBytes int64, manifestSHA256 string, artifact deployment.ReleaseArtifact) ([]byte, error) {
+	files, err := validatedCommandFiles(manifest, manifestBytes, manifestSHA256, artifact)
 	if err != nil {
 		return nil, err
 	}
-	if manifestBytes != int64(len(canonical)) || manifestBytes <= 0 || manifestBytes > 64*1024 ||
-		deployment.SHA256Hex(canonical) != manifestSHA256 {
-		return nil, errors.New("activation manifest size or pin does not match its canonical bytes")
+	prefixHome := func(path string) string { return "~/" + path }
+	parts := []string{
+		prefixHome(files.Artifact),
+		"deploy", "preview",
+		"--manifest", prefixHome(files.Manifest),
+		"--manifest-sha256", manifestSHA256,
+		"--artifact", prefixHome(files.Artifact),
+		"--license", prefixHome(files.License),
+		"--notice", prefixHome(files.Notice),
 	}
-	if artifact.OS == "" || artifact.Architecture == "" {
-		return nil, errors.New("activation artifact target is missing")
+	return []byte(strings.Join(parts, " ") + "\n"), nil
+}
+
+// ActivationLine is generated only after the exact canonical preview bytes
+// have been shown and confirmed. The server verifies the digest again while
+// holding its lifecycle and initialization locks before product mutation.
+func ActivationLine(manifest deployment.ReleaseManifest, manifestBytes int64, manifestSHA256 string, artifact deployment.ReleaseArtifact, confirmedPreviewSHA256 string) ([]byte, error) {
+	files, err := validatedCommandFiles(manifest, manifestBytes, manifestSHA256, artifact)
+	if err != nil {
+		return nil, err
 	}
-	selected, err := manifest.Artifact(deployment.Target{OS: artifact.OS, Architecture: artifact.Architecture})
-	if err != nil || selected != artifact {
-		return nil, errors.New("activation artifact is not the exact manifest target")
+	if len(confirmedPreviewSHA256) != 64 || confirmedPreviewSHA256 != strings.ToLower(confirmedPreviewSHA256) {
+		return nil, errors.New("confirmed preview SHA-256 must be exactly 64 lowercase hexadecimal characters")
 	}
-	files := uploadFiles(manifest, manifestSHA256, artifact)
+	for _, character := range confirmedPreviewSHA256 {
+		if !strings.ContainsRune("0123456789abcdef", character) {
+			return nil, errors.New("confirmed preview SHA-256 must be exactly 64 lowercase hexadecimal characters")
+		}
+	}
 	prefixHome := func(path string) string { return "~/" + path }
 	parts := []string{
 		prefixHome(files.Artifact),
@@ -255,9 +269,32 @@ func ActivationLine(manifest deployment.ReleaseManifest, manifestBytes int64, ma
 		"--artifact", prefixHome(files.Artifact),
 		"--license", prefixHome(files.License),
 		"--notice", prefixHome(files.Notice),
+		"--confirmed-preview-sha256", confirmedPreviewSHA256,
 		"--consume-inputs",
 	}
 	return []byte(strings.Join(parts, " ") + "\n"), nil
+}
+
+func validatedCommandFiles(manifest deployment.ReleaseManifest, manifestBytes int64, manifestSHA256 string, artifact deployment.ReleaseArtifact) (UploadFiles, error) {
+	if err := manifest.Validate(); err != nil {
+		return UploadFiles{}, err
+	}
+	canonical, err := manifest.CanonicalBytes()
+	if err != nil {
+		return UploadFiles{}, err
+	}
+	if manifestBytes != int64(len(canonical)) || manifestBytes <= 0 || manifestBytes > 64*1024 ||
+		deployment.SHA256Hex(canonical) != manifestSHA256 {
+		return UploadFiles{}, errors.New("deployment command manifest size or pin does not match its canonical bytes")
+	}
+	if artifact.OS == "" || artifact.Architecture == "" {
+		return UploadFiles{}, errors.New("deployment command artifact target is missing")
+	}
+	selected, err := manifest.Artifact(deployment.Target{OS: artifact.OS, Architecture: artifact.Architecture})
+	if err != nil || selected != artifact {
+		return UploadFiles{}, errors.New("deployment command artifact is not the exact manifest target")
+	}
+	return uploadFiles(manifest, manifestSHA256, artifact), nil
 }
 
 func uploadFiles(manifest deployment.ReleaseManifest, manifestSHA256 string, artifact deployment.ReleaseArtifact) UploadFiles {

@@ -72,7 +72,10 @@ current-user service-manager domain without creating the install root, state
 directory, lifecycle lock or journal, service definition, instance, or release
 artifact. Discarding the result is therefore a complete cancellation.
 
-The transactional `deploy apply`, `deploy recover`, `deploy status`, `deploy
+The transactional `deploy apply` and `deploy recover` require the SHA-256 of
+the exact canonical preview bytes, including their terminal newline. They
+rebuild that plan while holding the lifecycle and initialization locks and
+refuse before product mutation if any field or action changed. `deploy status`, `deploy
 rollback`, and `deploy uninstall` commands validate an exact pinned release,
 publish its binary and LICENSE/NOTICE without replacement, preserve protected
 instance state, and drive only the current user's native service manager.

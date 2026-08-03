@@ -132,6 +132,36 @@ func PrepareLayout(layout Layout) error {
 	return nil
 }
 
+// PrepareDeploymentLockRoot creates only the owner-only install root needed to
+// create the lifecycle lock. Apply calls it only after the exact read-only
+// preview has matched while holding the non-persistent bootstrap lock.
+func PrepareDeploymentLockRoot(layout Layout) error {
+	return prepareLayoutDirectory(layout, layout.InstallRoot, "install root")
+}
+
+// PrepareDeploymentStateDirectory creates only the owner-only state directory
+// needed to acquire the initialization lease. Artifact/version directories are
+// deliberately deferred until the locked preview confirmation has matched.
+func PrepareDeploymentStateDirectory(layout Layout) error {
+	return prepareLayoutDirectory(layout, layout.StateDir, "state directory")
+}
+
+func prepareLayoutDirectory(layout Layout, target, name string) error {
+	if err := validateLayoutShape(layout); err != nil {
+		return err
+	}
+	verifiedHome, err := openVerifiedDirectory(layout.HomeDir, true)
+	if err != nil {
+		return fmt.Errorf("validate home directory: %w", err)
+	}
+	defer verifiedHome.Close()
+	relative, _ := filepath.Rel(layout.HomeDir, target)
+	if err := ensureDirectoryBelow(int(verifiedHome.Fd()), relative); err != nil {
+		return fmt.Errorf("prepare %s: %w", name, err)
+	}
+	return nil
+}
+
 // ValidateLayoutReadOnly proves that every existing layout component has the
 // ownership, type, and permission properties required by PrepareLayout while
 // allowing absent descendants which apply would create. It never creates or

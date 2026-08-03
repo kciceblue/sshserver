@@ -27,7 +27,7 @@ dist/releases/<release>/
   NOTICE
   release-manifest.json
   sshserver-{linux,darwin}-{amd64,arm64}
-  activation-{linux,darwin}-{amd64,arm64}.txt
+  preview-{linux,darwin}-{amd64,arm64}.txt
 ```
 
 The canonical manifest is frozen by
@@ -35,7 +35,7 @@ The canonical manifest is frozen by
 exact origin, release, source revision, Go toolchain, four target identities,
 byte counts, SHA-256 digests, LICENSE, and NOTICE.
 
-## Client upload and activation boundary
+## Client upload, preview, and activation boundary
 
 The bundle generator reports an `upload_files` contract for each target. The
 authenticated SSH client must verify the selected manifest and release files
@@ -50,14 +50,23 @@ LICENSE                0400
 NOTICE                 0400
 ```
 
-It then invokes the matching `activation-*.txt` line as one SSH exec command.
-That command uses no shell pipeline, downloader, checksum utility, `sudo`, or
-host package prerequisite, and does not redirect stdout or stderr. The uploaded
-binary reopens and re-verifies the pinned manifest, artifact, LICENSE, and
-NOTICE before publishing anything. `--consume-inputs` removes the four verified
-upload files only after a successful transaction. On success, the activation
-line therefore passes through the one-line `deploy apply` JSON result, including
-its `deployment_locator`, unchanged.
+It first invokes the matching `preview-*.txt` line as one SSH exec command and
+strictly parses the returned canonical JSON. Preview creates no install root,
+state directory, lock, journal, service definition, instance, or release file,
+so discarding it is complete cancellation. After showing and confirming those
+exact bytes, the client computes their SHA-256 including the terminal newline
+and constructs the target-specific `deploy apply` line with
+`--confirmed-preview-sha256`. The server rebuilds and compares that exact plan
+while holding its lifecycle and initialization locks before journal, artifact,
+instance, or service mutation.
+
+Neither command uses a shell pipeline, downloader, checksum utility, `sudo`,
+host package prerequisite, or stdout/stderr redirection. The uploaded binary
+reopens and re-verifies the pinned manifest, artifact, LICENSE, and NOTICE
+before publishing anything. `--consume-inputs` removes the four verified upload
+files only after a successful transaction. On success, the confirmed activation
+line passes through the one-line `deploy apply` JSON result, including its
+`deployment_locator`, unchanged.
 
 This is deliberately the server activation foundation, not yet a standalone
 copy-and-paste installer: target detection, downloads, local verification,

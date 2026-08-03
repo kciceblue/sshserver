@@ -3,9 +3,11 @@
 package deployment
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -16,7 +18,10 @@ import (
 	"github.com/kciceblue/sshserver/runtime/internal/service"
 )
 
-var ErrInjectedDeploymentCrash = errors.New("injected deployment crash")
+var (
+	ErrInjectedDeploymentCrash               = errors.New("injected deployment crash")
+	ErrDeploymentPreviewConfirmationMismatch = errors.New("deployment preview confirmation no longer matches the exact apply plan")
+)
 
 type serviceController interface {
 	Kind() ManagerKind
@@ -54,11 +59,13 @@ type Lifecycle struct {
 }
 
 type ApplyRequest struct {
-	ManifestPayload []byte
-	ManifestSHA256  string
-	ArtifactPath    string
-	LicensePath     string
-	NoticePath      string
+	ManifestPath           string
+	ManifestPayload        []byte
+	ManifestSHA256         string
+	ArtifactPath           string
+	LicensePath            string
+	NoticePath             string
+	ConfirmedPreviewSHA256 string
 }
 
 // DeploymentLocator is the credential-free handoff receipt for invoking one
@@ -206,18 +213,23 @@ func (lifecycle *Lifecycle) Rollback(ctx context.Context) (result ApplyResult, r
 		lifecycle.verifyReleaseFile == nil || lifecycle.renderService == nil || lifecycle.probeRunning == nil {
 		return ApplyResult{}, errors.New("deployment lifecycle dependencies are incomplete")
 	}
-	if err := PrepareLayout(lifecycle.layout); err != nil {
-		return ApplyResult{}, err
-	}
-	lock, err := acquireDeploymentLock(lifecycle.layout)
+	bootstrapLock, lock, err := acquireDeploymentMutationLocks(lifecycle.layout)
 	if err != nil {
 		return ApplyResult{}, err
 	}
+	defer func() {
+		if closeErr := bootstrapLock.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment bootstrap lock: %w", closeErr))
+		}
+	}()
 	defer func() {
 		if closeErr := lock.Close(); closeErr != nil {
 			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment lock: %w", closeErr))
 		}
 	}()
+	if err := PrepareLayout(lifecycle.layout); err != nil {
+		return ApplyResult{}, err
+	}
 	journal, journalErr := LoadJournal(lifecycle.layout)
 	if journalErr == nil {
 		if journal.Operation != OperationRollback {
@@ -285,18 +297,23 @@ func (lifecycle *Lifecycle) Uninstall(ctx context.Context) (result UninstallResu
 		lifecycle.verifyReleaseFile == nil || lifecycle.renderService == nil || lifecycle.probeRunning == nil || lifecycle.removeArtifacts == nil {
 		return UninstallResult{}, errors.New("deployment lifecycle dependencies are incomplete")
 	}
-	if err := PrepareLayout(lifecycle.layout); err != nil {
-		return UninstallResult{}, err
-	}
-	lock, err := acquireDeploymentLock(lifecycle.layout)
+	bootstrapLock, lock, err := acquireDeploymentMutationLocks(lifecycle.layout)
 	if err != nil {
 		return UninstallResult{}, err
 	}
+	defer func() {
+		if closeErr := bootstrapLock.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment bootstrap lock: %w", closeErr))
+		}
+	}()
 	defer func() {
 		if closeErr := lock.Close(); closeErr != nil {
 			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment lock: %w", closeErr))
 		}
 	}()
+	if err := PrepareLayout(lifecycle.layout); err != nil {
+		return UninstallResult{}, err
+	}
 	journal, journalErr := LoadJournal(lifecycle.layout)
 	if journalErr == nil {
 		if journal.Operation != OperationUninstall {
@@ -646,25 +663,89 @@ func newLifecycle(layout Layout, target Target, manager serviceController) *Life
 	}
 }
 
+func (request ApplyRequest) previewRequest() PreviewRequest {
+	return PreviewRequest{
+		ManifestPath: request.ManifestPath, ManifestPayload: request.ManifestPayload, ManifestSHA256: request.ManifestSHA256,
+		ArtifactPath: request.ArtifactPath, LicensePath: request.LicensePath, NoticePath: request.NoticePath,
+	}
+}
+
+func confirmDeploymentPreview(preview DeploymentPreview, confirmedSHA256 string) error {
+	if !hexDigestPattern.MatchString(confirmedSHA256) {
+		return errors.New("confirmed deployment preview SHA-256 must be exactly 64 lowercase hexadecimal characters")
+	}
+	canonical, err := preview.CanonicalBytes()
+	if err != nil {
+		return err
+	}
+	if SHA256Hex(canonical) != confirmedSHA256 {
+		return ErrDeploymentPreviewConfirmationMismatch
+	}
+	if !preview.ApplyAllowed {
+		return fmt.Errorf("confirmed deployment preview is not applicable: %s", preview.BlockReason)
+	}
+	return nil
+}
+
+func (lifecycle *Lifecycle) verifyApplyConfirmationInputs(request ApplyRequest, desired InstalledRelease) error {
+	payload, err := ReadPinnedManifestFile(request.ManifestPath, request.ManifestSHA256)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(payload, request.ManifestPayload) {
+		return errors.New("deployment manifest bytes changed after they were read")
+	}
+	if err := lifecycle.verifySourceArtifact(request.ArtifactPath, desired); err != nil {
+		return fmt.Errorf("verify confirmed deployment artifact: %w", err)
+	}
+	if err := lifecycle.verifySourceReleaseFile(request.LicensePath, desired.LicenseBytes, desired.LicenseSHA256); err != nil {
+		return fmt.Errorf("verify confirmed deployment LICENSE: %w", err)
+	}
+	if err := lifecycle.verifySourceReleaseFile(request.NoticePath, desired.NoticeBytes, desired.NoticeSHA256); err != nil {
+		return fmt.Errorf("verify confirmed deployment NOTICE: %w", err)
+	}
+	return nil
+}
+
+func lockedConfirmationInstanceSnapshot(ctx context.Context, layout Layout, confirmedState string) previewInstanceSnapshot {
+	state, listeners, blockReason := inspectPreviewInstance(ctx, layout.StateDir)
+	// A fresh apply must create the state directory and its owner-only
+	// initialization lock before it can exclude a concurrent initializer. Treat
+	// only that exact, otherwise-empty structural delta as the original missing
+	// state. Every other file or state transition remains visible to the digest.
+	if confirmedState == "missing" && state == "uninitialized" && blockReason == "" && onlyInitializationLockPresent(layout.StateDir) {
+		state = "missing"
+	}
+	return previewInstanceSnapshot{state: state, listeners: listeners, blockReason: blockReason}
+}
+
+func onlyInitializationLockPresent(stateDir string) bool {
+	directory, err := openVerifiedDirectory(stateDir, true)
+	if err != nil {
+		return false
+	}
+	defer directory.Close()
+	names, err := directory.Readdirnames(-1)
+	return err == nil && len(names) == 1 && names[0] == ".instance.lock"
+}
+
 func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (result ApplyResult, returnErr error) {
 	if lifecycle == nil || lifecycle.manager == nil || lifecycle.inspector == nil || lifecycle.stageArtifact == nil ||
 		lifecycle.verifyArtifact == nil || lifecycle.stageReleaseFile == nil || lifecycle.verifyReleaseFile == nil ||
-		lifecycle.verifyPreviewRelease == nil || lifecycle.acquireInstanceLease == nil || lifecycle.renderService == nil || lifecycle.probeRunning == nil {
+		lifecycle.verifySourceArtifact == nil || lifecycle.verifySourceReleaseFile == nil || lifecycle.verifyPreviewRelease == nil ||
+		lifecycle.acquireInstanceLease == nil || lifecycle.renderService == nil || lifecycle.probeRunning == nil {
 		return ApplyResult{}, errors.New("deployment lifecycle dependencies are incomplete")
 	}
-	manifest, err := ParsePinnedManifest(request.ManifestPayload, request.ManifestSHA256)
+	if !hexDigestPattern.MatchString(request.ConfirmedPreviewSHA256) {
+		return ApplyResult{}, errors.New("confirmed deployment preview SHA-256 must be exactly 64 lowercase hexadecimal characters")
+	}
+	previewRequest := request.previewRequest()
+	manifest, desired, artifact, err := lifecycle.previewDesired(previewRequest)
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	desired, err := InstalledFromManifest(lifecycle.layout, manifest, request.ManifestSHA256, lifecycle.target)
-	if err != nil {
+	if err := lifecycle.verifyApplyConfirmationInputs(request, desired); err != nil {
 		return ApplyResult{}, err
-	}
-	if !canonicalAbsolutePath(request.ArtifactPath) || !canonicalAbsolutePath(request.LicensePath) || !canonicalAbsolutePath(request.NoticePath) {
-		return ApplyResult{}, errors.New("deployment artifact and release-file paths must be canonical and absolute")
-	}
-	if request.ArtifactPath == request.LicensePath || request.ArtifactPath == request.NoticePath || request.LicensePath == request.NoticePath {
-		return ApplyResult{}, errors.New("deployment input paths must be distinct")
 	}
 	if err := ValidateLayoutReadOnly(lifecycle.layout); err != nil {
 		return ApplyResult{}, err
@@ -719,10 +800,50 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 	if preflightJournalErr == nil && !managerMatchesJournal(preMutationAvailability, preflightJournal) {
 		return ApplyResult{}, errors.New("service-manager outcome no longer matches the recoverable deployment transaction")
 	}
-	if err := PrepareLayout(lifecycle.layout); err != nil {
+	bootstrapLock, err := acquireDeploymentBootstrapLock(lifecycle.layout)
+	if err != nil {
 		return ApplyResult{}, err
 	}
-	lock, err := acquireDeploymentLock(lifecycle.layout)
+	defer func() {
+		if closeErr := bootstrapLock.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment bootstrap lock: %w", closeErr))
+		}
+	}()
+
+	lifecycleLockPresent := false
+	var confirmedPreview DeploymentPreview
+	var lock *deploymentLock
+	if _, statErr := os.Lstat(lifecycle.layout.LockPath); statErr == nil {
+		lifecycleLockPresent = true
+		lock, err = acquireExistingDeploymentLock(lifecycle.layout)
+	} else if errors.Is(statErr, os.ErrNotExist) {
+		// No persistent path may be created until the confirmed bytes have been
+		// rebuilt while first-install attempts are serialized on the existing
+		// home-directory inode.
+		bootstrapPreview, previewErr := lifecycle.previewSnapshotWithInstance(
+			ctx, previewRequest, manifest, desired, artifact, false, nil,
+		)
+		if previewErr != nil {
+			return ApplyResult{}, previewErr
+		}
+		if err := confirmDeploymentPreview(bootstrapPreview, request.ConfirmedPreviewSHA256); err != nil {
+			return ApplyResult{}, err
+		}
+		confirmedPreview = bootstrapPreview
+		// The earlier input proof preceded first-operation admission. Repeat it
+		// while the home-directory bootstrap lock is held and before creating the
+		// install root or lifecycle lock, so input drift rejects with zero target
+		// mutation.
+		if err := lifecycle.verifyApplyConfirmationInputs(request, desired); err != nil {
+			return ApplyResult{}, err
+		}
+		if err := PrepareDeploymentLockRoot(lifecycle.layout); err != nil {
+			return ApplyResult{}, err
+		}
+		lock, err = acquireDeploymentLock(lifecycle.layout)
+	} else {
+		return ApplyResult{}, fmt.Errorf("inspect deployment lock: %w", statErr)
+	}
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -731,9 +852,27 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment lock: %w", closeErr))
 		}
 	}()
+	if err := lifecycle.verifyApplyConfirmationInputs(request, desired); err != nil {
+		return ApplyResult{}, err
+	}
+	lockedPreview, err := lifecycle.previewSnapshotWithInstance(
+		ctx, previewRequest, manifest, desired, artifact, lifecycleLockPresent, nil,
+	)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if err := confirmDeploymentPreview(lockedPreview, request.ConfirmedPreviewSHA256); err != nil {
+		return ApplyResult{}, err
+	}
+	if lifecycleLockPresent {
+		confirmedPreview = lockedPreview
+	}
 	// Recheck the desired final paths under the exclusive lifecycle lock so a
 	// cooperating deployment cannot race the read-only preflight into a journal.
 	if err := preflightDesiredReleaseDestinations(ctx, lifecycle.layout, desired); err != nil {
+		return ApplyResult{}, err
+	}
+	if err := PrepareDeploymentStateDirectory(lifecycle.layout); err != nil {
 		return ApplyResult{}, err
 	}
 	instanceLease, err := lifecycle.acquireInstanceLease(lifecycle.layout.StateDir)
@@ -745,12 +884,22 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 			returnErr = errors.Join(returnErr, fmt.Errorf("release deployment instance lease: %w", closeErr))
 		}
 	}()
-	// The pre-mutation check above catches invalid state without creating the
-	// layout. Repeat it while holding the initializer's exact lease, and retain
-	// that lease through runApply, so init/state replacement cannot race the
-	// journal and staging steps into a late initialization failure.
-	if _, _, instanceBlock := inspectPreviewInstance(ctx, lifecycle.layout.StateDir); instanceBlock != "" {
-		return ApplyResult{}, fmt.Errorf("deployment instance preflight is blocked under initialization lease: %s", instanceBlock)
+	if err := lifecycle.verifyApplyConfirmationInputs(request, desired); err != nil {
+		return ApplyResult{}, err
+	}
+	instanceSnapshot := lockedConfirmationInstanceSnapshot(ctx, lifecycle.layout, confirmedPreview.Existing.InstanceState)
+	finalPreview, err := lifecycle.previewSnapshotWithInstance(
+		ctx, previewRequest, manifest, desired, artifact, lifecycleLockPresent, &instanceSnapshot,
+	)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if err := confirmDeploymentPreview(finalPreview, request.ConfirmedPreviewSHA256); err != nil {
+		return ApplyResult{}, err
+	}
+	preMutationAvailability = cloneManagerAvailability(finalPreview.Manager)
+	if err := PrepareLayout(lifecycle.layout); err != nil {
+		return ApplyResult{}, err
 	}
 
 	journal, journalErr := LoadJournal(lifecycle.layout)

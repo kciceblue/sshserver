@@ -203,6 +203,26 @@ func TestDeployPreviewCLIIsCanonicalAndNeverMutatesTargetLayout(t *testing.T) {
 			t.Fatalf("preview CLI created %s: %v", path, err)
 		}
 	}
+	for _, operation := range []string{"apply", "recover"} {
+		operationArgs := append([]string(nil), args...)
+		operationArgs[1] = operation
+		var missingStdout, missingStderr bytes.Buffer
+		missingCode := (Runner{Stdout: &missingStdout, Stderr: &missingStderr}).Run(context.Background(), operationArgs)
+		if missingCode == 0 || missingStdout.Len() != 0 || !strings.Contains(missingStderr.String(), "--confirmed-preview-sha256") {
+			t.Fatalf("deploy %s missing confirmation code=%d stdout=%q stderr=%q", operation, missingCode, missingStdout.String(), missingStderr.String())
+		}
+		operationArgs = append(operationArgs, "--confirmed-preview-sha256", "not-a-digest")
+		var malformedStdout, malformedStderr bytes.Buffer
+		malformedCode := (Runner{Stdout: &malformedStdout, Stderr: &malformedStderr}).Run(context.Background(), operationArgs)
+		if malformedCode == 0 || malformedStdout.Len() != 0 || !strings.Contains(malformedStderr.String(), "64 lowercase hexadecimal") {
+			t.Fatalf("deploy %s malformed confirmation code=%d stdout=%q stderr=%q", operation, malformedCode, malformedStdout.String(), malformedStderr.String())
+		}
+	}
+	for _, path := range []string{installRoot, stateDir} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("rejected apply alias created %s: %v", path, err)
+		}
+	}
 
 	badArtifact := writeCLIProtectedInput(t, upload, "bad-sshserver", append(append([]byte(nil), artifactPayload...), 0), 0o500)
 	badArgs := append([]string(nil), args...)

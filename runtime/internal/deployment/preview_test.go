@@ -61,7 +61,7 @@ func TestDeploymentPreviewClassifiesFreshIdempotentAndUpgrade(t *testing.T) {
 		t.Fatalf("preview created deployment journal: %v", err)
 	}
 
-	if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 		t.Fatal(err)
 	}
 	idempotent, err := fixture.lifecycle.Preview(context.Background(), previewRequest)
@@ -134,7 +134,7 @@ func TestFreshAndUpgradeDestinationCollisionsBlockBeforeJournal(t *testing.T) {
 				fixture := newLifecycleFixture(t, false)
 				if classification == "upgrade" {
 					installed, _ := fixture.release(t, "v1.2.3", "destination-collision-installed")
-					if _, err := fixture.lifecycle.Apply(context.Background(), installed); err != nil {
+					if _, err := applyConfirmed(t, fixture.lifecycle, installed); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -179,7 +179,7 @@ func TestFreshAndUpgradeDestinationCollisionsBlockBeforeJournal(t *testing.T) {
 
 				stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
 				managerCallsBefore := len(fixture.manager.calls)
-				if _, err := fixture.lifecycle.Apply(context.Background(), request); err == nil ||
+				if _, err := applyConfirmed(t, fixture.lifecycle, request); err == nil ||
 					!strings.Contains(err.Error(), "preflight desired release destinations") {
 					t.Fatalf("destination-collision apply error=%v", err)
 				}
@@ -200,7 +200,7 @@ func TestFreshAndUpgradeDestinationCollisionsBlockBeforeJournal(t *testing.T) {
 func TestDeploymentPreviewAllowsMissingInstalledFilesOnlyForMatchingIdempotentRequest(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	request, desired := fixture.release(t, "v1.2.3", "idempotent-missing")
-	if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 		t.Fatal(err)
 	}
 	fixture.lifecycle.verifyPreviewRelease = func(context.Context, InstalledRelease) error {
@@ -249,7 +249,7 @@ func TestDeploymentPreviewAllowsMissingInstalledFilesOnlyForMatchingIdempotentRe
 func TestIdempotentRepairPreviewIncludesDirectoryPreparationWithoutMutation(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	request, desired := fixture.release(t, "v1.2.3", "idempotent-directory-repair")
-	if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 		t.Fatal(err)
 	}
 	releaseDir, err := fixture.layout.VersionDir(desired.Release)
@@ -284,7 +284,7 @@ func TestIdempotentRepairPreviewIncludesDirectoryPreparationWithoutMutation(t *t
 		}
 	}
 
-	if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 		t.Fatalf("idempotent directory repair: %v", err)
 	}
 	for _, path := range []string{fixture.layout.VersionsDir, releaseDir} {
@@ -367,7 +367,7 @@ func TestReadyInstancePreflightValidatesEveryRequiredFileBeforeJournal(t *testin
 				t.Fatalf("preview mutated invalid completed instance\n before=%+v\n after=%+v", before, after)
 			}
 			managerCallsBeforeApply := len(manager.calls)
-			if _, err := lifecycle.Apply(context.Background(), request); err == nil || !strings.Contains(err.Error(), testCase.blockReason) {
+			if _, err := applyConfirmed(t, lifecycle, request); err == nil || !strings.Contains(err.Error(), testCase.blockReason) {
 				t.Fatalf("invalid completed-instance apply error=%v", err)
 			}
 			if len(manager.calls) != managerCallsBeforeApply {
@@ -559,7 +559,7 @@ func TestResumableInstancePreflightValidatesExistingFilesBeforeJournal(t *testin
 				t.Fatalf("preview mutated invalid resumable instance\n before=%+v\n after=%+v", before, after)
 			}
 			managerCallsBeforeApply := len(manager.calls)
-			if _, err := lifecycle.Apply(context.Background(), request); err == nil || !strings.Contains(err.Error(), testCase.blockReason) {
+			if _, err := applyConfirmed(t, lifecycle, request); err == nil || !strings.Contains(err.Error(), testCase.blockReason) {
 				t.Fatalf("invalid resumable-instance apply error=%v", err)
 			}
 			if len(manager.calls) != managerCallsBeforeApply {
@@ -676,7 +676,7 @@ func TestPreviewAndApplyRejectUnsafeExistingServiceDefinitionBeforeMutation(t *t
 				fixture := newLifecycleFixture(t, false)
 				request, _ := fixture.release(t, "v1.2.3", "unsafe-definition-fresh")
 				if classification == "upgrade" {
-					if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+					if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 						t.Fatal(err)
 					}
 					request, _ = fixture.release(t, "v1.2.4", "unsafe-definition-upgrade")
@@ -692,7 +692,7 @@ func TestPreviewAndApplyRejectUnsafeExistingServiceDefinitionBeforeMutation(t *t
 				if _, err := fixture.lifecycle.Preview(context.Background(), requestForPreview(fixture.layout, request)); err == nil || !strings.Contains(err.Error(), unsafeDefinition.wantError) {
 					t.Fatalf("unsafe service-definition preview error=%v", err)
 				}
-				if _, err := fixture.lifecycle.Apply(context.Background(), request); err == nil || !strings.Contains(err.Error(), unsafeDefinition.wantError) {
+				if _, err := applyConfirmed(t, fixture.lifecycle, request); err == nil || !strings.Contains(err.Error(), unsafeDefinition.wantError) {
 					t.Fatalf("unsafe service-definition apply error=%v", err)
 				}
 				if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
@@ -761,7 +761,7 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 		fixture := newLifecycleFixture(t, false)
 		request, _ := fixture.release(t, "v1.2.3", "resume")
 		fixture.lifecycle.failAfterPhase = PhaseArtifactStaged
-		if _, err := fixture.lifecycle.Apply(context.Background(), request); !errors.Is(err, ErrInjectedDeploymentCrash) {
+		if _, err := applyConfirmed(t, fixture.lifecycle, request); !errors.Is(err, ErrInjectedDeploymentCrash) {
 			t.Fatalf("injected apply error=%v", err)
 		}
 		fixture.lifecycle.failAfterPhase = ""
@@ -773,14 +773,49 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 			preview.Existing.Journal.Phase != PhaseArtifactStaged {
 			t.Fatalf("resume preview=%+v", preview)
 		}
+		assertPreviewActionPrefix(t, preview.Actions,
+			"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "resume_apply_journal",
+		)
 		assertPreviewActionsContain(t, preview.Actions, "resume_apply_journal", "initialize_or_resume_loopback_instance", "remove_apply_journal")
+	})
+
+	t.Run("planned recovery records verified input rebind", func(t *testing.T) {
+		fixture := newLifecycleFixture(t, false)
+		request, _ := fixture.release(t, "v1.2.3", "resume-rebind")
+		fixture.lifecycle.failAfterPhase = PhasePlanned
+		if _, err := applyConfirmed(t, fixture.lifecycle, request); !errors.Is(err, ErrInjectedDeploymentCrash) {
+			t.Fatalf("injected apply error=%v", err)
+		}
+		fixture.lifecycle.failAfterPhase = ""
+		alternateDirectory := filepath.Join(fixture.layout.HomeDir, "alternate-upload")
+		request.ArtifactPath = filepath.Join(alternateDirectory, "sshserver")
+		request.LicensePath = filepath.Join(alternateDirectory, "LICENSE")
+		request.NoticePath = filepath.Join(alternateDirectory, "NOTICE")
+		preview, err := fixture.lifecycle.Preview(context.Background(), requestForPreview(fixture.layout, request))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertPreviewActionPrefix(t, preview.Actions,
+			"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "resume_apply_journal", "rebind_apply_journal_inputs",
+		)
+		var rebind *PreviewAction
+		for index := range preview.Actions {
+			if preview.Actions[index].Operation == "rebind_apply_journal_inputs" {
+				rebind = &preview.Actions[index]
+				break
+			}
+		}
+		if rebind == nil || !reflect.DeepEqual(rebind.Arguments, []string{request.ArtifactPath, request.LicensePath, request.NoticePath}) {
+			t.Fatalf("rebind action=%+v", rebind)
+		}
+		assertCanonicalPreview(t, preview)
 	})
 
 	t.Run("different release requires matching recovery", func(t *testing.T) {
 		fixture := newLifecycleFixture(t, false)
 		first, _ := fixture.release(t, "v1.2.3", "recovery-first")
 		fixture.lifecycle.failAfterPhase = PhasePlanned
-		if _, err := fixture.lifecycle.Apply(context.Background(), first); !errors.Is(err, ErrInjectedDeploymentCrash) {
+		if _, err := applyConfirmed(t, fixture.lifecycle, first); !errors.Is(err, ErrInjectedDeploymentCrash) {
 			t.Fatalf("injected apply error=%v", err)
 		}
 		fixture.lifecycle.failAfterPhase = ""
@@ -798,7 +833,7 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 	t.Run("damaged installed release blocks", func(t *testing.T) {
 		fixture := newLifecycleFixture(t, false)
 		request, _ := fixture.release(t, "v1.2.3", "damaged")
-		if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+		if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 			t.Fatal(err)
 		}
 		fixture.lifecycle.verifyPreviewRelease = func(context.Context, InstalledRelease) error { return errors.New("damaged") }
@@ -814,7 +849,7 @@ func TestDeploymentPreviewReportsResumeRecoveryAndBlockedStates(t *testing.T) {
 	t.Run("native to foreground transition blocks", func(t *testing.T) {
 		fixture := newLifecycleFixture(t, false)
 		first, _ := fixture.release(t, "v1.2.3", "native")
-		if _, err := fixture.lifecycle.Apply(context.Background(), first); err != nil {
+		if _, err := applyConfirmed(t, fixture.lifecycle, first); err != nil {
 			t.Fatal(err)
 		}
 		fixture.manager.availability = foregroundAvailability(fixture.layout, "/rewritten")
@@ -857,7 +892,7 @@ func TestDeploymentPreviewAndApplyManagerPreflightDoNotMutateOnCancelOrFailure(t
 	t.Run("initial apply manager failure", func(t *testing.T) {
 		lifecycle, layout, manager := missingLayoutLifecycle(t, request)
 		manager.failures["detect"] = 1
-		if _, err := lifecycle.Apply(context.Background(), request); err == nil || !strings.Contains(err.Error(), "detect") {
+		if _, err := applyConfirmed(t, lifecycle, request); err == nil || !strings.Contains(err.Error(), "detect") {
 			t.Fatalf("apply manager failure=%v", err)
 		}
 		assertMissingPreviewTargets(t, layout)
@@ -880,7 +915,7 @@ func TestApplyRevalidatesManagerBeforeDeploymentActions(t *testing.T) {
 		leaseCalls++
 		return nil, errors.New("unexpected initialization lease")
 	}
-	if _, err := lifecycle.Apply(context.Background(), request); err == nil || !strings.Contains(err.Error(), "changed during apply preflight") {
+	if _, err := applyConfirmed(t, lifecycle, request); err == nil || !strings.Contains(err.Error(), "changed during apply preflight") {
 		t.Fatalf("manager race error=%v", err)
 	}
 	if stageCalls != 0 || leaseCalls != 0 {
@@ -905,17 +940,18 @@ func TestDeploymentPreviewForegroundJournalRecoveryRequiresStoppedRuntime(t *tes
 			t.Run(name, func(t *testing.T) {
 				fixture := newLifecycleFixture(t, true)
 				firstRequest, firstRelease := fixture.release(t, "v1.2.3", name+"-prior")
-				if _, err := fixture.lifecycle.Apply(context.Background(), firstRequest); err != nil {
+				if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
 					t.Fatal(err)
 				}
-				fixture.manager.active = running
-				fixture.manager.current = identityFor(firstRelease)
+				fixture.manager.active = false
 				secondRequest, _ := fixture.release(t, "v1.2.4", name+"-desired")
 				fixture.lifecycle.failAfterPhase = phase
-				if _, err := fixture.lifecycle.Apply(context.Background(), secondRequest); !errors.Is(err, ErrInjectedDeploymentCrash) {
+				if _, err := applyConfirmed(t, fixture.lifecycle, secondRequest); !errors.Is(err, ErrInjectedDeploymentCrash) {
 					t.Fatalf("injected apply error=%v", err)
 				}
 				fixture.lifecycle.failAfterPhase = ""
+				fixture.manager.active = running
+				fixture.manager.current = identityFor(firstRelease)
 
 				preview, err := fixture.lifecycle.Preview(context.Background(), requestForPreview(fixture.layout, secondRequest))
 				if err != nil {
@@ -937,7 +973,7 @@ func TestDeploymentPreviewForegroundJournalRecoveryRequiresStoppedRuntime(t *tes
 				assertPreviewActionsContain(t, preview.Actions, "verify_prior_foreground_stopped")
 				if phase == PhasePlanned {
 					assertPreviewActionPrefix(t, preview.Actions,
-						"acquire_lifecycle_lock", "resume_apply_journal", "prepare_release_directory", "publish_verified_artifact",
+						"prepare_install_root", "prepare_versions_directory", "prepare_state_directory", "acquire_lifecycle_lock", "resume_apply_journal", "prepare_release_directory", "publish_verified_artifact",
 					)
 				} else {
 					assertPreviewActionsExclude(t, preview.Actions, "prepare_release_directory")
@@ -964,7 +1000,7 @@ func TestPreviewAndApplyRejectUnsafeExistingLockBeforeMutation(t *testing.T) {
 	if _, err := lifecycle.Preview(context.Background(), requestForPreview(layout, request)); err == nil || !strings.Contains(err.Error(), "deployment lock") {
 		t.Fatalf("unsafe-lock preview error=%v", err)
 	}
-	if _, err := lifecycle.Apply(context.Background(), request); err == nil || !strings.Contains(err.Error(), "deployment lock") {
+	if _, err := applyConfirmed(t, lifecycle, request); err == nil || !strings.Contains(err.Error(), "deployment lock") {
 		t.Fatalf("unsafe-lock apply error=%v", err)
 	}
 	if len(manager.calls) != 0 {
@@ -980,7 +1016,7 @@ func TestPreviewAndApplyRejectUnsafeExistingLockBeforeMutation(t *testing.T) {
 func TestDeploymentPreviewRetriesWhenFirstApplyCreatesLifecycleLock(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	request, desired := fixture.release(t, "v1.2.3", "first-apply-lock-race")
-	if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 		t.Fatal(err)
 	}
 	state, err := LoadState(fixture.layout)
@@ -1049,7 +1085,7 @@ func TestApplyRejectsMalformedManagerOutcomeBeforeMutation(t *testing.T) {
 	request, _ := template.release(t, "v1.2.3", "malformed-manager")
 	lifecycle, layout, manager := missingLayoutLifecycle(t, request)
 	manager.availability.Available = false
-	if _, err := lifecycle.Apply(context.Background(), request); err == nil || !strings.Contains(err.Error(), "invalid foreground outcome") {
+	if _, err := applyConfirmed(t, lifecycle, request); err == nil || !strings.Contains(err.Error(), "invalid foreground outcome") {
 		t.Fatalf("malformed manager error=%v", err)
 	}
 	assertMissingPreviewTargets(t, layout)

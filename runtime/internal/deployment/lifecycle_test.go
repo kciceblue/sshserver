@@ -21,10 +21,44 @@ import (
 	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
+func applyConfirmed(t *testing.T, lifecycle *Lifecycle, request ApplyRequest) (ApplyResult, error) {
+	t.Helper()
+	var savedCalls []string
+	var savedDetectResults []ManagerAvailability
+	var savedFailures map[string]int
+	manager, hasFakeManager := lifecycle.manager.(*fakeServiceManager)
+	if hasFakeManager {
+		savedCalls = append([]string(nil), manager.calls...)
+		savedDetectResults = append([]ManagerAvailability(nil), manager.detectResults...)
+		savedFailures = make(map[string]int, len(manager.failures))
+		for operation, count := range manager.failures {
+			savedFailures[operation] = count
+		}
+	}
+	preview, err := lifecycle.Preview(context.Background(), request.previewRequest())
+	if err == nil {
+		canonical, canonicalErr := preview.CanonicalBytes()
+		if canonicalErr != nil {
+			t.Fatal(canonicalErr)
+		}
+		request.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
+	} else {
+		// Invalid preflight fixtures still enter Apply so the test can assert the
+		// exact read-only validation error. A valid preview digest cannot exist.
+		request.ConfirmedPreviewSHA256 = strings.Repeat("0", 64)
+	}
+	if hasFakeManager {
+		manager.calls = savedCalls
+		manager.detectResults = savedDetectResults
+		manager.failures = savedFailures
+	}
+	return lifecycle.Apply(context.Background(), request)
+}
+
 func TestApplyTransactionCommitsExactNativeReleaseAndIsIdempotent(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	request, desired := fixture.release(t, "v1.2.3", "a")
-	result, err := fixture.lifecycle.Apply(context.Background(), request)
+	result, err := applyConfirmed(t, fixture.lifecycle, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +78,7 @@ func TestApplyTransactionCommitsExactNativeReleaseAndIsIdempotent(t *testing.T) 
 	}
 
 	beforeCalls := len(fixture.manager.calls)
-	second, err := fixture.lifecycle.Apply(context.Background(), request)
+	second, err := applyConfirmed(t, fixture.lifecycle, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,10 +93,186 @@ func TestApplyTransactionCommitsExactNativeReleaseAndIsIdempotent(t *testing.T) 
 	}
 }
 
+func TestApplyRequiresExactCanonicalPreviewDigestBeforePersistentMutation(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		confirmed func([]byte) string
+		wantError string
+	}{
+		{name: "missing", confirmed: func([]byte) string { return "" }, wantError: "64 lowercase hexadecimal"},
+		{name: "malformed", confirmed: func([]byte) string { return strings.Repeat("A", 64) }, wantError: "64 lowercase hexadecimal"},
+		{name: "canonical bytes without terminal LF", confirmed: func(payload []byte) string { return SHA256Hex(payload[:len(payload)-1]) }, wantError: ErrDeploymentPreviewConfirmationMismatch.Error()},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newLifecycleFixture(t, false)
+			request, _ := fixture.release(t, "v1.2.3", testCase.name)
+			preview, err := fixture.lifecycle.Preview(context.Background(), request.previewRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonical, err := preview.CanonicalBytes()
+			if err != nil || len(canonical) == 0 || canonical[len(canonical)-1] != '\n' {
+				t.Fatalf("canonical preview boundary bytes=%q err=%v", canonical, err)
+			}
+			request.ConfirmedPreviewSHA256 = testCase.confirmed(canonical)
+			before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+			if _, err := fixture.lifecycle.Apply(context.Background(), request); err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+				t.Fatalf("confirmation error=%v", err)
+			}
+			if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+				t.Fatalf("rejected confirmation mutated target\n before=%+v\n after=%+v", before, after)
+			}
+			if fixture.stageCalls != 0 || fixture.supportStageCalls != 0 || fixture.initializeCalls != 0 {
+				t.Fatalf("rejected confirmation reached mutation stage/support/init=%d/%d/%d", fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls)
+			}
+		})
+	}
+}
+
+func TestApplyRejectsStalePreviewWhenManagerPlanChanges(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	request, _ := fixture.release(t, "v1.2.3", "stale-manager")
+	preview, err := fixture.lifecycle.Preview(context.Background(), request.previewRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := preview.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
+	fixture.manager.availability = foregroundAvailability(fixture.layout, "/pending")
+	before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+	if _, err := fixture.lifecycle.Apply(context.Background(), request); !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) {
+		t.Fatalf("stale manager confirmation error=%v", err)
+	}
+	if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+		t.Fatalf("stale manager confirmation mutated target\n before=%+v\n after=%+v", before, after)
+	}
+	for _, call := range fixture.manager.calls {
+		if call == "install" || call == "activate" || call == "stop" || call == "remove" {
+			t.Fatalf("stale confirmation reached manager mutation: %v", fixture.manager.calls)
+		}
+	}
+}
+
+func TestApplyRejectsReplayOfFreshPreviewAfterSuccessfulCommit(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	request, _ := fixture.release(t, "v1.2.3", "replayed-fresh")
+	preview, err := fixture.lifecycle.Preview(context.Background(), request.previewRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := preview.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
+	if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+	before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+	if _, err := fixture.lifecycle.Apply(context.Background(), request); !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) {
+		t.Fatalf("replayed fresh confirmation error=%v", err)
+	}
+	if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+		t.Fatalf("replayed fresh confirmation mutated target\n before=%+v\n after=%+v", before, after)
+	}
+	if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+		t.Fatalf("replayed confirmation reached mutation stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+	}
+}
+
+func TestConcurrentFirstApplyLosesBootstrapAdmissionWithoutMutation(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	request, _ := fixture.release(t, "v1.2.3", "bootstrap-contention")
+	preview, err := fixture.lifecycle.Preview(context.Background(), request.previewRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := preview.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
+	bootstrap, err := acquireDeploymentBootstrapLock(fixture.layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bootstrap.Close()
+	before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+	if _, err := fixture.lifecycle.Apply(context.Background(), request); err == nil || !strings.Contains(err.Error(), "bootstrap operation") {
+		t.Fatalf("contended bootstrap error=%v", err)
+	}
+	if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+		t.Fatalf("losing first apply mutated target\n before=%+v\n after=%+v", before, after)
+	}
+}
+
+func TestConcurrentFreshMutationsLoseBootstrapAdmissionWithoutMutation(t *testing.T) {
+	for _, operation := range []string{"rollback", "uninstall"} {
+		t.Run(operation, func(t *testing.T) {
+			fixture := newLifecycleFixture(t, false)
+			bootstrap, err := acquireDeploymentBootstrapLock(fixture.layout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer bootstrap.Close()
+			before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+			switch operation {
+			case "rollback":
+				_, err = fixture.lifecycle.Rollback(context.Background())
+			case "uninstall":
+				_, err = fixture.lifecycle.Uninstall(context.Background())
+			}
+			if err == nil || !strings.Contains(err.Error(), "bootstrap operation") {
+				t.Fatalf("contended %s error=%v", operation, err)
+			}
+			if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+				t.Fatalf("losing first %s mutated target\n before=%+v\n after=%+v", operation, before, after)
+			}
+		})
+	}
+}
+
+func TestFirstApplyRevalidatesInputsUnderBootstrapBeforePersistentMutation(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	request, _ := fixture.release(t, "v1.2.3", "bootstrap-input-drift")
+	preview, err := fixture.lifecycle.Preview(context.Background(), request.previewRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := preview.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.ConfirmedPreviewSHA256 = SHA256Hex(canonical)
+	verificationCalls := 0
+	fixture.lifecycle.verifySourceArtifact = func(string, InstalledRelease) error {
+		verificationCalls++
+		if verificationCalls == 2 {
+			return errors.New("input changed under bootstrap admission")
+		}
+		return nil
+	}
+	before := snapshotPreviewTree(t, fixture.layout.HomeDir)
+	if _, err := fixture.lifecycle.Apply(context.Background(), request); err == nil ||
+		!strings.Contains(err.Error(), "input changed under bootstrap admission") {
+		t.Fatalf("bootstrap input revalidation error=%v", err)
+	}
+	if verificationCalls != 2 {
+		t.Fatalf("artifact verification calls=%d, want 2", verificationCalls)
+	}
+	if after := snapshotPreviewTree(t, fixture.layout.HomeDir); !reflect.DeepEqual(after, before) {
+		t.Fatalf("bootstrap input rejection mutated target\n before=%+v\n after=%+v", before, after)
+	}
+}
+
 func TestApplyRejectsDamagedRecordedReleaseBeforeMutation(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	first, _ := fixture.release(t, "v1.2.3", "apply-damaged-prior")
-	if _, err := fixture.lifecycle.Apply(context.Background(), first); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, first); err != nil {
 		t.Fatal(err)
 	}
 	upgrade, _ := fixture.release(t, "v1.2.4", "apply-damaged-upgrade")
@@ -73,7 +283,7 @@ func TestApplyRejectsDamagedRecordedReleaseBeforeMutation(t *testing.T) {
 	managerCallsBefore := len(fixture.manager.calls)
 	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
 
-	if _, err := fixture.lifecycle.Apply(context.Background(), upgrade); err == nil ||
+	if _, err := applyConfirmed(t, fixture.lifecycle, upgrade); err == nil ||
 		!strings.Contains(err.Error(), "verify recorded active release before apply") {
 		t.Fatalf("damaged recorded-release apply error=%v", err)
 	}
@@ -94,7 +304,7 @@ func TestApplyRejectsDamagedRecordedReleaseBeforeMutation(t *testing.T) {
 func TestApplyRevalidatesInstanceUnderInitializationLeaseBeforeJournal(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	first, _ := fixture.release(t, "v1.2.3", "instance-lease-race-first")
-	if _, err := fixture.lifecycle.Apply(context.Background(), first); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, first); err != nil {
 		t.Fatal(err)
 	}
 	upgrade, desired := fixture.release(t, "v1.2.4", "instance-lease-race-upgrade")
@@ -114,8 +324,8 @@ func TestApplyRevalidatesInstanceUnderInitializationLeaseBeforeJournal(t *testin
 	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
 	managerCallsBefore := len(fixture.manager.calls)
 
-	_, err := fixture.lifecycle.Apply(context.Background(), upgrade)
-	if err == nil || !strings.Contains(err.Error(), "deployment instance preflight is blocked under initialization lease: completed_instance_database_is_invalid") {
+	_, err := applyConfirmed(t, fixture.lifecycle, upgrade)
+	if !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) {
 		t.Fatalf("instance lease race error=%v", err)
 	}
 	if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
@@ -169,7 +379,7 @@ func TestApplyResumesReviewedDatabaseStatesUnderInitializationLease(t *testing.T
 		t.Run(testCase.name, func(t *testing.T) {
 			fixture := newLifecycleFixture(t, false)
 			first, _ := fixture.release(t, "v1.2.3", "resumable-database-first-"+testCase.name)
-			if _, err := fixture.lifecycle.Apply(context.Background(), first); err != nil {
+			if _, err := applyConfirmed(t, fixture.lifecycle, first); err != nil {
 				t.Fatal(err)
 			}
 			paths := config.ForStateDir(fixture.layout.StateDir)
@@ -183,7 +393,7 @@ func TestApplyResumesReviewedDatabaseStatesUnderInitializationLease(t *testing.T
 				t.Fatal(err)
 			}
 			upgrade, desired := fixture.release(t, "v1.2.4", "resumable-database-upgrade-"+testCase.name)
-			result, err := fixture.lifecycle.Apply(context.Background(), upgrade)
+			result, err := applyConfirmed(t, fixture.lifecycle, upgrade)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -207,7 +417,7 @@ func TestVerifiedLocatorSurvivesRepeatedUpgradesAndStatusRefreshesNewestActivePa
 	var newestLocator DeploymentLocator
 	for index, version := range []string{"v1.2.3", "v1.2.4", "v1.2.5"} {
 		request, release := fixture.release(t, version, fmt.Sprint(index))
-		result, err := fixture.lifecycle.Apply(context.Background(), request)
+		result, err := applyConfirmed(t, fixture.lifecycle, request)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -261,7 +471,7 @@ func TestApplyTransactionResumesAfterEveryDurablePhase(t *testing.T) {
 			fixture := newLifecycleFixture(t, false)
 			request, desired := fixture.release(t, "v1.2.3", "b")
 			fixture.lifecycle.failAfterPhase = phase
-			if _, err := fixture.lifecycle.Apply(context.Background(), request); !errors.Is(err, ErrInjectedDeploymentCrash) {
+			if _, err := applyConfirmed(t, fixture.lifecycle, request); !errors.Is(err, ErrInjectedDeploymentCrash) {
 				t.Fatalf("crash error = %v", err)
 			}
 			journal, err := LoadJournal(fixture.layout)
@@ -273,7 +483,7 @@ func TestApplyTransactionResumesAfterEveryDurablePhase(t *testing.T) {
 			}
 			fixture.lifecycle.failAfterPhase = ""
 			request.ArtifactPath = filepath.Join(fixture.layout.HomeDir, "download-retry", "sshserver")
-			result, err := fixture.lifecycle.Apply(context.Background(), request)
+			result, err := applyConfirmed(t, fixture.lifecycle, request)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -291,7 +501,7 @@ func TestApplyTransactionResumesAfterEveryDurablePhase(t *testing.T) {
 func TestApplyFailureRollsBackExactPriorReleaseAndPreservesInstance(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	firstRequest, firstRelease := fixture.release(t, "v1.2.3", "c")
-	if _, err := fixture.lifecycle.Apply(context.Background(), firstRequest); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
 		t.Fatal(err)
 	}
 	openedBefore, err := instance.Open(context.Background(), fixture.layout.StateDir)
@@ -305,7 +515,7 @@ func TestApplyFailureRollsBackExactPriorReleaseAndPreservesInstance(t *testing.T
 
 	secondRequest, _ := fixture.release(t, "v1.2.4", "d")
 	fixture.manager.failures["activate"] = 1
-	failed, err := fixture.lifecycle.Apply(context.Background(), secondRequest)
+	failed, err := applyConfirmed(t, fixture.lifecycle, secondRequest)
 	if err == nil || !strings.Contains(err.Error(), "activate") {
 		t.Fatalf("failed upgrade error = %v", err)
 	}
@@ -338,7 +548,7 @@ func TestApplyFailureRollsBackExactPriorReleaseAndPreservesInstance(t *testing.T
 func TestApplyForegroundFallbackIsStructuredAndNeverClaimsActivation(t *testing.T) {
 	fixture := newLifecycleFixture(t, true)
 	request, desired := fixture.release(t, "v1.2.3", "e")
-	result, err := fixture.lifecycle.Apply(context.Background(), request)
+	result, err := applyConfirmed(t, fixture.lifecycle, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,12 +574,12 @@ func TestApplyForegroundFallbackIsStructuredAndNeverClaimsActivation(t *testing.
 func TestApplyRefusesImplicitFallbackForActiveNativeService(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	first, _ := fixture.release(t, "v1.2.3", "1")
-	if _, err := fixture.lifecycle.Apply(context.Background(), first); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, first); err != nil {
 		t.Fatal(err)
 	}
 	fixture.manager.availability = foregroundAvailability(fixture.layout, "/unused")
 	second, _ := fixture.release(t, "v1.2.4", "2")
-	if _, err := fixture.lifecycle.Apply(context.Background(), second); err == nil || !strings.Contains(err.Error(), "refusing") {
+	if _, err := applyConfirmed(t, fixture.lifecycle, second); err == nil || !strings.Contains(err.Error(), "active_native_manager_unavailable") {
 		t.Fatalf("implicit fallback error=%v", err)
 	}
 	state, err := LoadState(fixture.layout)
@@ -381,7 +591,7 @@ func TestApplyRefusesImplicitFallbackForActiveNativeService(t *testing.T) {
 func TestApplyRejectsRecordedActiveServiceDefinitionDriftBeforeMutation(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	firstRequest, _ := fixture.release(t, "v1.2.3", "definition-drift-prior")
-	if _, err := fixture.lifecycle.Apply(context.Background(), firstRequest); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
 		t.Fatal(err)
 	}
 	state, err := LoadState(fixture.layout)
@@ -400,7 +610,7 @@ func TestApplyRejectsRecordedActiveServiceDefinitionDriftBeforeMutation(t *testi
 	fixture.manager.calls = nil
 	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
 
-	if _, err := fixture.lifecycle.Apply(context.Background(), secondRequest); err == nil || !strings.Contains(err.Error(), "recorded active service definition") {
+	if _, err := applyConfirmed(t, fixture.lifecycle, secondRequest); err == nil || !strings.Contains(err.Error(), "recorded active service definition") {
 		t.Fatalf("definition drift error=%v", err)
 	}
 	if len(fixture.manager.calls) != 0 || fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
@@ -421,7 +631,7 @@ func TestApplyRejectsRecordedActiveServiceDefinitionDriftBeforeMutation(t *testi
 func TestApplyRejectsMatchingJournalPriorServiceDefinitionDriftBeforeResume(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	firstRequest, _ := fixture.release(t, "v1.2.3", "journal-definition-prior")
-	if _, err := fixture.lifecycle.Apply(context.Background(), firstRequest); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
 		t.Fatal(err)
 	}
 	prior, err := LoadState(fixture.layout)
@@ -460,7 +670,7 @@ func TestApplyRejectsMatchingJournalPriorServiceDefinitionDriftBeforeResume(t *t
 	fixture.manager.calls = nil
 	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
 
-	if _, err := fixture.lifecycle.Apply(context.Background(), secondRequest); err == nil || !strings.Contains(err.Error(), "recorded active service definition") {
+	if _, err := applyConfirmed(t, fixture.lifecycle, secondRequest); err == nil || !strings.Contains(err.Error(), "recorded active service definition") {
 		t.Fatalf("journal definition drift error=%v", err)
 	}
 	if len(fixture.manager.calls) != 0 || fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
@@ -485,13 +695,13 @@ func TestApplyRejectsMatchingJournalPriorServiceDefinitionDriftBeforeResume(t *t
 func TestApplyRequiresExistingForegroundRuntimeToStopBeforeUpgrade(t *testing.T) {
 	fixture := newLifecycleFixture(t, true)
 	first, firstRelease := fixture.release(t, "v1.2.3", "3")
-	if _, err := fixture.lifecycle.Apply(context.Background(), first); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, first); err != nil {
 		t.Fatal(err)
 	}
 	fixture.manager.active = true
 	fixture.manager.current = identityFor(firstRelease)
 	second, _ := fixture.release(t, "v1.2.4", "4")
-	if _, err := fixture.lifecycle.Apply(context.Background(), second); err == nil || !strings.Contains(err.Error(), "must be stopped") {
+	if _, err := applyConfirmed(t, fixture.lifecycle, second); err == nil || !strings.Contains(err.Error(), "supervised_foreground_runtime_must_stop_before_apply") {
 		t.Fatalf("running foreground error=%v", err)
 	}
 	if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
@@ -503,7 +713,7 @@ func TestDeploymentStatusDistinguishesRunningStoppedAndRecovery(t *testing.T) {
 	t.Run("native", func(t *testing.T) {
 		fixture := newLifecycleFixture(t, false)
 		request, _ := fixture.release(t, "v1.2.3", "5")
-		if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+		if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 			t.Fatal(err)
 		}
 		status, err := fixture.lifecycle.Status(context.Background())
@@ -520,7 +730,7 @@ func TestDeploymentStatusDistinguishesRunningStoppedAndRecovery(t *testing.T) {
 	t.Run("foreground", func(t *testing.T) {
 		fixture := newLifecycleFixture(t, true)
 		request, desired := fixture.release(t, "v1.2.3", "6")
-		if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+		if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 			t.Fatal(err)
 		}
 		status, err := fixture.lifecycle.Status(context.Background())
@@ -539,7 +749,7 @@ func TestDeploymentStatusDistinguishesRunningStoppedAndRecovery(t *testing.T) {
 		fixture := newLifecycleFixture(t, false)
 		request, _ := fixture.release(t, "v1.2.3", "7")
 		fixture.lifecycle.failAfterPhase = PhaseArtifactStaged
-		if _, err := fixture.lifecycle.Apply(context.Background(), request); !errors.Is(err, ErrInjectedDeploymentCrash) {
+		if _, err := applyConfirmed(t, fixture.lifecycle, request); !errors.Is(err, ErrInjectedDeploymentCrash) {
 			t.Fatalf("crash error=%v", err)
 		}
 		status, err := fixture.lifecycle.Status(context.Background())
@@ -563,10 +773,10 @@ func TestRollbackSwitchesToVerifiedPreviousRelease(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	firstRequest, first := fixture.release(t, "v1.2.3", "8")
 	secondRequest, second := fixture.release(t, "v1.2.4", "9")
-	if _, err := fixture.lifecycle.Apply(context.Background(), firstRequest); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.lifecycle.Apply(context.Background(), secondRequest); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, secondRequest); err != nil {
 		t.Fatal(err)
 	}
 	result, err := fixture.lifecycle.Rollback(context.Background())
@@ -601,10 +811,10 @@ func TestRollbackResumesEveryDurablePhase(t *testing.T) {
 			fixture := newLifecycleFixture(t, false)
 			firstRequest, first := fixture.release(t, "v1.2.3", "a")
 			secondRequest, second := fixture.release(t, "v1.2.4", "b")
-			if _, err := fixture.lifecycle.Apply(context.Background(), firstRequest); err != nil {
+			if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := fixture.lifecycle.Apply(context.Background(), secondRequest); err != nil {
+			if _, err := applyConfirmed(t, fixture.lifecycle, secondRequest); err != nil {
 				t.Fatal(err)
 			}
 			fixture.lifecycle.failAfterPhase = phase
@@ -632,10 +842,10 @@ func TestRollbackFailureRestoresCurrentRelease(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	firstRequest, _ := fixture.release(t, "v1.2.3", "c")
 	secondRequest, second := fixture.release(t, "v1.2.4", "d")
-	if _, err := fixture.lifecycle.Apply(context.Background(), firstRequest); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.lifecycle.Apply(context.Background(), secondRequest); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, secondRequest); err != nil {
 		t.Fatal(err)
 	}
 	fixture.manager.failures["activate"] = 1
@@ -658,7 +868,7 @@ func TestRollbackFailureRestoresCurrentRelease(t *testing.T) {
 func TestUninstallRemovesRuntimeAndPreservesProtectedInstance(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	request, release := fixture.release(t, "v1.2.3", "e")
-	if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 		t.Fatal(err)
 	}
 	openedBefore, err := instance.Open(context.Background(), fixture.layout.StateDir)
@@ -713,7 +923,7 @@ func TestUninstallResumesEveryDurablePhase(t *testing.T) {
 		t.Run(string(phase), func(t *testing.T) {
 			fixture := newLifecycleFixture(t, false)
 			request, _ := fixture.release(t, "v1.2.3", "f")
-			if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+			if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 				t.Fatal(err)
 			}
 			fixture.lifecycle.failAfterPhase = phase
@@ -742,7 +952,7 @@ func TestUninstallResumesEveryDurablePhase(t *testing.T) {
 func TestUninstallManagerFailureRestoresActiveRelease(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	request, release := fixture.release(t, "v1.2.3", "0")
-	if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 		t.Fatal(err)
 	}
 	fixture.manager.failures["remove"] = 1
@@ -764,7 +974,7 @@ func TestUninstallManagerFailureRestoresActiveRelease(t *testing.T) {
 func TestUninstallArtifactFailureRequiresResumeWithoutDataLoss(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	request, _ := fixture.release(t, "v1.2.3", "1")
-	if _, err := fixture.lifecycle.Apply(context.Background(), request); err != nil {
+	if _, err := applyConfirmed(t, fixture.lifecycle, request); err != nil {
 		t.Fatal(err)
 	}
 	failed := true
@@ -799,7 +1009,7 @@ func TestUninstallArtifactFailureRequiresResumeWithoutDataLoss(t *testing.T) {
 func TestDeploymentLocatorRejectsInvalidLayoutAndActiveMetadata(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	request, desired := fixture.release(t, "v1.2.3", "locator")
-	result, err := fixture.lifecycle.Apply(context.Background(), request)
+	result, err := applyConfirmed(t, fixture.lifecycle, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1013,12 +1223,21 @@ func (fixture *lifecycleFixture) release(t *testing.T, version, manifestDigit st
 		t.Fatal(err)
 	}
 	fixture.identities[desired.BinaryPath] = identityFor(desired)
+	manifestDirectory := filepath.Join(fixture.layout.HomeDir, "download", version)
+	if err := os.MkdirAll(manifestDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(manifestDirectory, "release-manifest.json")
+	if err := os.WriteFile(manifestPath, payload, 0o400); err != nil {
+		t.Fatal(err)
+	}
 	return ApplyRequest{
+		ManifestPath:    manifestPath,
 		ManifestPayload: payload,
 		ManifestSHA256:  pin,
-		ArtifactPath:    filepath.Join(fixture.layout.HomeDir, "download", version, "sshserver"),
-		LicensePath:     filepath.Join(fixture.layout.HomeDir, "download", version, "LICENSE"),
-		NoticePath:      filepath.Join(fixture.layout.HomeDir, "download", version, "NOTICE"),
+		ArtifactPath:    filepath.Join(manifestDirectory, "sshserver"),
+		LicensePath:     filepath.Join(manifestDirectory, "LICENSE"),
+		NoticePath:      filepath.Join(manifestDirectory, "NOTICE"),
 	}, desired
 }
 
