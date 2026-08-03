@@ -2,18 +2,23 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/httpapi"
+	"github.com/kciceblue/sshserver/runtime/internal/instance"
 )
 
 type ready struct{}
@@ -42,6 +47,261 @@ func TestRunServesHealthAndRestartsOnSameLoopbackAddress(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatalf("run %d did not stop", iteration)
 		}
+	}
+}
+
+func TestRunWithAdminAcquiresListenersBeforeStartingBoot(t *testing.T) {
+	ctx := context.Background()
+	stateDir := shortStateDir(t)
+	address := reserveAddress(t, "tcp4", "127.0.0.1:0")
+	if _, err := instance.Initialize(ctx, stateDir, []string{address}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := instance.Open(ctx, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := first.Close(); err != nil {
+			t.Errorf("close first instance: %v", err)
+		}
+	})
+
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- RunWithAdmin(serveCtx, first.Settings, first.Store, first.Paths)
+	}()
+	serverStopped := false
+	t.Cleanup(func() {
+		if serverStopped {
+			return
+		}
+		cancelServe()
+		select {
+		case <-serveErrCh:
+		case <-time.After(10 * time.Second):
+			t.Error("first server did not stop during cleanup")
+		}
+	})
+	waitForHealth(t, address)
+
+	second, err := instance.Open(ctx, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := second.Close(); err != nil {
+			t.Errorf("close second instance: %v", err)
+		}
+	})
+
+	grant, err := first.Store.CreateEnrollmentGrant(ctx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(grant.Grant)
+	raw, err := sql.Open("sqlite3", "file:"+first.Paths.Database+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := raw.Close(); err != nil {
+			t.Errorf("close raw database: %v", err)
+		}
+	})
+	zero := make([]byte, 8)
+	if _, err := raw.ExecContext(ctx, `
+		INSERT INTO snapshots (
+			snapshot_id, owner_device_id, request_id, request_fingerprint,
+			cut_cursor, envelope_generation, collection_generation,
+			expires_at_ms, metadata_bytes, create_response_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"10000000-0000-4000-8000-000000000010",
+		"10000000-0000-4000-8000-000000000011",
+		"10000000-0000-4000-8000-000000000012",
+		bytes.Repeat([]byte{0x41}, 32), zero, zero, zero,
+		time.Now().Add(time.Hour).UnixMilli(), 0, []byte("{}"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	beforeBootID, beforeGrants, beforeSnapshots := readBootArtifacts(t, raw)
+	beforeSocket, err := os.Lstat(first.Paths.AdminSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	attemptCtx, cancelAttempt := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelAttempt()
+	attemptErrCh := make(chan error, 1)
+	go func() {
+		attemptErrCh <- RunWithAdmin(attemptCtx, second.Settings, second.Store, second.Paths)
+	}()
+	select {
+	case err = <-attemptErrCh:
+		if err == nil || !strings.Contains(err.Error(), "listen on "+address) {
+			t.Fatalf("second server error = %v, want occupied HTTP listener", err)
+		}
+	case <-attemptCtx.Done():
+		t.Fatal("second server did not reject the occupied listener promptly")
+	}
+
+	afterBootID, afterGrants, afterSnapshots := readBootArtifacts(t, raw)
+	if !bytes.Equal(afterBootID, beforeBootID) {
+		t.Fatal("failed second startup rotated the active boot ID")
+	}
+	if afterGrants != beforeGrants || afterSnapshots != beforeSnapshots {
+		t.Fatalf("failed second startup changed grants/snapshots from %d/%d to %d/%d",
+			beforeGrants, beforeSnapshots, afterGrants, afterSnapshots)
+	}
+	afterSocket, err := os.Lstat(first.Paths.AdminSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(beforeSocket, afterSocket) {
+		t.Fatal("failed second startup replaced the first server's admin socket")
+	}
+	if afterSocket.Mode().Perm() != 0o600 {
+		t.Fatalf("admin socket mode = %o, want 600", afterSocket.Mode().Perm())
+	}
+	if grant, err := second.Store.CreateEnrollmentGrant(ctx, time.Now()); err == nil {
+		clear(grant.Grant)
+		t.Fatal("failed second startup marked its store as booted")
+	} else if !strings.Contains(err.Error(), "server daemon is not running") {
+		t.Fatalf("second store enrollment error = %v", err)
+	}
+
+	waitForHealth(t, address)
+	select {
+	case err := <-serveErrCh:
+		serverStopped = true
+		t.Fatalf("first server exited after competing startup: %v", err)
+	default:
+	}
+	connection, err := net.DialTimeout("unix", first.Paths.AdminSocket, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(connection, `{"operation":"enrollment_create"}`); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	unixConnection, ok := connection.(*net.UnixConn)
+	if !ok {
+		connection.Close()
+		t.Fatal("admin connection is not a Unix connection")
+	}
+	if err := unixConnection.CloseWrite(); err != nil {
+		connection.Close()
+		t.Fatal(err)
+	}
+	responseBody, err := io.ReadAll(connection)
+	connection.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		ProtocolVersion string `json:"protocol_version"`
+	}
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode admin response: %v", err)
+	}
+	if response.ProtocolVersion != "1" {
+		t.Fatalf("admin protocol version = %q, want 1", response.ProtocolVersion)
+	}
+	_, finalGrants, finalSnapshots := readBootArtifacts(t, raw)
+	if finalGrants != beforeGrants+1 || finalSnapshots != beforeSnapshots {
+		t.Fatalf("first admin socket left grants/snapshots at %d/%d, want %d/%d",
+			finalGrants, finalSnapshots, beforeGrants+1, beforeSnapshots)
+	}
+
+	cancelServe()
+	select {
+	case err := <-serveErrCh:
+		serverStopped = true
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("first server did not stop")
+	}
+	if _, err := os.Lstat(first.Paths.AdminSocket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("admin socket remains after shutdown: %v", err)
+	}
+}
+
+func TestListenAdminSocketRejectsLiveSocket(t *testing.T) {
+	path := config.ForStateDir(shortStateDir(t)).AdminSocket
+	listener, err := listenAdminSocket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(listener.cleanup)
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := listenAdminSocket(path)
+	if second != nil {
+		second.cleanup()
+		t.Fatal("second admin listener unexpectedly succeeded")
+	}
+	if err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("second admin listener error = %v", err)
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("live admin socket was replaced")
+	}
+	connection, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatalf("live admin socket is no longer dialable: %v", err)
+	}
+	connection.Close()
+}
+
+func TestOwnedAdminListenerCleanupPreservesReplacement(t *testing.T) {
+	path := config.ForStateDir(shortStateDir(t)).AdminSocket
+	first, err := listenAdminSocket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(first.cleanup)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := listenAdminSocket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(replacement.cleanup)
+	replacementInfo, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.cleanup()
+	current, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(replacementInfo, current) {
+		t.Fatal("first listener cleanup removed or replaced the successor socket")
+	}
+	connection, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatalf("replacement admin socket is not dialable: %v", err)
+	}
+	connection.Close()
+	replacement.cleanup()
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned replacement socket remains after cleanup: %v", err)
 	}
 }
 
@@ -172,6 +432,34 @@ func reserveAddress(t *testing.T, network, address string) string {
 	result := listener.Addr().String()
 	listener.Close()
 	return result
+}
+
+func shortStateDir(t *testing.T) string {
+	t.Helper()
+	stateDir, err := os.MkdirTemp("/tmp", "jat-server-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(stateDir); err != nil {
+			t.Errorf("remove state directory: %v", err)
+		}
+	})
+	return stateDir
+}
+
+func readBootArtifacts(t *testing.T, database *sql.DB) ([]byte, int, int) {
+	t.Helper()
+	var bootID []byte
+	var grants, snapshots int
+	if err := database.QueryRow(`
+		SELECT active_boot_id,
+		       (SELECT count(*) FROM enrollment_grants),
+		       (SELECT count(*) FROM snapshots)
+		FROM runtime_state WHERE singleton = 1`).Scan(&bootID, &grants, &snapshots); err != nil {
+		t.Fatal(err)
+	}
+	return append([]byte(nil), bootID...), grants, snapshots
 }
 
 func waitForHealth(t *testing.T, address string) {

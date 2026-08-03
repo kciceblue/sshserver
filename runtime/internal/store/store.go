@@ -30,36 +30,15 @@ var (
 	ErrUnexpectedSchema = errors.New("database storage schema does not match reviewed V1 schema")
 )
 
-const createInstanceMetadataV1 = `CREATE TABLE instance_metadata (
-			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-			instance_id TEXT NOT NULL CHECK (length(instance_id) = 36),
-			vault_id TEXT NOT NULL CHECK (length(vault_id) = 36),
-			protocol_major TEXT NOT NULL CHECK (protocol_major = '1'),
-			storage_schema TEXT NOT NULL CHECK (storage_schema = '1'),
-			CHECK (instance_id <> vault_id)
-		) STRICT`
-
-const createDevicesV1 = `CREATE TABLE devices (
-			device_id TEXT PRIMARY KEY CHECK (length(device_id) = 36),
-			token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
-			scopes_json TEXT NOT NULL,
-			created_at_ms INTEGER NOT NULL,
-			revoked_at_ms INTEGER,
-			last_sync_at_ms INTEGER,
-			last_ack_cursor BLOB NOT NULL CHECK (length(last_ack_cursor) = 8),
-			max_author_counter BLOB NOT NULL CHECK (length(max_author_counter) = 8),
-			CHECK (revoked_at_ms IS NULL OR revoked_at_ms >= created_at_ms),
-			CHECK (last_sync_at_ms IS NULL OR last_sync_at_ms >= created_at_ms)
-		) STRICT`
-
 type Identity struct {
 	InstanceID string
 	VaultID    string
 }
 
 type Store struct {
-	db       *sql.DB
-	identity Identity
+	db        *sql.DB
+	identity  Identity
+	ephemeral *ephemeralState
 }
 
 func Open(ctx context.Context, path string, identity Identity) (*Store, error) {
@@ -98,7 +77,7 @@ func Open(ctx context.Context, path string, identity Identity) (*Store, error) {
 	}
 	database.SetMaxOpenConns(1)
 	database.SetMaxIdleConns(1)
-	store := &Store{db: database, identity: identity}
+	store := &Store{db: database, identity: identity, ephemeral: newEphemeralState()}
 	if err := store.initialize(ctx); err != nil {
 		if closeErr := database.Close(); closeErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("close SQLite after initialization failure: %w", closeErr))
@@ -119,21 +98,51 @@ func (store *Store) Close() error {
 }
 
 func (store *Store) Ready(ctx context.Context) error {
-	version, err := validateSchemaState(ctx, store.db)
+	transaction, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
+		return fmt.Errorf("database readiness: begin consistent read: %w", err)
+	}
+	defer transaction.Rollback()
+	if err := validateReadinessSnapshot(ctx, transaction, store.identity); err != nil {
 		return fmt.Errorf("database readiness: %w", err)
 	}
-	if version != SchemaVersion {
-		return fmt.Errorf("database readiness: %w", ErrUnexpectedSchema)
-	}
-	if err := validateIdentity(ctx, store.db, store.identity); err != nil {
-		return fmt.Errorf("database readiness: %w", err)
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("database readiness: commit consistent read: %w", err)
 	}
 	return nil
 }
 
-// CreateDevice persists only the domain-separated token hash and the exact
-// fixed scope set. The caller's plaintext token is never written to SQLite.
+func validateReadinessSnapshot(ctx context.Context, query schemaQueryer, identity Identity) error {
+	version, err := validateSchemaState(ctx, query)
+	if err != nil {
+		return err
+	}
+	if version != SchemaVersion {
+		return ErrUnexpectedSchema
+	}
+	if err := validateIdentity(ctx, query, identity); err != nil {
+		return err
+	}
+	serverCursor, envelopeGeneration, secretGeneration, _, err := validatePersistentRuntime(ctx, query)
+	if err != nil {
+		return err
+	}
+	// The device registry is capped at 64 rows by the V1 protocol, so this is a
+	// bounded health sentinel. Full revision, receipt, and snapshot graph
+	// validation runs once during Open; repeating those unbounded scans on the
+	// unauthenticated health endpoint would make vault size a health-check DoS.
+	if err := validateReadinessDevices(ctx, query, serverCursor); err != nil {
+		return err
+	}
+	if err := validatePersistentEnvelope(ctx, query, identity, envelopeGeneration, secretGeneration); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CreateDevice adds a pre-activation baseline device and persists only the
+// domain-separated token hash and exact fixed scope set. The caller's plaintext
+// token is never written to SQLite.
 func (store *Store) CreateDevice(ctx context.Context, deviceID string, token []byte, scopes []string, createdAt time.Time) error {
 	if _, err := uuidv4.Parse(deviceID); err != nil {
 		return fmt.Errorf("device ID: %w", err)
@@ -151,7 +160,33 @@ func (store *Store) CreateDevice(ctx context.Context, deviceID string, token []b
 	}
 	createdAt = createdAt.UTC().Truncate(time.Millisecond)
 	zero := EncodeUint64(0)
-	_, err = store.db.ExecContext(
+	transaction, err := store.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin create device: %w", err)
+	}
+	defer transaction.Rollback()
+	var cursorBytes, activeBootID []byte
+	var cursorLength int64
+	var activeBootLength sql.NullInt64
+	var snapshotCount int
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT octet_length(server_cursor),
+		       CASE WHEN typeof(server_cursor) = 'blob' AND octet_length(server_cursor) = 8 THEN server_cursor END,
+		       octet_length(active_boot_id),
+		       CASE WHEN typeof(active_boot_id) = 'blob' AND octet_length(active_boot_id) = 16 THEN active_boot_id END,
+		       (SELECT count(*) FROM (SELECT 1 FROM snapshots LIMIT 1))
+		FROM runtime_state WHERE singleton = 1`).Scan(&cursorLength, &cursorBytes, &activeBootLength, &activeBootID, &snapshotCount); err != nil {
+		return fmt.Errorf("read baseline activation state: %w", err)
+	}
+	if !boundedRequiredBytes(cursorLength, cursorBytes, 8) || cursorLength != 8 ||
+		!boundedOptionalBytes(activeBootLength, activeBootID, 16) || activeBootLength.Valid && activeBootLength.Int64 != 16 {
+		return errors.New("stored baseline activation state is invalid")
+	}
+	cursor, err := DecodeUint64(cursorBytes)
+	if err != nil || cursor != 0 || activeBootID != nil || snapshotCount != 0 {
+		return errors.New("create device: baseline device creation is closed after activation")
+	}
+	_, err = transaction.ExecContext(
 		ctx,
 		`INSERT INTO devices (
 			device_id, token_hash, scopes_json, created_at_ms,
@@ -167,6 +202,18 @@ func (store *Store) CreateDevice(ctx context.Context, deviceID string, token []b
 	if err != nil {
 		return fmt.Errorf("create device: %w", err)
 	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO device_origins (
+			device_id, origin_kind, created_cursor, baseline_revoked
+		) VALUES (?, 'baseline', NULL, 0)`, deviceID); err != nil {
+		return fmt.Errorf("create device origin: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, "INSERT INTO device_sync_state (device_id, max_returned_cursor) VALUES (?, ?)", deviceID, zero[:]); err != nil {
+		return fmt.Errorf("create device sync state: %w", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit create device: %w", err)
+	}
 	return nil
 }
 
@@ -175,19 +222,27 @@ func (store *Store) DeviceCredential(ctx context.Context, deviceID string) (hash
 		return hash, nil, fmt.Errorf("device ID: %w", err)
 	}
 	var hashBytes []byte
-	var scopesJSON string
+	wantScopes, _ := json.Marshal(auth.FixedScopes())
+	var scopesJSON sql.NullString
+	var hashLength, scopesLength int64
 	if err := store.db.QueryRowContext(
 		ctx,
-		"SELECT token_hash, scopes_json FROM devices WHERE device_id = ?",
-		deviceID,
-	).Scan(&hashBytes, &scopesJSON); err != nil {
+		`SELECT octet_length(token_hash),
+		        CASE WHEN typeof(token_hash) = 'blob' AND octet_length(token_hash) = 32 THEN token_hash END,
+		        octet_length(scopes_json),
+		        CASE WHEN typeof(scopes_json) = 'text'
+		                   AND octet_length(scopes_json) = ? THEN scopes_json END
+		 FROM devices WHERE device_id = ?`,
+		len(wantScopes), deviceID,
+	).Scan(&hashLength, &hashBytes, &scopesLength, &scopesJSON); err != nil {
 		return hash, nil, err
 	}
-	if len(hashBytes) != len(hash) {
-		return hash, nil, errors.New("stored token hash has invalid length")
+	if !boundedRequiredBytes(hashLength, hashBytes, len(hash)) || hashLength != int64(len(hash)) ||
+		!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) {
+		return hash, nil, errors.New("stored device credential is invalid")
 	}
 	copy(hash[:], hashBytes)
-	if err := json.Unmarshal([]byte(scopesJSON), &scopes); err != nil {
+	if err := json.Unmarshal([]byte(scopesJSON.String), &scopes); err != nil {
 		return hash, nil, fmt.Errorf("decode stored scopes: %w", err)
 	}
 	if err := auth.ValidateScopes(scopes); err != nil {
@@ -230,7 +285,8 @@ func (store *Store) initialize(ctx context.Context) error {
 	// Compatibility and the complete schema fingerprint are inspected before
 	// WAL mode, because changing journal_mode would persistently mutate a
 	// database that belongs to a newer or unexpected schema.
-	if _, err := validateSchemaState(ctx, store.db); err != nil {
+	initialKind, _, err := inspectSchemaState(ctx, store.db)
+	if err != nil {
 		return err
 	}
 	var journalMode string
@@ -249,19 +305,32 @@ func (store *Store) initialize(ctx context.Context) error {
 		return fmt.Errorf("begin schema transaction: %w", err)
 	}
 	defer transaction.Rollback()
-	userVersion, err := validateSchemaState(ctx, transaction)
+	kind, userVersion, err := inspectSchemaState(ctx, transaction)
 	if err != nil {
 		return err
+	}
+	if kind != initialKind {
+		return ErrUnexpectedSchema
 	}
 	createdSchema := userVersion == 0
 	if userVersion == 0 {
 		if err := createSchemaV1(ctx, transaction); err != nil {
 			return err
 		}
-		if version, err := validateSchemaState(ctx, transaction); err != nil {
+	} else if kind == schemaLegacy {
+		if err := migrateLegacySchemaV1(ctx, transaction); err != nil {
 			return err
-		} else if version != SchemaVersion {
-			return ErrUnexpectedSchema
+		}
+	} else if kind == schemaPriorFull {
+		if err := migratePriorFullSchemaV1(ctx, transaction); err != nil {
+			return err
+		}
+		if err := migrateRevisionAcceptanceOriginsV1(ctx, transaction); err != nil {
+			return err
+		}
+	} else if kind == schemaPriorAcceptanceOrigin {
+		if err := migrateRevisionAcceptanceOriginsV1(ctx, transaction); err != nil {
+			return err
 		}
 	}
 
@@ -277,8 +346,34 @@ func (store *Store) initialize(ctx context.Context) error {
 			return fmt.Errorf("initialize instance metadata: %w", err)
 		}
 	}
+	if createdSchema || kind == schemaLegacy {
+		zero := EncodeUint64(0)
+		one := EncodeUint64(1)
+		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO runtime_state (
+				singleton, server_cursor, cursor_floor, envelope_generation,
+				instance_secret_generation, collection_generation,
+				accumulated_uptime_ms, active_boot_id,
+				collection_scan_after_record_id
+			) VALUES (1, ?, ?, ?, ?, ?, ?, NULL, '')`, zero[:], zero[:], zero[:], one[:], zero[:], zero[:]); err != nil {
+			return fmt.Errorf("initialize runtime state: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO device_sync_state (device_id, max_returned_cursor)
+			SELECT device_id, ? FROM devices`, zero[:]); err != nil {
+			return fmt.Errorf("initialize device sync state: %w", err)
+		}
+	}
+	if _, version, err := inspectSchemaState(ctx, transaction); err != nil {
+		return err
+	} else if version != SchemaVersion {
+		return ErrUnexpectedSchema
+	}
 	if err := validateIdentity(ctx, transaction, store.identity); err != nil {
 		return err
+	}
+	if err := validatePersistentState(ctx, transaction, store.identity); err != nil {
+		return fmt.Errorf("validate persistent state: %w", err)
 	}
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit schema transaction: %w", err)
@@ -286,96 +381,39 @@ func (store *Store) initialize(ctx context.Context) error {
 	return nil
 }
 
-type schemaQueryer interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}
-
-type schemaObject struct {
-	typeName  string
-	name      string
-	tableName string
-	sql       string
-}
-
-var schemaV1Objects = [...]schemaObject{
-	{typeName: "index", name: "sqlite_autoindex_devices_1", tableName: "devices"},
-	{typeName: "index", name: "sqlite_autoindex_devices_2", tableName: "devices"},
-	{typeName: "table", name: "devices", tableName: "devices", sql: createDevicesV1},
-	{typeName: "table", name: "instance_metadata", tableName: "instance_metadata", sql: createInstanceMetadataV1},
-}
-
-func validateSchemaState(ctx context.Context, database schemaQueryer) (int, error) {
-	var userVersion int
-	if err := database.QueryRowContext(ctx, "PRAGMA user_version").Scan(&userVersion); err != nil {
-		return 0, fmt.Errorf("read storage schema: %w", err)
-	}
-	if userVersion > SchemaVersion {
-		return userVersion, ErrFutureSchema
-	}
-	if userVersion < 0 {
-		return userVersion, errors.New("invalid negative storage schema")
-	}
-	if userVersion == 0 {
-		var objectCount int
-		if err := database.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_schema").Scan(&objectCount); err != nil {
-			return userVersion, fmt.Errorf("inspect empty storage schema: %w", err)
-		}
-		if objectCount != 0 {
-			return userVersion, ErrUnexpectedSchema
-		}
-		return userVersion, nil
-	}
-	if err := validateSchemaV1(ctx, database); err != nil {
-		return userVersion, err
-	}
-	return userVersion, nil
-}
-
-func validateSchemaV1(ctx context.Context, database schemaQueryer) error {
-	rows, err := database.QueryContext(ctx, `
-		SELECT type, name, tbl_name, coalesce(sql, '')
-		FROM sqlite_schema ORDER BY type, name, tbl_name`)
-	if err != nil {
-		return fmt.Errorf("inspect V1 storage schema: %w", err)
-	}
-	defer rows.Close()
-	index := 0
-	for rows.Next() {
-		if index >= len(schemaV1Objects) {
-			return ErrUnexpectedSchema
-		}
-		var actual schemaObject
-		if err := rows.Scan(&actual.typeName, &actual.name, &actual.tableName, &actual.sql); err != nil {
-			return fmt.Errorf("read V1 storage schema: %w", err)
-		}
-		if actual != schemaV1Objects[index] {
-			return ErrUnexpectedSchema
-		}
-		index++
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("read V1 storage schema: %w", err)
-	}
-	if index != len(schemaV1Objects) {
-		return ErrUnexpectedSchema
-	}
-	return nil
-}
-
 func validateIdentity(ctx context.Context, database schemaQueryer, expected Identity) error {
-	var stored Identity
-	var protocolMajor, storageSchema string
+	var instanceID, vaultID, protocolMajor, storageSchema sql.NullString
+	var instanceIDLength, vaultIDLength, protocolMajorLength, storageSchemaLength int64
 	if err := database.QueryRowContext(ctx, `
-		SELECT instance_id, vault_id, protocol_major, storage_schema
+		SELECT octet_length(instance_id),
+		       CASE WHEN typeof(instance_id) = 'text'
+		                  AND octet_length(instance_id) = ? THEN instance_id END,
+		       octet_length(vault_id),
+		       CASE WHEN typeof(vault_id) = 'text'
+		                  AND octet_length(vault_id) = ? THEN vault_id END,
+		       octet_length(protocol_major),
+		       CASE WHEN typeof(protocol_major) = 'text'
+		                  AND octet_length(protocol_major) = ? THEN protocol_major END,
+		       octet_length(storage_schema),
+		       CASE WHEN typeof(storage_schema) = 'text'
+		                  AND octet_length(storage_schema) = ? THEN storage_schema END
 		FROM instance_metadata WHERE singleton = 1`,
-	).Scan(&stored.InstanceID, &stored.VaultID, &protocolMajor, &storageSchema); err != nil {
+		maxUUIDBytes, maxUUIDBytes, len("1"), len("1"),
+	).Scan(
+		&instanceIDLength, &instanceID, &vaultIDLength, &vaultID,
+		&protocolMajorLength, &protocolMajor, &storageSchemaLength, &storageSchema,
+	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrIdentityMismatch
 		}
 		return fmt.Errorf("read instance metadata: %w", err)
 	}
-	if stored != expected || protocolMajor != "1" || storageSchema != "1" {
+	if instanceIDLength != maxUUIDBytes || !boundedRequiredText(instanceIDLength, instanceID, maxUUIDBytes) ||
+		vaultIDLength != maxUUIDBytes || !boundedRequiredText(vaultIDLength, vaultID, maxUUIDBytes) ||
+		protocolMajorLength != int64(len("1")) || !boundedRequiredText(protocolMajorLength, protocolMajor, len("1")) ||
+		storageSchemaLength != int64(len("1")) || !boundedRequiredText(storageSchemaLength, storageSchema, len("1")) ||
+		(Identity{InstanceID: instanceID.String, VaultID: vaultID.String}) != expected ||
+		protocolMajor.String != "1" || storageSchema.String != "1" {
 		return ErrIdentityMismatch
 	}
 	return nil
@@ -394,20 +432,6 @@ func restrictSQLiteFiles(path string) error {
 	for _, candidate := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
 		if err := config.RestrictProtectedFile(candidate, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("protect SQLite file %s: %w", filepath.Base(candidate), err)
-		}
-	}
-	return nil
-}
-
-func createSchemaV1(ctx context.Context, transaction *sql.Tx) error {
-	statements := []string{
-		createInstanceMetadataV1,
-		createDevicesV1,
-		fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion),
-	}
-	for _, statement := range statements {
-		if _, err := transaction.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("create storage schema: %w", err)
 		}
 	}
 	return nil

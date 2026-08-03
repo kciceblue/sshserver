@@ -4,11 +4,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -49,6 +51,8 @@ func (runner Runner) Run(ctx context.Context, args []string) int {
 		err = runner.runServe(ctx, args[1:])
 	case "health":
 		err = runner.runHealth(ctx, args[1:])
+	case "enrollment":
+		err = runner.runEnrollment(ctx, args[1:])
 	case "service":
 		err = runner.runService(args[1:])
 	case "version":
@@ -136,7 +140,88 @@ func (runner Runner) runServe(ctx context.Context, args []string) (returnErr err
 	for _, listener := range opened.Settings.Listeners {
 		fmt.Fprintf(runner.Stderr, "sshserver: listening on %s\n", listener)
 	}
-	return server.Run(ctx, opened.Settings, opened.Store)
+	return server.RunWithAdmin(ctx, opened.Settings, opened.Store, opened.Paths)
+}
+
+func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
+	if len(args) == 0 || args[0] != "create" {
+		return errors.New("enrollment requires create")
+	}
+	stateDir, err := config.DefaultStateDir()
+	if err != nil {
+		return err
+	}
+	format := "json"
+	flags := runner.flagSet("enrollment create")
+	flags.StringVar(&stateDir, "state-dir", stateDir, "absolute protected state directory")
+	flags.StringVar(&format, "format", format, "output format (json)")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("enrollment create accepts no positional arguments")
+	}
+	if format != "json" {
+		return errors.New("enrollment create supports only --format=json")
+	}
+	if err := config.EnsureStateDirectory(stateDir); err != nil {
+		return err
+	}
+	connection, err := (&net.Dialer{}).DialContext(ctx, "unix", config.ForStateDir(stateDir).AdminSocket)
+	if err != nil {
+		return errors.New("enrollment service is unavailable")
+	}
+	defer connection.Close()
+	if _, err := io.WriteString(connection, `{"operation":"enrollment_create"}`); err != nil {
+		return errors.New("enrollment service request failed")
+	}
+	if unixConnection, ok := connection.(*net.UnixConn); ok {
+		if err := unixConnection.CloseWrite(); err != nil {
+			return errors.New("enrollment service request failed")
+		}
+	}
+	payload, err := io.ReadAll(io.LimitReader(connection, 4097))
+	if err != nil || len(payload) == 0 || len(payload) > 4096 {
+		return errors.New("enrollment service returned an invalid response")
+	}
+	var response struct {
+		ProtocolVersion string `json:"protocol_version"`
+		InstanceID      string `json:"instance_id"`
+		VaultID         string `json:"vault_id"`
+		InstanceSecret  string `json:"instance_secret"`
+		EnrollmentGrant string `json:"enrollment_grant"`
+		ExpiresAt       string `json:"expires_at"`
+		LoopbackPort    int    `json:"loopback_port"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&response); err != nil {
+		return errors.New("enrollment service returned an invalid response")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return errors.New("enrollment service returned trailing data")
+	}
+	secret, secretErr := base64.RawURLEncoding.Strict().DecodeString(response.InstanceSecret)
+	grant, grantErr := base64.RawURLEncoding.Strict().DecodeString(response.EnrollmentGrant)
+	defer clear(secret)
+	defer clear(grant)
+	if response.ProtocolVersion != config.ProtocolMajor || len(secret) != 32 || len(grant) != 32 || secretErr != nil || grantErr != nil ||
+		base64.RawURLEncoding.EncodeToString(secret) != response.InstanceSecret ||
+		base64.RawURLEncoding.EncodeToString(grant) != response.EnrollmentGrant ||
+		response.LoopbackPort < 1 || response.LoopbackPort > 65535 {
+		return errors.New("enrollment service returned an invalid response")
+	}
+	if _, err := uuidv4.Parse(response.InstanceID); err != nil {
+		return errors.New("enrollment service returned an invalid response")
+	}
+	if _, err := uuidv4.Parse(response.VaultID); err != nil || response.VaultID == response.InstanceID {
+		return errors.New("enrollment service returned an invalid response")
+	}
+	parsedExpiry, err := time.Parse("2006-01-02T15:04:05.000Z", response.ExpiresAt)
+	if err != nil || parsedExpiry.Format("2006-01-02T15:04:05.000Z") != response.ExpiresAt {
+		return errors.New("enrollment service returned an invalid response")
+	}
+	return json.NewEncoder(runner.Stdout).Encode(response)
 }
 
 func (runner Runner) runHealth(ctx context.Context, args []string) error {
@@ -282,7 +367,7 @@ func (runner Runner) flagSet(name string) *flag.FlagSet {
 }
 
 func (runner Runner) usage() {
-	fmt.Fprintln(runner.Stderr, "usage: sshserver <init|serve|health|service|version> [options]")
+	fmt.Fprintln(runner.Stderr, "usage: sshserver <init|serve|health|enrollment|service|version> [options]")
 }
 
 type stringList struct {

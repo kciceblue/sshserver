@@ -54,6 +54,7 @@ type Paths struct {
 	Database       string
 	InstanceSecret string
 	InstallMarker  string
+	AdminSocket    string
 }
 
 func ForStateDir(stateDir string) Paths {
@@ -63,6 +64,7 @@ func ForStateDir(stateDir string) Paths {
 		Database:       filepath.Join(stateDir, "server.db"),
 		InstanceSecret: filepath.Join(stateDir, "instance-secret"),
 		InstallMarker:  filepath.Join(stateDir, "install-state.json"),
+		AdminSocket:    filepath.Join(stateDir, ".enrollment.sock"),
 	}
 }
 

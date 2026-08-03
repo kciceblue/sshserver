@@ -1,0 +1,2745 @@
+package store
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"slices"
+
+	"github.com/kciceblue/sshserver/runtime/internal/api"
+	"github.com/kciceblue/sshserver/runtime/internal/auth"
+)
+
+type validatedDeviceRow struct {
+	createdAt int64
+	// Zero denotes a pre-activation or recovery baseline device. Normal
+	// enrollments carry their permanent change cursor in the enrollment row.
+	createdCursor   uint64
+	revokedCursor   uint64
+	revoked         bool
+	revokedAt       int64
+	baselineRevoked bool
+	maxCounter      uint64
+	ackCursor       uint64
+	maxReturned     uint64
+}
+
+func invalidPersistentState(detail string) error {
+	return fmt.Errorf("%w: %s", ErrUnexpectedSchema, detail)
+}
+
+// validatePersistentState rejects canonical-shape and cross-row corruption at
+// startup/readiness instead of allowing a later authenticated request to turn
+// it into a malformed replay or a partially usable instance.
+func validatePersistentState(ctx context.Context, query schemaQueryer, identity Identity) error {
+	serverCursor, envelopeGeneration, secretGeneration, collectionGeneration, err := validatePersistentRuntime(ctx, query)
+	if err != nil {
+		return err
+	}
+	devices, err := validatePersistentDevices(ctx, query, serverCursor)
+	if err != nil {
+		return err
+	}
+	if err := validatePersistentEnvelope(ctx, query, identity, envelopeGeneration, secretGeneration); err != nil {
+		return err
+	}
+	if err := validatePersistentRevisionObjects(ctx, query); err != nil {
+		return err
+	}
+	historicalCounters, err := validatePersistentRevisions(ctx, query, devices, serverCursor, collectionGeneration)
+	if err != nil {
+		return err
+	}
+	if err := validatePersistentRevisionAcceptanceOrigins(ctx, query); err != nil {
+		return err
+	}
+	if err := validatePersistentHistorySequence(ctx, query, devices); err != nil {
+		return err
+	}
+	for deviceID, row := range devices {
+		if row.maxCounter != historicalCounters[deviceID] {
+			return invalidPersistentState("device counter does not match accepted history")
+		}
+	}
+	if err := validatePersistentRecordHeads(ctx, query); err != nil {
+		return err
+	}
+	if err := validatePersistentRecordVectorIndex(ctx, query); err != nil {
+		return err
+	}
+	if err := validatePersistentCollectionQueues(ctx, query, serverCursor); err != nil {
+		return err
+	}
+	if err := validatePersistentChanges(ctx, query, devices, serverCursor); err != nil {
+		return err
+	}
+	if err := validatePersistentMarkers(ctx, query, devices, serverCursor); err != nil {
+		return err
+	}
+	if err := validatePersistentReceipts(ctx, query, identity, devices); err != nil {
+		return err
+	}
+	if err := validatePersistentReceiptRetention(ctx, query); err != nil {
+		return err
+	}
+	if err := validatePersistentEnrollmentsAndRotations(ctx, query, identity, devices); err != nil {
+		return err
+	}
+	if err := validatePersistentEnrollmentGrants(ctx, query); err != nil {
+		return err
+	}
+	if err := validatePersistentSnapshots(ctx, query, identity, devices, serverCursor, envelopeGeneration, collectionGeneration); err != nil {
+		return err
+	}
+	if err := validatePersistentObjectReferences(ctx, query); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validatePersistentDevices(ctx context.Context, query schemaQueryer, serverCursor uint64) (map[string]validatedDeviceRow, error) {
+	wantScopes, _ := json.Marshal(auth.FixedScopes())
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(d.device_id),
+		       CASE WHEN typeof(d.device_id) = 'text'
+		                  AND octet_length(d.device_id) = ? THEN d.device_id END,
+		       octet_length(d.token_hash),
+		       CASE WHEN typeof(d.token_hash) = 'blob'
+		                  AND octet_length(d.token_hash) = 32 THEN d.token_hash END,
+		       octet_length(d.scopes_json),
+		       CASE WHEN typeof(d.scopes_json) = 'text'
+		                  AND octet_length(d.scopes_json) = ? THEN d.scopes_json END,
+		       d.created_at_ms, octet_length(o.origin_kind),
+		       CASE WHEN typeof(o.origin_kind) = 'text'
+		                  AND o.origin_kind IN ('baseline', 'enrolled') THEN o.origin_kind END,
+		       octet_length(o.created_cursor),
+		       CASE WHEN typeof(o.created_cursor) = 'blob'
+		                  AND octet_length(o.created_cursor) = 8 THEN o.created_cursor END,
+		       octet_length(o.revoked_cursor),
+		       CASE WHEN typeof(o.revoked_cursor) = 'blob'
+		                  AND octet_length(o.revoked_cursor) = 8 THEN o.revoked_cursor END,
+		       o.baseline_revoked,
+		       d.revoked_at_ms, d.last_sync_at_ms,
+		       octet_length(d.last_ack_cursor),
+		       CASE WHEN typeof(d.last_ack_cursor) = 'blob'
+		                  AND octet_length(d.last_ack_cursor) = 8 THEN d.last_ack_cursor END,
+		       octet_length(d.max_author_counter),
+		       CASE WHEN typeof(d.max_author_counter) = 'blob'
+		                  AND octet_length(d.max_author_counter) = 8 THEN d.max_author_counter END,
+		       octet_length(s.max_returned_cursor),
+		       CASE WHEN typeof(s.max_returned_cursor) = 'blob'
+		                  AND octet_length(s.max_returned_cursor) = 8 THEN s.max_returned_cursor END
+		FROM devices d LEFT JOIN device_sync_state s USING (device_id)
+		LEFT JOIN device_origins o USING (device_id)
+		ORDER BY d.device_id LIMIT 65`, maxUUIDBytes, len(wantScopes))
+	if err != nil {
+		return nil, invalidPersistentState("read device rows")
+	}
+	defer rows.Close()
+	result := make(map[string]validatedDeviceRow)
+	var previous string
+	for rows.Next() {
+		var deviceID, scopesJSON, originKind sql.NullString
+		var deviceIDLength, tokenHashLength, scopesLength, ackLength, counterLength int64
+		var originLength, createdCursorLength, revokedCursorLength, baselineRevoked, returnedLength sql.NullInt64
+		var tokenHash, createdCursorBytes, revokedCursorBytes, ackBytes, counterBytes, returnedBytes []byte
+		var createdAt int64
+		var revokedAt, lastSyncAt sql.NullInt64
+		if rows.Scan(
+			&deviceIDLength, &deviceID, &tokenHashLength, &tokenHash, &scopesLength, &scopesJSON, &createdAt,
+			&originLength, &originKind,
+			&createdCursorLength, &createdCursorBytes,
+			&revokedCursorLength, &revokedCursorBytes, &baselineRevoked,
+			&revokedAt, &lastSyncAt,
+			&ackLength, &ackBytes, &counterLength, &counterBytes, &returnedLength, &returnedBytes,
+		) != nil ||
+			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			!boundedRequiredBytes(tokenHashLength, tokenHash, 32) || tokenHashLength != 32 ||
+			!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) ||
+			!boundedOptionalText(originLength, originKind, 8) || !originLength.Valid || originLength.Int64 != 8 ||
+			!boundedOptionalBytes(createdCursorLength, createdCursorBytes, 8) || createdCursorLength.Valid && createdCursorLength.Int64 != 8 ||
+			!boundedOptionalBytes(revokedCursorLength, revokedCursorBytes, 8) || revokedCursorLength.Valid && revokedCursorLength.Int64 != 8 ||
+			!boundedRequiredBytes(ackLength, ackBytes, 8) || ackLength != 8 ||
+			!boundedRequiredBytes(counterLength, counterBytes, 8) || counterLength != 8 ||
+			!boundedOptionalBytes(returnedLength, returnedBytes, 8) || !returnedLength.Valid || returnedLength.Int64 != 8 ||
+			(originKind.String != "baseline" && originKind.String != "enrolled") || !baselineRevoked.Valid || baselineRevoked.Int64 < 0 || baselineRevoked.Int64 > 1 ||
+			previous != "" && previous >= deviceID.String || validateTimestamp(formatTimestamp(createdAt)) != nil {
+			return nil, invalidPersistentState("invalid device row")
+		}
+		if revokedAt.Valid && (revokedAt.Int64 < createdAt || validateTimestamp(formatTimestamp(revokedAt.Int64)) != nil) {
+			return nil, invalidPersistentState("invalid device revocation timestamp")
+		}
+		if lastSyncAt.Valid && (lastSyncAt.Int64 < createdAt || validateTimestamp(formatTimestamp(lastSyncAt.Int64)) != nil) {
+			return nil, invalidPersistentState("invalid device sync timestamp")
+		}
+		ack, ackErr := DecodeUint64(ackBytes)
+		counter, counterErr := DecodeUint64(counterBytes)
+		returned, returnedErr := DecodeUint64(returnedBytes)
+		createdCursor := uint64(0)
+		var createdCursorErr error
+		if createdCursorBytes != nil {
+			createdCursor, createdCursorErr = DecodeUint64(createdCursorBytes)
+		}
+		revokedCursor := uint64(0)
+		var revokedCursorErr error
+		if revokedCursorBytes != nil {
+			revokedCursor, revokedCursorErr = DecodeUint64(revokedCursorBytes)
+		}
+		if ackErr != nil || counterErr != nil || returnedErr != nil || createdCursorErr != nil || revokedCursorErr != nil ||
+			(originKind.String == "enrolled") != (createdCursorBytes != nil) ||
+			createdCursorBytes != nil && (createdCursor == 0 || createdCursor > serverCursor) ||
+			revokedCursorBytes != nil && (revokedCursor == 0 || revokedCursor > serverCursor || revokedCursor <= createdCursor) ||
+			originKind.String == "enrolled" && baselineRevoked.Int64 != 0 || baselineRevoked.Int64 == 1 && !revokedAt.Valid ||
+			(revokedCursorBytes != nil) != (revokedAt.Valid && baselineRevoked.Int64 == 0) ||
+			ack > returned || returned > serverCursor {
+			return nil, invalidPersistentState("invalid device cursor state")
+		}
+		result[deviceID.String] = validatedDeviceRow{
+			createdAt: createdAt, createdCursor: createdCursor, revokedCursor: revokedCursor,
+			revoked: revokedAt.Valid, baselineRevoked: baselineRevoked.Int64 == 1, maxCounter: counter,
+			ackCursor: ack, maxReturned: returned,
+		}
+		if revokedAt.Valid {
+			row := result[deviceID.String]
+			row.revokedAt = revokedAt.Int64
+			result[deviceID.String] = row
+		}
+		if len(result) > 64 {
+			return nil, invalidPersistentState("invalid device registry")
+		}
+		previous = deviceID.String
+	}
+	if rows.Err() != nil || len(result) > 64 {
+		rows.Close()
+		return nil, invalidPersistentState("invalid device registry")
+	}
+	if rows.Close() != nil {
+		return nil, invalidPersistentState("read device registry")
+	}
+	var orphanSyncRows int
+	if query.QueryRowContext(ctx, `
+		SELECT count(*) FROM device_sync_state s
+		LEFT JOIN devices d USING (device_id) WHERE d.device_id IS NULL`,
+	).Scan(&orphanSyncRows) != nil || orphanSyncRows != 0 {
+		return nil, invalidPersistentState("orphan device sync state")
+	}
+	var orphanOriginRows int
+	if query.QueryRowContext(ctx, `
+		SELECT count(*) FROM device_origins o
+		LEFT JOIN devices d USING (device_id) WHERE d.device_id IS NULL`,
+	).Scan(&orphanOriginRows) != nil || orphanOriginRows != 0 {
+		return nil, invalidPersistentState("orphan device origin")
+	}
+	return result, nil
+}
+
+// validateReadinessDevices inspects at most the protocol maximum plus one
+// sentinel row. Full registry and orphan validation is startup-only.
+func validateReadinessDevices(ctx context.Context, query schemaQueryer, serverCursor uint64) error {
+	wantScopes, _ := json.Marshal(auth.FixedScopes())
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(d.device_id),
+		       CASE WHEN typeof(d.device_id) = 'text'
+		                  AND octet_length(d.device_id) = ? THEN d.device_id END,
+		       octet_length(d.token_hash),
+		       CASE WHEN typeof(d.token_hash) = 'blob'
+		                  AND octet_length(d.token_hash) = 32 THEN d.token_hash END,
+		       octet_length(d.scopes_json),
+		       CASE WHEN typeof(d.scopes_json) = 'text'
+		                  AND octet_length(d.scopes_json) = ? THEN d.scopes_json END,
+		       d.created_at_ms, octet_length(o.origin_kind),
+		       CASE WHEN typeof(o.origin_kind) = 'text'
+		                  AND o.origin_kind IN ('baseline', 'enrolled') THEN o.origin_kind END,
+		       octet_length(o.created_cursor),
+		       CASE WHEN typeof(o.created_cursor) = 'blob'
+		                  AND octet_length(o.created_cursor) = 8 THEN o.created_cursor END,
+		       octet_length(o.revoked_cursor),
+		       CASE WHEN typeof(o.revoked_cursor) = 'blob'
+		                  AND octet_length(o.revoked_cursor) = 8 THEN o.revoked_cursor END,
+		       o.baseline_revoked,
+		       d.revoked_at_ms, d.last_sync_at_ms,
+		       octet_length(d.last_ack_cursor),
+		       CASE WHEN typeof(d.last_ack_cursor) = 'blob'
+		                  AND octet_length(d.last_ack_cursor) = 8 THEN d.last_ack_cursor END,
+		       octet_length(d.max_author_counter),
+		       CASE WHEN typeof(d.max_author_counter) = 'blob'
+		                  AND octet_length(d.max_author_counter) = 8 THEN d.max_author_counter END,
+		       octet_length(s.max_returned_cursor),
+		       CASE WHEN typeof(s.max_returned_cursor) = 'blob'
+		                  AND octet_length(s.max_returned_cursor) = 8 THEN s.max_returned_cursor END
+		FROM devices d LEFT JOIN device_sync_state s USING (device_id)
+		LEFT JOIN device_origins o USING (device_id)
+		ORDER BY d.device_id LIMIT 65`, maxUUIDBytes, len(wantScopes))
+	if err != nil {
+		return invalidPersistentState("read readiness device sentinel")
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		count++
+		var deviceID, scopesJSON, originKind sql.NullString
+		var deviceIDLength, tokenHashLength, scopesLength, ackLength, counterLength int64
+		var originLength, createdCursorLength, revokedCursorLength, baselineRevoked, returnedLength sql.NullInt64
+		var tokenHash, createdCursorBytes, revokedCursorBytes, ackBytes, counterBytes, returnedBytes []byte
+		var createdAt int64
+		var revokedAt, lastSyncAt sql.NullInt64
+		if rows.Scan(
+			&deviceIDLength, &deviceID, &tokenHashLength, &tokenHash, &scopesLength, &scopesJSON, &createdAt,
+			&originLength, &originKind,
+			&createdCursorLength, &createdCursorBytes,
+			&revokedCursorLength, &revokedCursorBytes, &baselineRevoked,
+			&revokedAt, &lastSyncAt,
+			&ackLength, &ackBytes, &counterLength, &counterBytes, &returnedLength, &returnedBytes,
+		) != nil ||
+			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			!boundedRequiredBytes(tokenHashLength, tokenHash, 32) || tokenHashLength != 32 ||
+			!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) || validateTimestamp(formatTimestamp(createdAt)) != nil ||
+			!boundedOptionalText(originLength, originKind, 8) || !originLength.Valid || originLength.Int64 != 8 ||
+			!boundedOptionalBytes(createdCursorLength, createdCursorBytes, 8) || createdCursorLength.Valid && createdCursorLength.Int64 != 8 ||
+			!boundedOptionalBytes(revokedCursorLength, revokedCursorBytes, 8) || revokedCursorLength.Valid && revokedCursorLength.Int64 != 8 ||
+			!boundedRequiredBytes(ackLength, ackBytes, 8) || ackLength != 8 ||
+			!boundedRequiredBytes(counterLength, counterBytes, 8) || counterLength != 8 ||
+			!boundedOptionalBytes(returnedLength, returnedBytes, 8) || !returnedLength.Valid || returnedLength.Int64 != 8 ||
+			(originKind.String != "baseline" && originKind.String != "enrolled") || !baselineRevoked.Valid || baselineRevoked.Int64 < 0 || baselineRevoked.Int64 > 1 ||
+			revokedAt.Valid && (revokedAt.Int64 < createdAt || validateTimestamp(formatTimestamp(revokedAt.Int64)) != nil) ||
+			lastSyncAt.Valid && (lastSyncAt.Int64 < createdAt || validateTimestamp(formatTimestamp(lastSyncAt.Int64)) != nil) {
+			return invalidPersistentState("invalid readiness device sentinel")
+		}
+		ack, ackErr := DecodeUint64(ackBytes)
+		_, counterErr := DecodeUint64(counterBytes)
+		returned, returnedErr := DecodeUint64(returnedBytes)
+		createdCursor := uint64(0)
+		var createdCursorErr error
+		if createdCursorBytes != nil {
+			createdCursor, createdCursorErr = DecodeUint64(createdCursorBytes)
+		}
+		revokedCursor := uint64(0)
+		var revokedCursorErr error
+		if revokedCursorBytes != nil {
+			revokedCursor, revokedCursorErr = DecodeUint64(revokedCursorBytes)
+		}
+		if ackErr != nil || counterErr != nil || returnedErr != nil || createdCursorErr != nil || revokedCursorErr != nil ||
+			(originKind.String == "enrolled") != (createdCursorBytes != nil) ||
+			createdCursorBytes != nil && (createdCursor == 0 || createdCursor > serverCursor) ||
+			revokedCursorBytes != nil && (revokedCursor == 0 || revokedCursor > serverCursor || revokedCursor <= createdCursor) ||
+			originKind.String == "enrolled" && baselineRevoked.Int64 != 0 || baselineRevoked.Int64 == 1 && !revokedAt.Valid ||
+			(revokedCursorBytes != nil) != (revokedAt.Valid && baselineRevoked.Int64 == 0) ||
+			ack > returned || returned > serverCursor {
+			return invalidPersistentState("invalid readiness device cursor")
+		}
+	}
+	if rows.Err() != nil || count > 64 {
+		return invalidPersistentState("invalid readiness device registry")
+	}
+	return nil
+}
+
+func validatePersistentRuntime(ctx context.Context, query schemaQueryer) (uint64, uint64, uint64, uint64, error) {
+	var cursorBytes, floorBytes, envelopeBytes, secretBytes, collectionBytes, uptimeBytes, bootID []byte
+	var collectionScanAfter sql.NullString
+	var cursorLength, floorLength, envelopeLength, secretLength, collectionLength, uptimeLength int64
+	var bootIDLength sql.NullInt64
+	var collectionScanAfterLength int64
+	if query.QueryRowContext(ctx, `
+		SELECT octet_length(server_cursor),
+		       CASE WHEN typeof(server_cursor) = 'blob' AND octet_length(server_cursor) = 8 THEN server_cursor END,
+		       octet_length(cursor_floor),
+		       CASE WHEN typeof(cursor_floor) = 'blob' AND octet_length(cursor_floor) = 8 THEN cursor_floor END,
+		       octet_length(envelope_generation),
+		       CASE WHEN typeof(envelope_generation) = 'blob' AND octet_length(envelope_generation) = 8 THEN envelope_generation END,
+		       octet_length(instance_secret_generation),
+		       CASE WHEN typeof(instance_secret_generation) = 'blob' AND octet_length(instance_secret_generation) = 8 THEN instance_secret_generation END,
+		       octet_length(collection_generation),
+		       CASE WHEN typeof(collection_generation) = 'blob' AND octet_length(collection_generation) = 8 THEN collection_generation END,
+		       octet_length(accumulated_uptime_ms),
+		       CASE WHEN typeof(accumulated_uptime_ms) = 'blob' AND octet_length(accumulated_uptime_ms) = 8 THEN accumulated_uptime_ms END,
+		       octet_length(active_boot_id),
+		       CASE WHEN typeof(active_boot_id) = 'blob' AND octet_length(active_boot_id) = 16 THEN active_boot_id END,
+		       octet_length(collection_scan_after_record_id),
+		       CASE WHEN typeof(collection_scan_after_record_id) = 'text'
+		                  AND octet_length(collection_scan_after_record_id) IN (0, 36)
+		            THEN collection_scan_after_record_id END
+		FROM runtime_state WHERE singleton = 1`,
+	).Scan(
+		&cursorLength, &cursorBytes, &floorLength, &floorBytes,
+		&envelopeLength, &envelopeBytes, &secretLength, &secretBytes,
+		&collectionLength, &collectionBytes, &uptimeLength, &uptimeBytes,
+		&bootIDLength, &bootID, &collectionScanAfterLength, &collectionScanAfter,
+	) != nil {
+		return 0, 0, 0, 0, invalidPersistentState("missing runtime state")
+	}
+	cursor, cursorErr := DecodeUint64(cursorBytes)
+	floor, floorErr := DecodeUint64(floorBytes)
+	envelope, envelopeErr := DecodeUint64(envelopeBytes)
+	secret, secretErr := DecodeUint64(secretBytes)
+	collection, collectionErr := DecodeUint64(collectionBytes)
+	_, uptimeErr := DecodeUint64(uptimeBytes)
+	if !boundedRequiredBytes(cursorLength, cursorBytes, 8) || cursorLength != 8 ||
+		!boundedRequiredBytes(floorLength, floorBytes, 8) || floorLength != 8 ||
+		!boundedRequiredBytes(envelopeLength, envelopeBytes, 8) || envelopeLength != 8 ||
+		!boundedRequiredBytes(secretLength, secretBytes, 8) || secretLength != 8 ||
+		!boundedRequiredBytes(collectionLength, collectionBytes, 8) || collectionLength != 8 ||
+		!boundedRequiredBytes(uptimeLength, uptimeBytes, 8) || uptimeLength != 8 ||
+		!boundedOptionalBytes(bootIDLength, bootID, 16) || bootIDLength.Valid && bootIDLength.Int64 != 16 ||
+		cursorErr != nil || floorErr != nil || envelopeErr != nil || secretErr != nil || collectionErr != nil || uptimeErr != nil || floor > cursor || secret == 0 ||
+		!collectionScanAfter.Valid || int64(len(collectionScanAfter.String)) != collectionScanAfterLength ||
+		collectionScanAfterLength != 0 && (collectionScanAfterLength != maxUUIDBytes || validateUUID(collectionScanAfter.String) != nil) {
+		return 0, 0, 0, 0, invalidPersistentState("invalid runtime state")
+	}
+	return cursor, envelope, secret, collection, nil
+}
+
+func validatePersistentEnvelope(ctx context.Context, query schemaQueryer, identity Identity, runtimeGeneration, secretGeneration uint64) error {
+	var generationBytes, body []byte
+	var generationLength, bodyLength int64
+	err := query.QueryRowContext(ctx, `
+		SELECT octet_length(generation),
+		       CASE WHEN typeof(generation) = 'blob' AND octet_length(generation) = 8 THEN generation END,
+		       length(envelope_json),
+		       CASE WHEN length(envelope_json) BETWEEN 1 AND ? THEN envelope_json END
+		FROM vault_envelope WHERE singleton = 1`, maxBodyBytes,
+	).Scan(&generationLength, &generationBytes, &bodyLength, &body)
+	if errors.Is(err, sql.ErrNoRows) {
+		if runtimeGeneration != 0 {
+			return invalidPersistentState("runtime envelope generation has no envelope")
+		}
+		return nil
+	}
+	if err != nil {
+		return invalidPersistentState("read envelope row")
+	}
+	generation, err := DecodeUint64(generationBytes)
+	var envelope vaultEnvelope
+	if !boundedRequiredBytes(generationLength, generationBytes, 8) || generationLength != 8 ||
+		err != nil || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) || decodeStoredCanonical(body, &envelope) != nil {
+		return invalidPersistentState("invalid envelope row")
+	}
+	bodyGeneration, bodySecret, err := validateEnvelope(envelope, identity)
+	if err != nil || generation != runtimeGeneration || bodyGeneration != generation || bodySecret != secretGeneration {
+		return invalidPersistentState("inconsistent envelope row")
+	}
+	return nil
+}
+
+func validatePersistentChangeOrigins(ctx context.Context, query schemaQueryer, serverCursor, runtimeEnvelopeGeneration uint64, snapshotCuts []uint64) (map[uint64]uint64, error) {
+	// Every assigned cursor has one permanent kind origin. Collection removes
+	// only the replayable record_revision change row, never its origin, so a
+	// later metadata event cannot be relocated onto that freed cursor. This
+	// runtime activates from the no-envelope generation-zero state; future
+	// recovery activation must persist explicit baseline envelope provenance.
+	if len(snapshotCuts) > 8 {
+		return nil, invalidPersistentState("too many snapshot cuts")
+	}
+	generationsAtCut := make(map[uint64]uint64, len(snapshotCuts))
+	for _, cut := range snapshotCuts {
+		if cut > serverCursor {
+			return nil, invalidPersistentState("snapshot cut exceeds server cursor")
+		}
+		generationsAtCut[cut] = 0
+	}
+	// Check the reverse ownership direction before streaming origins. In
+	// particular, a corrupt durable owner at server_cursor+1 must not survive
+	// preflight and then collide with the cursor assigned by an envelope PUT.
+	// Ack, floor, barrier, and snapshot-cut cursors are references rather than
+	// owners and intentionally do not participate in this projection.
+	var orphanChange, orphanDurableOwner int
+	if err := query.QueryRowContext(ctx, `
+		WITH durable_owners(cursor, kind) AS (
+			SELECT change_cursor, 'record_revision' FROM record_revisions
+			UNION ALL
+			SELECT created_cursor, 'device_changed' FROM device_origins
+			WHERE created_cursor IS NOT NULL
+			UNION ALL
+			SELECT revoked_cursor, 'device_changed' FROM device_origins
+			WHERE revoked_cursor IS NOT NULL
+			UNION ALL
+			SELECT created_cursor, 'device_changed' FROM enrollments
+			UNION ALL
+			SELECT change_cursor, 'collection_marker' FROM collection_markers
+		)
+		SELECT
+			EXISTS (
+				SELECT 1 FROM changes c
+				LEFT JOIN change_origins o
+				  ON o.cursor = c.cursor AND o.kind = c.kind
+				WHERE o.cursor IS NULL
+			),
+			EXISTS (
+				SELECT 1 FROM durable_owners d
+				LEFT JOIN change_origins o
+				  ON o.cursor = d.cursor AND o.kind = d.kind
+				WHERE o.cursor IS NULL
+			)`,
+	).Scan(&orphanChange, &orphanDurableOwner); err != nil || orphanChange != 0 || orphanDurableOwner != 0 {
+		return nil, invalidPersistentState("durable change owner does not match origin")
+	}
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(o.cursor),
+		       CASE WHEN typeof(o.cursor) = 'blob' AND octet_length(o.cursor) = 8
+		            THEN o.cursor END,
+		       CASE WHEN typeof(o.kind) = 'text' AND o.kind IN (
+		            'record_revision', 'collection_marker',
+		            'envelope_changed', 'device_changed'
+		       ) THEN o.kind END,
+		       octet_length(o.envelope_generation),
+		       CASE WHEN typeof(o.envelope_generation) = 'blob'
+		                  AND octet_length(o.envelope_generation) = 8
+		            THEN o.envelope_generation END,
+		       CASE WHEN c.cursor IS NULL THEN 0
+		            WHEN typeof(c.kind) = 'text' AND c.kind = o.kind THEN 1
+		            ELSE -1 END,
+		       octet_length(c.record_revision_id),
+		       CASE WHEN typeof(c.record_revision_id) = 'text'
+		                  AND octet_length(c.record_revision_id) = ? THEN c.record_revision_id END,
+		       octet_length(c.collection_marker_record_id),
+		       CASE WHEN typeof(c.collection_marker_record_id) = 'text'
+		                  AND octet_length(c.collection_marker_record_id) = ? THEN c.collection_marker_record_id END,
+		       octet_length(c.collection_marker_json),
+		       CASE WHEN typeof(c.collection_marker_json) = 'blob'
+		                  AND octet_length(c.collection_marker_json) BETWEEN 1 AND ? THEN c.collection_marker_json END,
+		       octet_length(c.device_changed_id),
+		       CASE WHEN typeof(c.device_changed_id) = 'text'
+		                  AND octet_length(c.device_changed_id) = ? THEN c.device_changed_id END,
+		       octet_length(c.device_change_kind),
+		       CASE WHEN typeof(c.device_change_kind) = 'text'
+		                  AND c.device_change_kind IN ('enrolled', 'revoked') THEN c.device_change_kind END,
+		       CASE WHEN r.change_cursor IS NULL THEN 0
+		            WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = 36 THEN 1
+		            ELSE -1 END,
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = 36
+		            THEN r.revision_id END,
+		       CASE WHEN r.change_cursor IS NULL THEN NULL
+		            WHEN typeof(r.retained) = 'integer' AND r.retained IN (0, 1) THEN r.retained
+		            ELSE -1 END,
+		       octet_length(m.record_id),
+		       CASE WHEN typeof(m.record_id) = 'text'
+		                  AND octet_length(m.record_id) = 36
+		            THEN m.record_id END,
+		       octet_length(m.change_cursor),
+		       CASE WHEN typeof(m.change_cursor) = 'blob'
+		                  AND octet_length(m.change_cursor) = 8 THEN m.change_cursor END,
+		       octet_length(m.marker_json),
+		       CASE WHEN typeof(m.marker_json) = 'blob'
+		                  AND octet_length(m.marker_json) BETWEEN 1 AND ? THEN m.marker_json END,
+		       octet_length(mo.record_id),
+		       CASE WHEN typeof(mo.record_id) = 'text'
+		                  AND octet_length(mo.record_id) = 36 THEN mo.record_id END,
+		       octet_length(mo.marker_json),
+		       CASE WHEN typeof(mo.marker_json) = 'blob'
+		                  AND octet_length(mo.marker_json) BETWEEN 1 AND ? THEN mo.marker_json END,
+		       octet_length(d.device_id),
+		       CASE WHEN typeof(d.device_id) = 'text'
+		                  AND octet_length(d.device_id) = 36
+		            THEN d.device_id END,
+		       octet_length(e.device_id),
+		       CASE WHEN typeof(e.device_id) = 'text'
+		                  AND octet_length(e.device_id) = 36
+		            THEN e.device_id END,
+		       octet_length(rd.device_id),
+		       CASE WHEN typeof(rd.device_id) = 'text'
+		                  AND octet_length(rd.device_id) = 36
+		            THEN rd.device_id END
+		FROM change_origins o
+		LEFT JOIN changes c ON c.cursor = o.cursor
+		LEFT JOIN record_revisions r ON r.change_cursor = o.cursor
+		LEFT JOIN collection_markers m ON m.record_id = c.collection_marker_record_id
+		LEFT JOIN collection_markers mo ON mo.change_cursor = o.cursor
+		LEFT JOIN device_origins d ON d.created_cursor = o.cursor
+		LEFT JOIN enrollments e ON e.created_cursor = o.cursor
+		LEFT JOIN device_origins rd ON rd.revoked_cursor = o.cursor
+		ORDER BY o.cursor`, maxUUIDBytes, maxUUIDBytes, maxBodyBytes, maxUUIDBytes, maxBodyBytes, maxBodyBytes)
+	if err != nil {
+		return nil, invalidPersistentState("read change origins")
+	}
+	defer rows.Close()
+	previous := uint64(0)
+	envelopeGeneration := uint64(0)
+	for rows.Next() {
+		var cursorBytes, generationBytes, changeMarkerBody, markerCursorBytes, markerBody, markerOriginBody []byte
+		var cursorLength int64
+		var generationLength sql.NullInt64
+		var kind, changeRevisionID, changeMarkerRecordID, changedDeviceID, deviceChangeKind sql.NullString
+		var revisionID, markerRecordID, markerOriginRecordID, originDeviceID, enrollmentDeviceID, revokedDeviceID sql.NullString
+		var changeRevisionIDLength, changeMarkerRecordIDLength, changeMarkerBodyLength sql.NullInt64
+		var changedDeviceIDLength, deviceChangeKindLength sql.NullInt64
+		var markerRecordIDLength, markerCursorLength, markerBodyLength sql.NullInt64
+		var markerOriginRecordIDLength, markerOriginBodyLength sql.NullInt64
+		var originDeviceIDLength, enrollmentDeviceIDLength, revokedDeviceIDLength sql.NullInt64
+		var revisionRetained sql.NullInt64
+		var changeState, revisionState int
+		if rows.Scan(
+			&cursorLength, &cursorBytes, &kind,
+			&generationLength, &generationBytes, &changeState,
+			&changeRevisionIDLength, &changeRevisionID,
+			&changeMarkerRecordIDLength, &changeMarkerRecordID, &changeMarkerBodyLength, &changeMarkerBody,
+			&changedDeviceIDLength, &changedDeviceID,
+			&deviceChangeKindLength, &deviceChangeKind,
+			&revisionState, &revisionID, &revisionRetained,
+			&markerRecordIDLength, &markerRecordID,
+			&markerCursorLength, &markerCursorBytes,
+			&markerBodyLength, &markerBody,
+			&markerOriginRecordIDLength, &markerOriginRecordID,
+			&markerOriginBodyLength, &markerOriginBody,
+			&originDeviceIDLength, &originDeviceID,
+			&enrollmentDeviceIDLength, &enrollmentDeviceID,
+			&revokedDeviceIDLength, &revokedDeviceID,
+		) != nil ||
+			cursorLength != 8 || len(cursorBytes) != 8 || !kind.Valid ||
+			generationLength.Valid && (generationLength.Int64 != 8 || len(generationBytes) != 8) ||
+			!generationLength.Valid && generationBytes != nil ||
+			changeState < 0 || changeState > 1 || revisionState < 0 || revisionState > 1 ||
+			!boundedOptionalText(changeRevisionIDLength, changeRevisionID, maxUUIDBytes) ||
+			changeRevisionIDLength.Valid && (changeRevisionIDLength.Int64 != maxUUIDBytes || validateUUID(changeRevisionID.String) != nil) ||
+			!boundedOptionalText(changeMarkerRecordIDLength, changeMarkerRecordID, maxUUIDBytes) ||
+			changeMarkerRecordIDLength.Valid && (changeMarkerRecordIDLength.Int64 != maxUUIDBytes || validateUUID(changeMarkerRecordID.String) != nil) ||
+			!boundedOptionalBytes(changeMarkerBodyLength, changeMarkerBody, maxBodyBytes) ||
+			!boundedOptionalText(changedDeviceIDLength, changedDeviceID, maxUUIDBytes) ||
+			changedDeviceIDLength.Valid && (changedDeviceIDLength.Int64 != maxUUIDBytes || validateUUID(changedDeviceID.String) != nil) ||
+			!boundedOptionalText(deviceChangeKindLength, deviceChangeKind, 8) ||
+			deviceChangeKindLength.Valid && (deviceChangeKindLength.Int64 < 7 || deviceChangeKindLength.Int64 > 8 || !deviceChangeKind.Valid) ||
+			(revisionState == 1) != revisionID.Valid || revisionID.Valid && validateUUID(revisionID.String) != nil ||
+			(revisionState == 1) != revisionRetained.Valid || revisionRetained.Valid && (revisionRetained.Int64 < 0 || revisionRetained.Int64 > 1) ||
+			!boundedOptionalText(markerRecordIDLength, markerRecordID, maxUUIDBytes) ||
+			markerRecordIDLength.Valid && (markerRecordIDLength.Int64 != maxUUIDBytes || validateUUID(markerRecordID.String) != nil) ||
+			!boundedOptionalBytes(markerCursorLength, markerCursorBytes, 8) || markerCursorLength.Valid && markerCursorLength.Int64 != 8 ||
+			!boundedOptionalBytes(markerBodyLength, markerBody, maxBodyBytes) ||
+			!boundedOptionalText(markerOriginRecordIDLength, markerOriginRecordID, maxUUIDBytes) ||
+			markerOriginRecordIDLength.Valid && (markerOriginRecordIDLength.Int64 != maxUUIDBytes || validateUUID(markerOriginRecordID.String) != nil) ||
+			!boundedOptionalBytes(markerOriginBodyLength, markerOriginBody, maxBodyBytes) ||
+			markerOriginRecordID.Valid != markerOriginBodyLength.Valid ||
+			!boundedOptionalText(originDeviceIDLength, originDeviceID, maxUUIDBytes) ||
+			originDeviceIDLength.Valid && (originDeviceIDLength.Int64 != maxUUIDBytes || validateUUID(originDeviceID.String) != nil) ||
+			!boundedOptionalText(enrollmentDeviceIDLength, enrollmentDeviceID, maxUUIDBytes) ||
+			enrollmentDeviceIDLength.Valid && (enrollmentDeviceIDLength.Int64 != maxUUIDBytes || validateUUID(enrollmentDeviceID.String) != nil) ||
+			!boundedOptionalText(revokedDeviceIDLength, revokedDeviceID, maxUUIDBytes) ||
+			revokedDeviceIDLength.Valid && (revokedDeviceIDLength.Int64 != maxUUIDBytes || validateUUID(revokedDeviceID.String) != nil) ||
+			originDeviceID.Valid != enrollmentDeviceID.Valid ||
+			originDeviceID.Valid && originDeviceID.String != enrollmentDeviceID.String {
+			return nil, invalidPersistentState("invalid change origin")
+		}
+		cursor, cursorErr := DecodeUint64(cursorBytes)
+		if cursorErr != nil || cursor == 0 || previous == math.MaxUint64 || cursor != previous+1 || cursor > serverCursor {
+			return nil, invalidPersistentState("change origins are not contiguous")
+		}
+		switch kind.String {
+		case "record_revision":
+			if generationBytes != nil || revisionState != 1 || markerRecordID.Valid || markerOriginRecordID.Valid || originDeviceID.Valid || revokedDeviceID.Valid ||
+				changeMarkerRecordID.Valid || changeMarkerBodyLength.Valid || changedDeviceID.Valid || deviceChangeKind.Valid ||
+				(revisionRetained.Int64 == 1 && (changeState != 1 || !changeRevisionID.Valid || changeRevisionID.String != revisionID.String)) ||
+				(revisionRetained.Int64 == 0 && (changeState != 0 || changeRevisionID.Valid)) {
+				return nil, invalidPersistentState("change origin does not match durable owner")
+			}
+		case "collection_marker":
+			if generationBytes != nil || revisionState != 0 || changeState != 1 || !markerRecordID.Valid || originDeviceID.Valid || revokedDeviceID.Valid ||
+				changeRevisionID.Valid || !changeMarkerRecordID.Valid || changeMarkerRecordID.String != markerRecordID.String || !changeMarkerBodyLength.Valid ||
+				!markerCursorLength.Valid || !markerBodyLength.Valid ||
+				changedDeviceID.Valid || deviceChangeKind.Valid {
+				return nil, invalidPersistentState("change origin does not match durable owner")
+			}
+			changeMarker, changeMarkerErr := decodeStoredCollectionMarker(changeMarkerBody)
+			currentMarker, currentMarkerErr := decodeStoredCollectionMarker(markerBody)
+			currentMarkerCursor, currentMarkerCursorErr := DecodeUint64(markerCursorBytes)
+			ownerAtOrigin := markerOriginRecordID.Valid
+			if changeMarkerErr != nil || currentMarkerErr != nil || currentMarkerCursorErr != nil ||
+				changeMarker.RecordID != changeMarkerRecordID.String || currentMarker.RecordID != markerRecordID.String ||
+				currentMarkerCursor < cursor || ownerAtOrigin != (currentMarkerCursor == cursor) ||
+				ownerAtOrigin && (markerOriginRecordID.String != changeMarkerRecordID.String || !bytes.Equal(markerOriginBody, changeMarkerBody)) ||
+				currentMarkerCursor == cursor && !bytes.Equal(changeMarkerBody, markerBody) {
+				return nil, invalidPersistentState("change origin does not match durable owner")
+			}
+		case "device_changed":
+			enrollmentOwner := originDeviceID.Valid
+			revocationOwner := revokedDeviceID.Valid
+			if generationBytes != nil || revisionState != 0 || changeState != 1 || markerRecordID.Valid || markerOriginRecordID.Valid ||
+				changeRevisionID.Valid || changeMarkerRecordID.Valid || changeMarkerBodyLength.Valid ||
+				!changedDeviceID.Valid || !deviceChangeKind.Valid || enrollmentOwner == revocationOwner ||
+				enrollmentOwner && (changedDeviceID.String != originDeviceID.String || deviceChangeKind.String != "enrolled") ||
+				revocationOwner && (changedDeviceID.String != revokedDeviceID.String || deviceChangeKind.String != "revoked") {
+				return nil, invalidPersistentState("change origin does not match durable owner")
+			}
+		case "envelope_changed":
+			generation, generationErr := DecodeUint64(generationBytes)
+			if generationErr != nil || envelopeGeneration == math.MaxUint64 || generation != envelopeGeneration+1 || revisionState != 0 || changeState != 1 ||
+				markerRecordID.Valid || markerOriginRecordID.Valid || originDeviceID.Valid || revokedDeviceID.Valid || changeRevisionID.Valid ||
+				changeMarkerRecordID.Valid || changeMarkerBodyLength.Valid || changedDeviceID.Valid || deviceChangeKind.Valid {
+				return nil, invalidPersistentState("invalid envelope change origin")
+			}
+			envelopeGeneration = generation
+			for cut := range generationsAtCut {
+				if cursor <= cut {
+					generationsAtCut[cut] = generation
+				}
+			}
+		default:
+			return nil, invalidPersistentState("invalid change origin kind")
+		}
+		previous = cursor
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return nil, invalidPersistentState("read change origins")
+	}
+	if previous != serverCursor {
+		return nil, invalidPersistentState("change origins do not reach server cursor")
+	}
+	if envelopeGeneration != runtimeEnvelopeGeneration {
+		return nil, invalidPersistentState("envelope generation does not match accepted history")
+	}
+	return generationsAtCut, nil
+}
+
+func validatePersistentRevisionObjects(ctx context.Context, query schemaQueryer) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(content_hash),
+		       CASE WHEN typeof(content_hash) = 'blob' AND octet_length(content_hash) = 32 THEN content_hash END,
+		       length(revision_json),
+		       CASE WHEN length(revision_json) BETWEEN 1 AND ? THEN revision_json END
+		FROM revision_objects ORDER BY content_hash`, maxBodyBytes)
+	if err != nil {
+		return invalidPersistentState("read revision objects")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var hashBytes, body []byte
+		var hashLength, bodyLength int64
+		var revision recordRevision
+		if rows.Scan(&hashLength, &hashBytes, &bodyLength, &body) != nil ||
+			!boundedRequiredBytes(hashLength, hashBytes, 32) || hashLength != 32 ||
+			bodyLength <= 0 || bodyLength > maxBodyBytes || int64(len(body)) != bodyLength {
+			return invalidPersistentState("revision object exceeds body limit")
+		}
+		if decodeStoredCanonical(body, &revision) != nil {
+			return invalidPersistentState("invalid revision object")
+		}
+		computed := sha256.Sum256(body)
+		if !bytes.Equal(computed[:], hashBytes) {
+			return invalidPersistentState("revision object hash mismatch")
+		}
+		if _, _, err := validateRevision(revision); err != nil {
+			return invalidPersistentState("invalid revision object profile")
+		}
+	}
+	if rows.Err() != nil {
+		return invalidPersistentState("read revision objects")
+	}
+	return nil
+}
+
+// validatePersistentHistorySequence proves that the durable author history is
+// complete, not merely that its maximum agrees with the device registry. V1
+// never deletes revision metadata, so every device must retain exactly the
+// contiguous counter sequence 1...max_author_counter. The same pass derives
+// the exact cursor floor from collected revision changes; no other change kind
+// is deleted by V1.
+func validatePersistentHistorySequence(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(author_device_id),
+		       CASE WHEN typeof(author_device_id) = 'text'
+		                  AND octet_length(author_device_id) = ? THEN author_device_id END,
+		       octet_length(author_counter),
+		       CASE WHEN typeof(author_counter) = 'blob' AND octet_length(author_counter) = 8 THEN author_counter END,
+		       retained,
+		       octet_length(change_cursor),
+		       CASE WHEN typeof(change_cursor) = 'blob' AND octet_length(change_cursor) = 8 THEN change_cursor END
+		FROM record_revisions ORDER BY author_device_id, author_counter`, maxUUIDBytes)
+	if err != nil {
+		return invalidPersistentState("read revision history sequence")
+	}
+	seenAuthors := make(map[string]struct{}, len(devices))
+	currentAuthor := ""
+	lastCounter := uint64(0)
+	maxCollectedCursor := uint64(0)
+	finishAuthor := func() error {
+		if currentAuthor != "" && devices[currentAuthor].maxCounter != lastCounter {
+			return invalidPersistentState("device counter history is incomplete")
+		}
+		return nil
+	}
+	for rows.Next() {
+		var authorID sql.NullString
+		var authorIDLength, counterLength, cursorLength int64
+		var counterBytes, cursorBytes []byte
+		var retained int
+		if rows.Scan(&authorIDLength, &authorID, &counterLength, &counterBytes, &retained, &cursorLength, &cursorBytes) != nil ||
+			!boundedRequiredText(authorIDLength, authorID, maxUUIDBytes) || validateUUID(authorID.String) != nil ||
+			!boundedRequiredBytes(counterLength, counterBytes, 8) || counterLength != 8 ||
+			!boundedRequiredBytes(cursorLength, cursorBytes, 8) || cursorLength != 8 || retained < 0 || retained > 1 {
+			rows.Close()
+			return invalidPersistentState("invalid revision history sequence")
+		}
+		if _, exists := devices[authorID.String]; !exists {
+			rows.Close()
+			return invalidPersistentState("revision history has unknown author")
+		}
+		if authorID.String != currentAuthor {
+			if err := finishAuthor(); err != nil {
+				rows.Close()
+				return err
+			}
+			currentAuthor = authorID.String
+			lastCounter = 0
+			seenAuthors[authorID.String] = struct{}{}
+		}
+		counter, counterErr := DecodeUint64(counterBytes)
+		cursor, cursorErr := DecodeUint64(cursorBytes)
+		if counterErr != nil || cursorErr != nil || counter == 0 || cursor == 0 || lastCounter == math.MaxUint64 || counter != lastCounter+1 {
+			rows.Close()
+			return invalidPersistentState("revision author counters are not contiguous")
+		}
+		lastCounter = counter
+		if retained == 0 && cursor > maxCollectedCursor {
+			maxCollectedCursor = cursor
+		}
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return invalidPersistentState("read revision history sequence")
+	}
+	if err := finishAuthor(); err != nil {
+		return err
+	}
+	for deviceID, row := range devices {
+		if _, exists := seenAuthors[deviceID]; !exists && row.maxCounter != 0 {
+			return invalidPersistentState("device counter history is missing")
+		}
+	}
+	var floorBytes []byte
+	var floorLength int64
+	if query.QueryRowContext(ctx, `
+		SELECT octet_length(cursor_floor),
+		       CASE WHEN typeof(cursor_floor) = 'blob' AND octet_length(cursor_floor) = 8 THEN cursor_floor END
+		FROM runtime_state WHERE singleton = 1`,
+	).Scan(&floorLength, &floorBytes) != nil || !boundedRequiredBytes(floorLength, floorBytes, 8) || floorLength != 8 {
+		return invalidPersistentState("read cursor floor")
+	}
+	floor, err := DecodeUint64(floorBytes)
+	if err != nil || floor != maxCollectedCursor {
+		return invalidPersistentState("cursor floor does not match collected history")
+	}
+	return nil
+}
+
+func validatePersistentObjectReferences(ctx context.Context, query schemaQueryer) error {
+	var orphanObjects int
+	if query.QueryRowContext(ctx, `
+		SELECT count(*) FROM revision_objects o
+		LEFT JOIN (
+			SELECT content_hash FROM record_revisions WHERE retained = 1
+			UNION
+			SELECT content_hash FROM snapshot_revision_refs
+		) refs USING (content_hash)
+		WHERE refs.content_hash IS NULL`,
+	).Scan(&orphanObjects) != nil || orphanObjects != 0 {
+		return invalidPersistentState("orphan revision object")
+	}
+	return nil
+}
+
+func validatePersistentRevisions(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor, collectionGeneration uint64) (map[string]uint64, error) {
+	// change_cursor is a unique fixed-width big-endian value. Replaying each
+	// record in cursor order reproduces its admission-time frontier, so the
+	// 32-sibling cap is sound even when a later resolution sorts after older
+	// revision UUIDs.
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       octet_length(r.author_device_id),
+		       CASE WHEN typeof(r.author_device_id) = 'text'
+		                  AND octet_length(r.author_device_id) = ? THEN r.author_device_id END,
+		       octet_length(r.author_counter),
+		       CASE WHEN typeof(r.author_counter) = 'blob' AND octet_length(r.author_counter) = 8 THEN r.author_counter END,
+		       length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
+		       octet_length(r.collection_witness_authenticator),
+		       CASE WHEN typeof(r.collection_witness_authenticator) = 'blob'
+		                  AND octet_length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
+		       r.tombstone,
+		       octet_length(r.content_hash),
+		       CASE WHEN typeof(r.content_hash) = 'blob' AND octet_length(r.content_hash) = 32 THEN r.content_hash END,
+		       r.received_at_ms,
+		       octet_length(r.accepted_uptime_ms),
+		       CASE WHEN typeof(r.accepted_uptime_ms) = 'blob' AND octet_length(r.accepted_uptime_ms) = 8 THEN r.accepted_uptime_ms END,
+		       octet_length(a.accepted_uptime_ms),
+		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END,
+		       octet_length(r.change_cursor),
+		       CASE WHEN typeof(r.change_cursor) = 'blob' AND octet_length(r.change_cursor) = 8 THEN r.change_cursor END,
+		       octet_length(r.collected_generation),
+		       CASE WHEN typeof(r.collected_generation) = 'blob'
+		                  AND octet_length(r.collected_generation) = 8 THEN r.collected_generation END,
+		       r.retained, r.undominated,
+		       length(o.revision_json),
+		       CASE WHEN length(o.revision_json) BETWEEN 1 AND ? THEN o.revision_json END,
+		       octet_length(c.cursor),
+		       CASE WHEN typeof(c.cursor) = 'blob' AND octet_length(c.cursor) = 8 THEN c.cursor END,
+		       CASE WHEN typeof(p.kind) = 'text'
+		                  AND p.kind = 'record_revision' THEN p.kind END
+		FROM record_revisions r
+		LEFT JOIN revision_acceptance_origins a ON a.revision_id = r.revision_id
+		LEFT JOIN revision_objects o USING (content_hash)
+		LEFT JOIN changes c
+		  ON c.cursor = r.change_cursor AND c.kind = 'record_revision'
+		 AND c.record_revision_id = r.revision_id
+		LEFT JOIN change_origins p ON p.cursor = r.change_cursor
+		ORDER BY r.record_id, r.change_cursor`, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes, maxVectorBytes, maxBodyBytes)
+	if err != nil {
+		return nil, invalidPersistentState("read revision rows")
+	}
+	defer rows.Close()
+	historicalCounters := make(map[string]uint64, len(devices))
+	type frontierItem struct {
+		id     string
+		vector map[string]uint64
+	}
+	var currentRecord string
+	var historicalFrontier []frontierItem
+	var retainedFrontier []frontierItem
+	storedHeads := make(map[string]struct{})
+	flushFrontier := func() error {
+		if len(retainedFrontier) != len(storedHeads) || len(retainedFrontier) > 32 {
+			return invalidPersistentState("invalid stored undominated frontier")
+		}
+		for _, item := range retainedFrontier {
+			if _, exists := storedHeads[item.id]; !exists {
+				return invalidPersistentState("incorrect stored undominated flag")
+			}
+		}
+		return nil
+	}
+	advanceFrontier := func(frontier []frontierItem, revisionID string, vector map[string]uint64) ([]frontierItem, error) {
+		dominated := false
+		next := frontier[:0]
+		for _, existing := range frontier {
+			if vectorsEqual(existing.vector, vector) {
+				return nil, invalidPersistentState("equal-vector revision equivocation")
+			}
+			if vectorDominates(existing.vector, vector) {
+				dominated = true
+			}
+			if !vectorDominates(vector, existing.vector) {
+				next = append(next, existing)
+			}
+		}
+		if !dominated {
+			next = append(next, frontierItem{id: revisionID, vector: vector})
+			if len(next) > 32 {
+				return nil, invalidPersistentState("too many reconstructed undominated revisions")
+			}
+		}
+		return next, nil
+	}
+	for rows.Next() {
+		var revisionID, recordID, authorID sql.NullString
+		var revisionIDLength, recordIDLength, authorIDLength, counterLength int64
+		var counterBytes, vectorBody, witness, hashBytes, uptimeBytes, originUptimeBytes, cursorBytes, collectedBytes, objectBody, matchingChange []byte
+		var vectorLength, hashLength, uptimeLength, cursorLength int64
+		var witnessLength, originUptimeLength, collectedLength sql.NullInt64
+		var objectLength, matchingChangeLength sql.NullInt64
+		var originKind sql.NullString
+		var receivedAt int64
+		var tombstone, retained, undominated int
+		if rows.Scan(
+			&revisionIDLength, &revisionID, &recordIDLength, &recordID, &authorIDLength, &authorID,
+			&counterLength, &counterBytes, &vectorLength, &vectorBody, &witnessLength, &witness,
+			&tombstone, &hashLength, &hashBytes, &receivedAt, &uptimeLength, &uptimeBytes,
+			&originUptimeLength, &originUptimeBytes, &cursorLength, &cursorBytes,
+			&collectedLength, &collectedBytes, &retained, &undominated,
+			&objectLength, &objectBody, &matchingChangeLength, &matchingChange, &originKind,
+		) != nil ||
+			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength != maxUUIDBytes || validateUUID(revisionID.String) != nil ||
+			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
+			!boundedRequiredText(authorIDLength, authorID, maxUUIDBytes) || validateUUID(authorID.String) != nil ||
+			!boundedRequiredBytes(counterLength, counterBytes, 8) || counterLength != 8 ||
+			!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) || !boundedOptionalBytes(witnessLength, witness, 32) || witnessLength.Valid && witnessLength.Int64 != 32 ||
+			!boundedRequiredBytes(hashLength, hashBytes, 32) || hashLength != 32 ||
+			!boundedRequiredBytes(uptimeLength, uptimeBytes, 8) || uptimeLength != 8 ||
+			!boundedOptionalBytes(originUptimeLength, originUptimeBytes, 8) || !originUptimeLength.Valid || originUptimeLength.Int64 != 8 || !bytes.Equal(uptimeBytes, originUptimeBytes) ||
+			!boundedRequiredBytes(cursorLength, cursorBytes, 8) || cursorLength != 8 ||
+			!boundedOptionalBytes(collectedLength, collectedBytes, 8) || collectedLength.Valid && collectedLength.Int64 != 8 ||
+			!boundedOptionalBytes(matchingChangeLength, matchingChange, 8) || matchingChangeLength.Valid && matchingChangeLength.Int64 != 8 ||
+			tombstone < 0 || tombstone > 1 || retained < 0 || retained > 1 || undominated < 0 || undominated > 1 ||
+			retained == 0 && undominated != 0 ||
+			validateTimestamp(formatTimestamp(receivedAt)) != nil {
+			return nil, invalidPersistentState("invalid revision row")
+		}
+		if !originKind.Valid || originKind.String != "record_revision" {
+			return nil, invalidPersistentState("revision does not match durable change origin")
+		}
+		counter, counterErr := DecodeUint64(counterBytes)
+		uptime, uptimeErr := DecodeUint64(uptimeBytes)
+		cursor, cursorErr := DecodeUint64(cursorBytes)
+		collectedGeneration := uint64(0)
+		var collectedErr error
+		if collectedBytes != nil {
+			collectedGeneration, collectedErr = DecodeUint64(collectedBytes)
+		}
+		_ = uptime
+		var entries []vectorEntry
+		if json.Unmarshal(vectorBody, &entries) != nil {
+			return nil, invalidPersistentState("invalid stored revision vector")
+		}
+		vector, vectorErr := validateVector(entries)
+		canonicalVector, _ := json.Marshal(entries)
+		deviceRow, authorExists := devices[authorID.String]
+		if counterErr != nil || uptimeErr != nil || cursorErr != nil || collectedErr != nil || cursor == 0 || cursor > serverCursor ||
+			(retained == 0) != (collectedBytes != nil) || collectedBytes != nil && (collectedGeneration == 0 || collectedGeneration > collectionGeneration) || vectorErr != nil ||
+			!bytes.Equal(canonicalVector, vectorBody) || vector[authorID.String] != counter || !authorExists ||
+			deviceRow.createdCursor != 0 && deviceRow.createdCursor >= cursor || counter > deviceRow.maxCounter {
+			return nil, invalidPersistentState("inconsistent revision row")
+		}
+		if currentRecord != recordID.String {
+			if currentRecord != "" {
+				if err := flushFrontier(); err != nil {
+					return nil, err
+				}
+			}
+			currentRecord = recordID.String
+			historicalFrontier = nil
+			retainedFrontier = nil
+			clear(storedHeads)
+		}
+		historicalFrontier, err = advanceFrontier(historicalFrontier, revisionID.String, vector)
+		if err != nil {
+			return nil, err
+		}
+		if retained == 1 {
+			retainedFrontier, err = advanceFrontier(retainedFrontier, revisionID.String, vector)
+			if err != nil {
+				return nil, err
+			}
+			if undominated == 1 {
+				storedHeads[revisionID.String] = struct{}{}
+				if len(storedHeads) > 32 {
+					return nil, invalidPersistentState("too many stored undominated revisions")
+				}
+			}
+		}
+		if counter > historicalCounters[authorID.String] {
+			historicalCounters[authorID.String] = counter
+		}
+		for vectorDeviceID, vectorCounter := range vector {
+			registry, exists := devices[vectorDeviceID]
+			if !exists || registry.createdCursor != 0 && registry.createdCursor >= cursor || vectorCounter > registry.maxCounter {
+				return nil, invalidPersistentState("revision vector exceeds device registry")
+			}
+		}
+		var bodyRevision recordRevision
+		objectExists := objectLength.Valid
+		if objectExists && (objectLength.Int64 <= 0 || objectLength.Int64 > maxBodyBytes || int64(len(objectBody)) != objectLength.Int64) {
+			return nil, invalidPersistentState("revision object exceeds body limit")
+		}
+		if objectExists && decodeStoredCanonical(objectBody, &bodyRevision) != nil {
+			return nil, invalidPersistentState("invalid referenced revision object")
+		}
+		if retained == 1 && (!objectExists || len(matchingChange) != 8) {
+			return nil, invalidPersistentState("retained revision object or change mismatch")
+		}
+		if objectExists && (bodyRevision.RevisionID != revisionID.String || bodyRevision.RecordID != recordID.String || bodyRevision.AuthorDeviceID != authorID.String ||
+			bodyRevision.AuthorCounter != encodeUint64Text(counter) || !slices.Equal(bodyRevision.VersionVector, entries) || bodyRevision.Tombstone != (tombstone == 1)) {
+			return nil, invalidPersistentState("revision object identity mismatch")
+		}
+		if retained == 0 && matchingChange != nil {
+			return nil, invalidPersistentState("collected revision retains a change")
+		}
+		if objectExists {
+			computed := sha256.Sum256(objectBody)
+			if !bytes.Equal(computed[:], hashBytes) {
+				return nil, invalidPersistentState("revision content address mismatch")
+			}
+			var bodyWitness []byte
+			if bodyRevision.CollectionWitnessAuthenticator != nil {
+				bodyWitness, _ = decodeBase64(*bodyRevision.CollectionWitnessAuthenticator, 32, 0, 0)
+			}
+			if !bytes.Equal(bodyWitness, witness) {
+				return nil, invalidPersistentState("revision witness mismatch")
+			}
+		}
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return nil, invalidPersistentState("read revision rows")
+	}
+	if currentRecord != "" {
+		if err := flushFrontier(); err != nil {
+			return nil, err
+		}
+	}
+	if err := validatePersistentCollectionGenerationSequence(ctx, query, collectionGeneration); err != nil {
+		return nil, err
+	}
+	return historicalCounters, nil
+}
+
+// validatePersistentRevisionAcceptanceOrigins performs the reverse half of the
+// one-to-one check without retaining an unbounded key set: every provenance row
+// is streamed in primary-key order and must own one canonical permanent
+// revision with the same age.
+func validatePersistentRevisionAcceptanceOrigins(ctx context.Context, query schemaQueryer) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(a.revision_id),
+		       CASE WHEN typeof(a.revision_id) = 'text'
+		                  AND octet_length(a.revision_id) = ? THEN a.revision_id END,
+		       octet_length(a.accepted_uptime_ms),
+		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END,
+		       octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       octet_length(r.accepted_uptime_ms),
+		       CASE WHEN typeof(r.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(r.accepted_uptime_ms) = 8 THEN r.accepted_uptime_ms END
+		FROM revision_acceptance_origins a
+		LEFT JOIN record_revisions r ON r.revision_id = a.revision_id
+		ORDER BY a.revision_id`, maxUUIDBytes, maxUUIDBytes)
+	if err != nil {
+		return invalidPersistentState("read revision acceptance origins")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var originRevisionID, revisionID sql.NullString
+		var originRevisionIDLength, originUptimeLength int64
+		var revisionIDLength, revisionUptimeLength sql.NullInt64
+		var originUptimeBytes, revisionUptimeBytes []byte
+		if rows.Scan(&originRevisionIDLength, &originRevisionID, &originUptimeLength, &originUptimeBytes, &revisionIDLength, &revisionID, &revisionUptimeLength, &revisionUptimeBytes) != nil ||
+			!boundedRequiredText(originRevisionIDLength, originRevisionID, maxUUIDBytes) || originRevisionIDLength != maxUUIDBytes || validateUUID(originRevisionID.String) != nil ||
+			!boundedRequiredBytes(originUptimeLength, originUptimeBytes, 8) || originUptimeLength != 8 || decodeUint64Error(originUptimeBytes) != nil ||
+			!boundedOptionalText(revisionIDLength, revisionID, maxUUIDBytes) || !revisionIDLength.Valid || revisionIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalBytes(revisionUptimeLength, revisionUptimeBytes, 8) || !revisionUptimeLength.Valid || revisionUptimeLength.Int64 != 8 ||
+			validateUUID(revisionID.String) != nil || revisionID.String != originRevisionID.String || !bytes.Equal(revisionUptimeBytes, originUptimeBytes) {
+			return invalidPersistentState("invalid revision acceptance origin")
+		}
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return invalidPersistentState("read revision acceptance origins")
+	}
+	return nil
+}
+
+func validatePersistentCollectionGenerationSequence(ctx context.Context, query schemaQueryer, collectionGeneration uint64) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(collected_generation),
+		       CASE WHEN typeof(collected_generation) = 'blob'
+		                  AND octet_length(collected_generation) = 8
+		            THEN collected_generation END
+		FROM record_revisions
+		WHERE collected_generation IS NOT NULL
+		ORDER BY collected_generation`)
+	if err != nil {
+		return invalidPersistentState("read revision collection generations")
+	}
+	defer rows.Close()
+	previous := uint64(0)
+	for rows.Next() {
+		var generationBytes []byte
+		var generationLength int64
+		if rows.Scan(&generationLength, &generationBytes) != nil || generationLength != 8 || len(generationBytes) != 8 {
+			return invalidPersistentState("invalid revision collection generation")
+		}
+		generation, err := DecodeUint64(generationBytes)
+		if err != nil || generation == 0 || generation > collectionGeneration {
+			return invalidPersistentState("invalid revision collection generation")
+		}
+		if next, valid := advancePersistentCollectionGeneration(previous, generation); !valid {
+			return invalidPersistentState("collection generation does not match accepted history")
+		} else {
+			previous = next
+		}
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return invalidPersistentState("read revision collection generations")
+	}
+	if previous != collectionGeneration {
+		return invalidPersistentState("collection generation does not match accepted history")
+	}
+	return nil
+}
+
+func advancePersistentCollectionGeneration(previous, generation uint64) (uint64, bool) {
+	if generation == previous {
+		return previous, true
+	}
+	if previous == math.MaxUint64 || generation != previous+1 {
+		return previous, false
+	}
+	return generation, true
+}
+
+func validatePersistentRecordHeads(ctx context.Context, query schemaQueryer) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(h.record_id),
+		       CASE WHEN typeof(h.record_id) = 'text'
+		                  AND octet_length(h.record_id) = ? THEN h.record_id END,
+		       octet_length(h.revision_id),
+		       CASE WHEN typeof(h.revision_id) = 'text'
+		                  AND octet_length(h.revision_id) = ? THEN h.revision_id END,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       r.retained, r.undominated
+		FROM record_heads h
+		LEFT JOIN record_revisions r ON r.revision_id = h.revision_id
+		ORDER BY h.record_id, h.revision_id`, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes)
+	if err != nil {
+		return invalidPersistentState("read record heads")
+	}
+	var previousRecord string
+	countForRecord := 0
+	for rows.Next() {
+		var recordID, revisionID, revisionRecord sql.NullString
+		var recordIDLength, revisionIDLength int64
+		var revisionRecordLength sql.NullInt64
+		var retained, undominated sql.NullInt64
+		if rows.Scan(&recordIDLength, &recordID, &revisionIDLength, &revisionID, &revisionRecordLength, &revisionRecord, &retained, &undominated) != nil ||
+			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
+			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength != maxUUIDBytes || validateUUID(revisionID.String) != nil ||
+			!boundedOptionalText(revisionRecordLength, revisionRecord, maxUUIDBytes) || !revisionRecordLength.Valid || validateUUID(revisionRecord.String) != nil ||
+			revisionRecord.String != recordID.String || !retained.Valid || retained.Int64 != 1 || !undominated.Valid || undominated.Int64 != 1 {
+			rows.Close()
+			return invalidPersistentState("invalid record head")
+		}
+		if recordID.String != previousRecord {
+			previousRecord = recordID.String
+			countForRecord = 0
+		}
+		countForRecord++
+		if countForRecord > 32 {
+			rows.Close()
+			return invalidPersistentState("too many record heads")
+		}
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return invalidPersistentState("read record heads")
+	}
+	var missing int
+	if query.QueryRowContext(ctx, `
+		SELECT count(*) FROM record_revisions r
+		WHERE r.retained = 1 AND r.undominated = 1 AND NOT EXISTS (
+			SELECT 1 FROM record_heads h
+			WHERE h.record_id = r.record_id AND h.revision_id = r.revision_id
+		)`).Scan(&missing) != nil || missing != 0 {
+		return invalidPersistentState("record head index is incomplete")
+	}
+	return nil
+}
+
+func validatePersistentRecordVectorIndex(ctx context.Context, query schemaQueryer) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(i.record_id),
+		       CASE WHEN typeof(i.record_id) = 'text'
+		                  AND octet_length(i.record_id) = ? THEN i.record_id END,
+		       octet_length(i.vector_hash),
+		       CASE WHEN typeof(i.vector_hash) = 'blob' AND octet_length(i.vector_hash) = 32 THEN i.vector_hash END,
+		       octet_length(i.revision_id),
+		       CASE WHEN typeof(i.revision_id) = 'text'
+		                  AND octet_length(i.revision_id) = ? THEN i.revision_id END,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END
+		FROM record_vector_index i
+		LEFT JOIN record_revisions r ON r.revision_id = i.revision_id
+		ORDER BY i.record_id, i.vector_hash, i.revision_id`, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes, maxVectorBytes)
+	if err != nil {
+		return invalidPersistentState("read record vector index")
+	}
+	var previousRecordID string
+	var previousVectorHash [32]byte
+	havePrevious := false
+	for rows.Next() {
+		var recordID, revisionID sql.NullString
+		var vectorHash, vectorBody []byte
+		var revisionRecord sql.NullString
+		var recordIDLength, vectorHashLength, revisionIDLength int64
+		var revisionRecordLength, vectorLength sql.NullInt64
+		if rows.Scan(&recordIDLength, &recordID, &vectorHashLength, &vectorHash, &revisionIDLength, &revisionID, &revisionRecordLength, &revisionRecord, &vectorLength, &vectorBody) != nil ||
+			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
+			!boundedRequiredBytes(vectorHashLength, vectorHash, 32) || vectorHashLength != 32 ||
+			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength != maxUUIDBytes || validateUUID(revisionID.String) != nil ||
+			!boundedOptionalText(revisionRecordLength, revisionRecord, maxUUIDBytes) || !revisionRecordLength.Valid || validateUUID(revisionRecord.String) != nil || revisionRecord.String != recordID.String ||
+			!boundedOptionalBytes(vectorLength, vectorBody, maxVectorBytes) || !vectorLength.Valid {
+			rows.Close()
+			return invalidPersistentState("invalid record vector index")
+		}
+		computed := sha256.Sum256(vectorBody)
+		if !bytes.Equal(computed[:], vectorHash) {
+			rows.Close()
+			return invalidPersistentState("record vector index hash mismatch")
+		}
+		if havePrevious && recordID.String == previousRecordID && bytes.Equal(vectorHash, previousVectorHash[:]) {
+			rows.Close()
+			return invalidPersistentState("duplicate record vector index")
+		}
+		previousRecordID = recordID.String
+		copy(previousVectorHash[:], vectorHash)
+		havePrevious = true
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return invalidPersistentState("read record vector index")
+	}
+	var missing int
+	if query.QueryRowContext(ctx, `
+		SELECT count(*) FROM (
+			SELECT record_id, revision_id FROM record_revisions
+			EXCEPT
+			SELECT record_id, revision_id FROM record_vector_index
+		)`).Scan(&missing) != nil || missing != 0 {
+		return invalidPersistentState("record vector index is incomplete")
+	}
+	return nil
+}
+
+func validatePersistentCollectionQueues(ctx context.Context, query schemaQueryer, serverCursor uint64) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(q.record_id),
+		       CASE WHEN typeof(q.record_id) = 'text'
+		                  AND octet_length(q.record_id) = ? THEN q.record_id END,
+		       octet_length(q.barrier_cursor),
+		       CASE WHEN typeof(q.barrier_cursor) = 'blob' AND octet_length(q.barrier_cursor) = 8 THEN q.barrier_cursor END,
+		       octet_length(h.record_id),
+		       CASE WHEN typeof(h.record_id) = 'text'
+		                  AND octet_length(h.record_id) = ? THEN h.record_id END,
+		       octet_length(h.max_cursor),
+		       CASE WHEN typeof(h.max_cursor) = 'blob' AND octet_length(h.max_cursor) = 8 THEN h.max_cursor END
+		FROM collection_records q
+		LEFT JOIN (
+			SELECT record_id, max(change_cursor) AS max_cursor
+			FROM record_revisions GROUP BY record_id
+		) h USING (record_id)
+		ORDER BY q.record_id`, maxUUIDBytes, maxUUIDBytes)
+	if err != nil {
+		return invalidPersistentState("read collection record queue")
+	}
+	for rows.Next() {
+		var recordID sql.NullString
+		var barrierBytes, maxBytes []byte
+		var historicalRecord sql.NullString
+		var recordIDLength, barrierLength int64
+		var historicalRecordLength, maxLength sql.NullInt64
+		if rows.Scan(&recordIDLength, &recordID, &barrierLength, &barrierBytes, &historicalRecordLength, &historicalRecord, &maxLength, &maxBytes) != nil ||
+			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
+			!boundedRequiredBytes(barrierLength, barrierBytes, 8) || barrierLength != 8 ||
+			!boundedOptionalText(historicalRecordLength, historicalRecord, maxUUIDBytes) || !historicalRecordLength.Valid || validateUUID(historicalRecord.String) != nil || historicalRecord.String != recordID.String ||
+			!boundedOptionalBytes(maxLength, maxBytes, 8) || !maxLength.Valid || maxLength.Int64 != 8 {
+			rows.Close()
+			return invalidPersistentState("invalid collection record queue")
+		}
+		barrier, barrierErr := DecodeUint64(barrierBytes)
+		historicalMaximum, maxErr := DecodeUint64(maxBytes)
+		if barrierErr != nil || maxErr != nil || barrier != historicalMaximum || barrier == 0 || barrier > serverCursor {
+			rows.Close()
+			return invalidPersistentState("invalid collection record barrier")
+		}
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return invalidPersistentState("read collection record queue")
+	}
+	var missingRecords int
+	if query.QueryRowContext(ctx, `
+		SELECT count(*) FROM (
+			SELECT DISTINCT r.record_id FROM record_revisions r
+			WHERE r.retained = 1
+			EXCEPT SELECT q.record_id FROM collection_records q
+		)`).Scan(&missingRecords) != nil || missingRecords != 0 {
+		return invalidPersistentState("collection record queue is incomplete")
+	}
+	var emptyRecords int
+	if query.QueryRowContext(ctx, `
+		SELECT count(*) FROM collection_records q
+		WHERE NOT EXISTS (
+			SELECT 1 FROM record_revisions r
+			WHERE r.record_id = q.record_id AND r.retained = 1
+		)`).Scan(&emptyRecords) != nil || emptyRecords != 0 {
+		return invalidPersistentState("collection record queue has empty records")
+	}
+	candidateRows, err := query.QueryContext(ctx, `
+		SELECT octet_length(q.record_id),
+		       CASE WHEN typeof(q.record_id) = 'text'
+		                  AND octet_length(q.record_id) = ? THEN q.record_id END,
+		       octet_length(q.accepted_uptime_ms),
+		       CASE WHEN typeof(q.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(q.accepted_uptime_ms) = 8 THEN q.accepted_uptime_ms END,
+		       octet_length(q.revision_id),
+		       CASE WHEN typeof(q.revision_id) = 'text'
+		                  AND octet_length(q.revision_id) = ? THEN q.revision_id END,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       octet_length(r.accepted_uptime_ms),
+		       CASE WHEN typeof(r.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(r.accepted_uptime_ms) = 8 THEN r.accepted_uptime_ms END,
+		       r.retained,
+		       octet_length(a.accepted_uptime_ms),
+		       CASE WHEN typeof(a.accepted_uptime_ms) = 'blob'
+		                  AND octet_length(a.accepted_uptime_ms) = 8 THEN a.accepted_uptime_ms END
+		FROM collection_candidates q
+		LEFT JOIN record_revisions r ON r.revision_id = q.revision_id
+		LEFT JOIN revision_acceptance_origins a ON a.revision_id = q.revision_id
+		ORDER BY q.record_id, q.accepted_uptime_ms, q.revision_id`, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes)
+	if err != nil {
+		return invalidPersistentState("read collection candidate queue")
+	}
+	for candidateRows.Next() {
+		var recordID, revisionID sql.NullString
+		var uptimeBytes, revisionUptime, originUptime []byte
+		var revisionRecord sql.NullString
+		var recordIDLength, uptimeLength, revisionIDLength int64
+		var revisionRecordLength, revisionUptimeLength sql.NullInt64
+		var retained, originUptimeLength sql.NullInt64
+		if candidateRows.Scan(&recordIDLength, &recordID, &uptimeLength, &uptimeBytes, &revisionIDLength, &revisionID, &revisionRecordLength, &revisionRecord, &revisionUptimeLength, &revisionUptime, &retained, &originUptimeLength, &originUptime) != nil ||
+			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
+			!boundedRequiredBytes(uptimeLength, uptimeBytes, 8) || uptimeLength != 8 || decodeUint64Error(uptimeBytes) != nil ||
+			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength != maxUUIDBytes || validateUUID(revisionID.String) != nil ||
+			!boundedOptionalText(revisionRecordLength, revisionRecord, maxUUIDBytes) || !revisionRecordLength.Valid || validateUUID(revisionRecord.String) != nil ||
+			!boundedOptionalBytes(revisionUptimeLength, revisionUptime, 8) || !revisionUptimeLength.Valid || revisionUptimeLength.Int64 != 8 ||
+			revisionRecord.String != recordID.String || !bytes.Equal(uptimeBytes, revisionUptime) || !retained.Valid || retained.Int64 != 1 ||
+			!boundedOptionalBytes(originUptimeLength, originUptime, 8) || !originUptimeLength.Valid || originUptimeLength.Int64 != 8 || !bytes.Equal(revisionUptime, originUptime) {
+			candidateRows.Close()
+			return invalidPersistentState("invalid collection candidate queue")
+		}
+	}
+	if candidateRows.Err() != nil || candidateRows.Close() != nil {
+		return invalidPersistentState("read collection candidate queue")
+	}
+	var missingCandidates int
+	if query.QueryRowContext(ctx, `
+		SELECT count(*) FROM record_revisions r
+		WHERE r.retained = 1 AND NOT EXISTS (
+			SELECT 1 FROM collection_candidates q
+			WHERE q.revision_id = r.revision_id AND q.record_id = r.record_id
+			  AND q.accepted_uptime_ms = r.accepted_uptime_ms
+		)`).Scan(&missingCandidates) != nil || missingCandidates != 0 {
+		return invalidPersistentState("collection candidate queue is incomplete")
+	}
+	return nil
+}
+
+func decodeUint64Error(value []byte) error {
+	_, err := DecodeUint64(value)
+	return err
+}
+
+func validatePersistentMarkers(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor uint64) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(m.record_id),
+		       CASE WHEN typeof(m.record_id) = 'text'
+		                  AND octet_length(m.record_id) = ? THEN m.record_id END,
+		       octet_length(m.witness_revision_id),
+		       CASE WHEN typeof(m.witness_revision_id) = 'text'
+		                  AND octet_length(m.witness_revision_id) = ? THEN m.witness_revision_id END,
+		       length(m.frontier_json),
+		       CASE WHEN length(m.frontier_json) BETWEEN 1 AND ? THEN m.frontier_json END,
+		       octet_length(m.collection_witness_authenticator),
+		       CASE WHEN typeof(m.collection_witness_authenticator) = 'blob'
+		                  AND octet_length(m.collection_witness_authenticator) = 32 THEN m.collection_witness_authenticator END,
+		       octet_length(m.barrier_cursor),
+		       CASE WHEN typeof(m.barrier_cursor) = 'blob' AND octet_length(m.barrier_cursor) = 8 THEN m.barrier_cursor END,
+		       length(m.marker_json),
+		       CASE WHEN length(m.marker_json) BETWEEN 1 AND ? THEN m.marker_json END,
+		       octet_length(m.change_cursor),
+		       CASE WHEN typeof(m.change_cursor) = 'blob' AND octet_length(m.change_cursor) = 8 THEN m.change_cursor END,
+		       m.received_at_ms,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
+		       octet_length(r.collection_witness_authenticator),
+		       CASE WHEN typeof(r.collection_witness_authenticator) = 'blob'
+		                  AND octet_length(r.collection_witness_authenticator) = 32 THEN r.collection_witness_authenticator END,
+		       CASE WHEN typeof(c.kind) = 'text'
+		                  AND c.kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed') THEN c.kind END,
+		       octet_length(c.collection_marker_record_id),
+		       CASE WHEN typeof(c.collection_marker_record_id) = 'text'
+		                  AND octet_length(c.collection_marker_record_id) = ? THEN c.collection_marker_record_id END,
+		       length(c.collection_marker_json),
+		       CASE WHEN typeof(c.collection_marker_json) = 'blob'
+		                  AND length(c.collection_marker_json) BETWEEN 1 AND ? THEN c.collection_marker_json END
+		FROM collection_markers m
+		LEFT JOIN record_revisions r ON r.revision_id = m.witness_revision_id
+		LEFT JOIN changes c ON c.cursor = m.change_cursor
+		ORDER BY m.record_id`, maxUUIDBytes, maxUUIDBytes, maxVectorBytes, maxBodyBytes, maxUUIDBytes, maxVectorBytes, maxUUIDBytes, maxBodyBytes)
+	if err != nil {
+		return invalidPersistentState("read marker rows")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var recordID, witnessID, changeKind, changeRecordID sql.NullString
+		var frontierBody, authenticator, barrierBytes, body, changeBytes, changeMarkerBody []byte
+		var witnessRecordID sql.NullString
+		var witnessVector, witnessAuthenticator []byte
+		var recordIDLength, witnessIDLength, frontierLength, authenticatorLength, barrierLength, bodyLength, changeLength int64
+		var witnessRecordIDLength, witnessVectorLength, witnessAuthenticatorLength sql.NullInt64
+		var changeRecordIDLength, changeMarkerBodyLength sql.NullInt64
+		var receivedAt int64
+		if rows.Scan(&recordIDLength, &recordID, &witnessIDLength, &witnessID, &frontierLength, &frontierBody,
+			&authenticatorLength, &authenticator, &barrierLength, &barrierBytes, &bodyLength, &body, &changeLength, &changeBytes, &receivedAt,
+			&witnessRecordIDLength, &witnessRecordID, &witnessVectorLength, &witnessVector, &witnessAuthenticatorLength, &witnessAuthenticator,
+			&changeKind, &changeRecordIDLength, &changeRecordID, &changeMarkerBodyLength, &changeMarkerBody) != nil ||
+			!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
+			!boundedRequiredText(witnessIDLength, witnessID, maxUUIDBytes) || witnessIDLength != maxUUIDBytes || validateUUID(witnessID.String) != nil ||
+			!boundedOptionalText(witnessRecordIDLength, witnessRecordID, maxUUIDBytes) || !witnessRecordIDLength.Valid || validateUUID(witnessRecordID.String) != nil ||
+			!boundedRequiredBytes(frontierLength, frontierBody, maxVectorBytes) ||
+			!boundedRequiredBytes(authenticatorLength, authenticator, 32) || authenticatorLength != 32 ||
+			!boundedRequiredBytes(barrierLength, barrierBytes, 8) || barrierLength != 8 ||
+			!boundedRequiredBytes(changeLength, changeBytes, 8) || changeLength != 8 ||
+			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) || !boundedOptionalBytes(witnessVectorLength, witnessVector, maxVectorBytes) ||
+			!boundedOptionalBytes(witnessAuthenticatorLength, witnessAuthenticator, 32) || witnessAuthenticatorLength.Valid && witnessAuthenticatorLength.Int64 != 32 ||
+			!boundedOptionalText(changeRecordIDLength, changeRecordID, maxUUIDBytes) || changeRecordIDLength.Valid && changeRecordIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalBytes(changeMarkerBodyLength, changeMarkerBody, maxBodyBytes) {
+			return invalidPersistentState("invalid marker row")
+		}
+		marker, err := decodeStoredCollectionMarker(body)
+		barrier, barrierErr := DecodeUint64(barrierBytes)
+		changeCursor, changeErr := DecodeUint64(changeBytes)
+		canonicalFrontier, _ := json.Marshal(marker.Frontier)
+		decodedAuthenticator, authErr := decodeBase64(marker.CollectionWitnessAuthenticator, 32, 0, 0)
+		if err != nil || barrierErr != nil || changeErr != nil || authErr != nil || marker.RecordID != recordID.String || marker.WitnessRevisionID != witnessID.String ||
+			!bytes.Equal(canonicalFrontier, frontierBody) || !bytes.Equal(decodedAuthenticator, authenticator) || marker.BarrierCursor != encodeUint64Text(barrier) ||
+			barrier >= changeCursor || changeCursor > serverCursor || validateTimestamp(formatTimestamp(receivedAt)) != nil ||
+			witnessRecordID.String != recordID.String || !bytes.Equal(witnessVector, frontierBody) || !bytes.Equal(witnessAuthenticator, authenticator) ||
+			!changeKind.Valid || changeKind.String != "collection_marker" || !changeRecordID.Valid || changeRecordID.String != recordID.String ||
+			!bytes.Equal(changeMarkerBody, body) {
+			return invalidPersistentState("inconsistent marker row")
+		}
+		frontier, _, _, _ := validateCollectionMarker(marker)
+		for deviceID, counter := range frontier {
+			deviceRow, exists := devices[deviceID]
+			if !exists || counter > deviceRow.maxCounter {
+				return invalidPersistentState("marker frontier exceeds device registry")
+			}
+		}
+	}
+	if rows.Err() != nil {
+		return invalidPersistentState("read marker rows")
+	}
+	return nil
+}
+
+func validatePersistentEnrollmentGrants(ctx context.Context, query schemaQueryer) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(g.grant_hash),
+		       CASE WHEN typeof(g.grant_hash) = 'blob' AND octet_length(g.grant_hash) = 32 THEN g.grant_hash END,
+		       octet_length(g.boot_id),
+		       CASE WHEN typeof(g.boot_id) = 'blob' AND octet_length(g.boot_id) = 16 THEN g.boot_id END,
+		       g.expires_at_ms,
+		       octet_length(g.consumed_enrollment_id),
+		       CASE WHEN typeof(g.consumed_enrollment_id) = 'text'
+		                  AND octet_length(g.consumed_enrollment_id) = ? THEN g.consumed_enrollment_id END,
+		       octet_length(e.enrollment_id),
+		       CASE WHEN typeof(e.enrollment_id) = 'text'
+		                  AND octet_length(e.enrollment_id) = ? THEN e.enrollment_id END
+		FROM enrollment_grants g
+		LEFT JOIN enrollments e ON e.enrollment_id = g.consumed_enrollment_id
+		ORDER BY g.grant_hash`, maxUUIDBytes, maxUUIDBytes)
+	if err != nil {
+		return invalidPersistentState("read enrollment grants")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var grantHash, bootID []byte
+		var grantHashLength, bootIDLength int64
+		var expiresAt int64
+		var consumedID, matchedID sql.NullString
+		var consumedLength, matchedLength sql.NullInt64
+		if rows.Scan(&grantHashLength, &grantHash, &bootIDLength, &bootID, &expiresAt, &consumedLength, &consumedID, &matchedLength, &matchedID) != nil ||
+			!boundedRequiredBytes(grantHashLength, grantHash, 32) || grantHashLength != 32 ||
+			!boundedRequiredBytes(bootIDLength, bootID, 16) || bootIDLength != 16 ||
+			!boundedOptionalText(consumedLength, consumedID, maxUUIDBytes) || consumedLength.Valid && consumedLength.Int64 != maxUUIDBytes ||
+			consumedID.Valid && validateUUID(consumedID.String) != nil ||
+			!boundedOptionalText(matchedLength, matchedID, maxUUIDBytes) || matchedLength.Valid && matchedLength.Int64 != maxUUIDBytes ||
+			matchedID.Valid && validateUUID(matchedID.String) != nil ||
+			validateTimestamp(formatTimestamp(expiresAt)) != nil || consumedID.Valid != matchedID.Valid || consumedID.Valid && consumedID.String != matchedID.String {
+			return invalidPersistentState("invalid enrollment grant")
+		}
+	}
+	if rows.Err() != nil {
+		return invalidPersistentState("read enrollment grants")
+	}
+	return nil
+}
+
+const persistentChangesValidationQuery = `
+		SELECT octet_length(c.cursor),
+		       CASE WHEN typeof(c.cursor) = 'blob' AND octet_length(c.cursor) = 8 THEN c.cursor END,
+		       CASE WHEN typeof(c.kind) = 'text'
+		                  AND c.kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed') THEN c.kind END,
+		       c.received_at_ms,
+		       octet_length(c.record_revision_id),
+		       CASE WHEN typeof(c.record_revision_id) = 'text'
+		                  AND octet_length(c.record_revision_id) = ? THEN c.record_revision_id END,
+		       octet_length(c.collection_marker_record_id),
+		       CASE WHEN typeof(c.collection_marker_record_id) = 'text'
+		                  AND octet_length(c.collection_marker_record_id) = ? THEN c.collection_marker_record_id END,
+		       length(c.collection_marker_json),
+		       CASE WHEN length(c.collection_marker_json) BETWEEN 1 AND ? THEN c.collection_marker_json END,
+		       octet_length(c.device_changed_id),
+		       CASE WHEN typeof(c.device_changed_id) = 'text'
+		                  AND octet_length(c.device_changed_id) = ? THEN c.device_changed_id END,
+		       octet_length(c.device_change_kind),
+		       CASE WHEN typeof(c.device_change_kind) = 'text'
+		                  AND c.device_change_kind IN ('enrolled', 'revoked') THEN c.device_change_kind END,
+		       r.retained,
+		       CASE WHEN typeof(p.kind) = 'text'
+		                  AND p.kind IN ('record_revision', 'collection_marker', 'envelope_changed', 'device_changed') THEN p.kind END,
+		       CASE WHEN m.record_id IS NULL THEN 0 ELSE 1 END,
+		       octet_length(m.change_cursor),
+		       CASE WHEN typeof(m.change_cursor) = 'blob'
+		                  AND octet_length(m.change_cursor) = 8 THEN m.change_cursor END,
+		       CASE WHEN m.record_id IS NULL THEN 0
+		            WHEN m.change_cursor = c.cursor THEN
+		                 CASE WHEN typeof(m.marker_json) = 'blob' AND length(m.marker_json) BETWEEN 1 AND ?
+		                            AND m.marker_json = c.collection_marker_json THEN 1 ELSE -1 END
+		            ELSE 0 END
+		FROM changes c LEFT JOIN record_revisions r
+		  ON r.revision_id = c.record_revision_id
+		LEFT JOIN change_origins p ON p.cursor = c.cursor
+		LEFT JOIN collection_markers m ON m.record_id = c.collection_marker_record_id
+		ORDER BY c.cursor`
+
+func validatePersistentChanges(ctx context.Context, query schemaQueryer, devices map[string]validatedDeviceRow, serverCursor uint64) error {
+	var floorBytes []byte
+	var floorLength int64
+	if query.QueryRowContext(ctx, `
+		SELECT octet_length(cursor_floor),
+		       CASE WHEN typeof(cursor_floor) = 'blob' AND octet_length(cursor_floor) = 8 THEN cursor_floor END
+		FROM runtime_state WHERE singleton = 1`,
+	).Scan(&floorLength, &floorBytes) != nil || !boundedRequiredBytes(floorLength, floorBytes, 8) || floorLength != 8 {
+		return invalidPersistentState("read cursor floor")
+	}
+	floor, err := DecodeUint64(floorBytes)
+	if err != nil || floor > serverCursor {
+		return invalidPersistentState("invalid cursor floor")
+	}
+	rows, err := query.QueryContext(ctx, persistentChangesValidationQuery,
+		maxUUIDBytes, maxUUIDBytes, maxBodyBytes, maxUUIDBytes, maxBodyBytes)
+	if err != nil {
+		return invalidPersistentState("read change rows")
+	}
+	defer rows.Close()
+	previous := uint64(0)
+	retainedCursor := floor
+	enrollmentChanges := make(map[string]struct{}, len(devices))
+	revocationChanges := make(map[string]uint64, len(devices))
+	for rows.Next() {
+		var cursorBytes, markerBody, currentMarkerCursorBytes []byte
+		var cursorLength int64
+		var kind sql.NullString
+		var receivedAt int64
+		var revisionID, markerID, changedDeviceID, deviceChangeKind sql.NullString
+		var revisionIDLength, markerIDLength, markerBodyLength, changedDeviceIDLength, deviceChangeKindLength sql.NullInt64
+		var currentMarkerCursorLength sql.NullInt64
+		var revisionRetained sql.NullInt64
+		var originKind sql.NullString
+		var currentMarkerState, currentMarkerBodyState int
+		if rows.Scan(
+			&cursorLength, &cursorBytes, &kind, &receivedAt,
+			&revisionIDLength, &revisionID, &markerIDLength, &markerID,
+			&markerBodyLength, &markerBody,
+			&changedDeviceIDLength, &changedDeviceID,
+			&deviceChangeKindLength, &deviceChangeKind,
+			&revisionRetained, &originKind,
+			&currentMarkerState, &currentMarkerCursorLength, &currentMarkerCursorBytes, &currentMarkerBodyState,
+		) != nil ||
+			!boundedRequiredBytes(cursorLength, cursorBytes, 8) || cursorLength != 8 ||
+			!boundedOptionalText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength.Valid && revisionIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalText(markerIDLength, markerID, maxUUIDBytes) || markerIDLength.Valid && markerIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalBytes(markerBodyLength, markerBody, maxBodyBytes) ||
+			!boundedOptionalText(changedDeviceIDLength, changedDeviceID, maxUUIDBytes) || changedDeviceIDLength.Valid && changedDeviceIDLength.Int64 != maxUUIDBytes ||
+			!boundedOptionalText(deviceChangeKindLength, deviceChangeKind, 8) ||
+			currentMarkerState < 0 || currentMarkerState > 1 ||
+			!boundedOptionalBytes(currentMarkerCursorLength, currentMarkerCursorBytes, 8) || currentMarkerCursorLength.Valid && currentMarkerCursorLength.Int64 != 8 ||
+			currentMarkerBodyState < -1 || currentMarkerBodyState > 1 {
+			return invalidPersistentState("invalid change row")
+		}
+		if !kind.Valid || !originKind.Valid || originKind.String != kind.String {
+			return invalidPersistentState("change row does not match durable origin")
+		}
+		cursor, err := DecodeUint64(cursorBytes)
+		if err != nil || cursor == 0 || cursor <= previous || cursor > serverCursor || validateTimestamp(formatTimestamp(receivedAt)) != nil {
+			return invalidPersistentState("invalid change cursor")
+		}
+		if cursor > floor {
+			if retainedCursor == math.MaxUint64 || cursor != retainedCursor+1 {
+				return invalidPersistentState("retained change cursor gap")
+			}
+			retainedCursor = cursor
+		}
+		switch kind.String {
+		case "record_revision":
+			if !revisionID.Valid || markerID.Valid || markerBody != nil || changedDeviceID.Valid || deviceChangeKind.Valid || validateUUID(revisionID.String) != nil {
+				return invalidPersistentState("invalid revision change")
+			}
+			if !revisionRetained.Valid || revisionRetained.Int64 != 1 {
+				return invalidPersistentState("orphan revision change")
+			}
+		case "collection_marker":
+			marker, markerErr := decodeStoredCollectionMarker(markerBody)
+			currentMarkerCursor, currentMarkerCursorErr := DecodeUint64(currentMarkerCursorBytes)
+			if revisionID.Valid || !markerID.Valid || changedDeviceID.Valid || deviceChangeKind.Valid || markerErr != nil || marker.RecordID != markerID.String ||
+				currentMarkerState != 1 || !currentMarkerCursorLength.Valid || currentMarkerCursorErr != nil || currentMarkerCursor < cursor ||
+				currentMarkerBodyState != boolToInt(currentMarkerCursor == cursor) {
+				return invalidPersistentState("invalid marker change")
+			}
+		case "envelope_changed":
+			if revisionID.Valid || markerID.Valid || markerBody != nil || changedDeviceID.Valid || deviceChangeKind.Valid {
+				return invalidPersistentState("invalid metadata change")
+			}
+		case "device_changed":
+			device, exists := devices[changedDeviceID.String]
+			if revisionID.Valid || markerID.Valid || markerBody != nil || !changedDeviceID.Valid || !deviceChangeKind.Valid ||
+				validateUUID(changedDeviceID.String) != nil || !exists {
+				return invalidPersistentState("invalid device change")
+			}
+			switch deviceChangeKind.String {
+			case "enrolled":
+				if cursor != device.createdCursor || receivedAt != device.createdAt {
+					return invalidPersistentState("device enrollment history mismatch")
+				}
+				if _, duplicate := enrollmentChanges[changedDeviceID.String]; duplicate {
+					return invalidPersistentState("duplicate device enrollment change")
+				}
+				enrollmentChanges[changedDeviceID.String] = struct{}{}
+			case "revoked":
+				if !device.revoked || receivedAt != device.revokedAt || cursor <= device.createdCursor ||
+					!device.baselineRevoked && cursor != device.revokedCursor {
+					return invalidPersistentState("device revocation history mismatch")
+				}
+				if _, duplicate := revocationChanges[changedDeviceID.String]; duplicate {
+					return invalidPersistentState("duplicate device revocation change")
+				}
+				revocationChanges[changedDeviceID.String] = cursor
+			default:
+				return invalidPersistentState("invalid device change kind")
+			}
+		default:
+			return invalidPersistentState("invalid change kind")
+		}
+		previous = cursor
+	}
+	if rows.Err() != nil {
+		return invalidPersistentState("read change rows")
+	}
+	if retainedCursor != serverCursor {
+		return invalidPersistentState("retained change cursor gap")
+	}
+	for deviceID, device := range devices {
+		_, enrolled := enrollmentChanges[deviceID]
+		if enrolled != (device.createdCursor != 0) {
+			return invalidPersistentState("device enrollment change mismatch")
+		}
+		_, revoked := revocationChanges[deviceID]
+		expectedRevocation := device.revoked && !device.baselineRevoked
+		if revoked != expectedRevocation {
+			return invalidPersistentState("device revocation change mismatch")
+		}
+	}
+	return nil
+}
+
+func validatePersistentReceipts(ctx context.Context, query schemaQueryer, identity Identity, devices map[string]validatedDeviceRow) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(device_id),
+		       CASE WHEN typeof(device_id) = 'text'
+		                  AND octet_length(device_id) = ? THEN device_id END,
+		       octet_length(operation),
+		       CASE WHEN typeof(operation) = 'text'
+		                  AND octet_length(operation) BETWEEN 1 AND ? THEN operation END,
+		       octet_length(request_id),
+		       CASE WHEN typeof(request_id) = 'text'
+		                  AND octet_length(request_id) = ? THEN request_id END,
+		       octet_length(request_fingerprint),
+		       CASE WHEN typeof(request_fingerprint) = 'blob'
+		                  AND octet_length(request_fingerprint) = 32 THEN request_fingerprint END,
+		       response_status,
+		       length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END,
+		       created_at_ms,
+		       octet_length(created_uptime_ms),
+		       CASE WHEN typeof(created_uptime_ms) = 'blob'
+		                  AND octet_length(created_uptime_ms) = 8 THEN created_uptime_ms END
+		FROM operation_receipts ORDER BY receipt_sequence`, maxUUIDBytes, maxOperationBytes, maxUUIDBytes, maxBodyBytes)
+	if err != nil {
+		return invalidPersistentState("read operation receipts")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var deviceID, operation, requestID sql.NullString
+		var fingerprint, body, uptimeBytes []byte
+		var deviceIDLength, operationLength, requestIDLength, fingerprintLength, bodyLength, uptimeLength int64
+		var status int
+		var createdAt int64
+		if rows.Scan(&deviceIDLength, &deviceID, &operationLength, &operation, &requestIDLength, &requestID, &fingerprintLength, &fingerprint, &status, &bodyLength, &body, &createdAt, &uptimeLength, &uptimeBytes) != nil ||
+			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			!boundedRequiredText(requestIDLength, requestID, maxUUIDBytes) || requestIDLength != maxUUIDBytes || validateUUID(requestID.String) != nil ||
+			!boundedRequiredBytes(fingerprintLength, fingerprint, 32) || fingerprintLength != 32 || !deviceExists(devices, deviceID.String) ||
+			!boundedRequiredText(operationLength, operation, maxOperationBytes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
+			!boundedRequiredBytes(uptimeLength, uptimeBytes, 8) || uptimeLength != 8 ||
+			validateTimestamp(formatTimestamp(createdAt)) != nil || validateStoredOperationResponse(operation.String, status, body, identity) != nil {
+			return invalidPersistentState("invalid operation receipt")
+		}
+		if _, err := DecodeUint64(uptimeBytes); err != nil {
+			return invalidPersistentState("invalid operation receipt uptime")
+		}
+	}
+	if rows.Err() != nil {
+		return invalidPersistentState("read operation receipts")
+	}
+	return nil
+}
+
+func validatePersistentReceiptRetention(ctx context.Context, query schemaQueryer) error {
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(q.device_id),
+		       CASE WHEN typeof(q.device_id) = 'text'
+		                  AND octet_length(q.device_id) = ? THEN q.device_id END,
+		       CASE WHEN typeof(q.receipt_class) = 'text'
+		                  AND q.receipt_class IN ('sync', 'other') THEN q.receipt_class END,
+		       q.receipt_sequence,
+		       octet_length(q.created_uptime_ms),
+		       CASE WHEN typeof(q.created_uptime_ms) = 'blob'
+		                  AND octet_length(q.created_uptime_ms) = 8 THEN q.created_uptime_ms END,
+		       octet_length(r.device_id),
+		       CASE WHEN typeof(r.device_id) = 'text'
+		                  AND octet_length(r.device_id) = ? THEN r.device_id END,
+		       octet_length(r.operation),
+		       CASE WHEN typeof(r.operation) = 'text'
+		                  AND octet_length(r.operation) BETWEEN 1 AND ? THEN r.operation END,
+		       octet_length(r.created_uptime_ms),
+		       CASE WHEN typeof(r.created_uptime_ms) = 'blob'
+		                  AND octet_length(r.created_uptime_ms) = 8 THEN r.created_uptime_ms END
+		FROM operation_receipt_retention q
+		LEFT JOIN operation_receipts r ON r.receipt_sequence = q.receipt_sequence
+		ORDER BY q.device_id, q.receipt_class, q.receipt_sequence`, maxUUIDBytes, maxUUIDBytes, maxOperationBytes)
+	if err != nil {
+		return invalidPersistentState("read operation receipt retention")
+	}
+	for rows.Next() {
+		var sequence int64
+		var uptimeBytes, receiptUptime []byte
+		var deviceID, receiptClass, receiptDevice, operation sql.NullString
+		var deviceIDLength, uptimeLength int64
+		var receiptDeviceLength, operationLength, receiptUptimeLength sql.NullInt64
+		if rows.Scan(&deviceIDLength, &deviceID, &receiptClass, &sequence, &uptimeLength, &uptimeBytes, &receiptDeviceLength, &receiptDevice, &operationLength, &operation, &receiptUptimeLength, &receiptUptime) != nil ||
+			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			!boundedOptionalText(receiptDeviceLength, receiptDevice, maxUUIDBytes) || !receiptDeviceLength.Valid || validateUUID(receiptDevice.String) != nil ||
+			!boundedRequiredBytes(uptimeLength, uptimeBytes, 8) || uptimeLength != 8 ||
+			!boundedOptionalBytes(receiptUptimeLength, receiptUptime, 8) || !receiptUptimeLength.Valid || receiptUptimeLength.Int64 != 8 ||
+			!receiptClass.Valid || sequence <= 0 || decodeUint64Error(uptimeBytes) != nil || receiptDevice.String != deviceID.String ||
+			!boundedOptionalText(operationLength, operation, maxOperationBytes) || !operationLength.Valid || !bytes.Equal(uptimeBytes, receiptUptime) ||
+			(receiptClass.String == "sync") != (operation.String == "sync") {
+			rows.Close()
+			return invalidPersistentState("invalid operation receipt retention")
+		}
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return invalidPersistentState("read operation receipt retention")
+	}
+	var missing int
+	if query.QueryRowContext(ctx, `
+		SELECT count(*) FROM operation_receipts r
+		WHERE NOT EXISTS (
+			SELECT 1 FROM operation_receipt_retention q
+			WHERE q.receipt_sequence = r.receipt_sequence
+		)`).Scan(&missing) != nil || missing != 0 {
+		return invalidPersistentState("operation receipt retention is incomplete")
+	}
+	return nil
+}
+
+func deviceExists(devices map[string]validatedDeviceRow, deviceID string) bool {
+	_, exists := devices[deviceID]
+	return exists
+}
+
+func validatePersistentEnrollmentsAndRotations(ctx context.Context, query schemaQueryer, identity Identity, devices map[string]validatedDeviceRow) error {
+	wantScopes, _ := json.Marshal(auth.FixedScopes())
+	enrollmentRows, err := query.QueryContext(ctx, `
+		SELECT octet_length(enrollment_id),
+		       CASE WHEN typeof(enrollment_id) = 'text'
+		                  AND octet_length(enrollment_id) = ? THEN enrollment_id END,
+		       octet_length(device_id),
+		       CASE WHEN typeof(device_id) = 'text'
+		                  AND octet_length(device_id) = ? THEN device_id END,
+		       octet_length(created_cursor),
+		       CASE WHEN typeof(created_cursor) = 'blob' AND octet_length(created_cursor) = 8 THEN created_cursor END,
+		       octet_length(token_hash),
+		       CASE WHEN typeof(token_hash) = 'blob' AND octet_length(token_hash) = 32 THEN token_hash END,
+		       octet_length(scopes_json),
+		       CASE WHEN typeof(scopes_json) = 'text'
+		                  AND octet_length(scopes_json) = ? THEN scopes_json END,
+		       octet_length(request_fingerprint),
+		       CASE WHEN typeof(request_fingerprint) = 'blob' AND octet_length(request_fingerprint) = 32 THEN request_fingerprint END,
+		       length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END,
+		       created_status
+		FROM enrollments ORDER BY enrollment_id`, maxUUIDBytes, maxUUIDBytes, len(wantScopes), maxBodyBytes)
+	if err != nil {
+		return invalidPersistentState("read enrollment rows")
+	}
+	enrolledDevices := make(map[string]struct{}, len(devices))
+	for enrollmentRows.Next() {
+		var enrollmentID, deviceID, scopesJSON sql.NullString
+		var createdCursorBytes, tokenHash, fingerprint, body []byte
+		var enrollmentIDLength, deviceIDLength, createdCursorLength, tokenHashLength, scopesLength, fingerprintLength, bodyLength int64
+		var status int
+		if enrollmentRows.Scan(&enrollmentIDLength, &enrollmentID, &deviceIDLength, &deviceID, &createdCursorLength, &createdCursorBytes, &tokenHashLength, &tokenHash, &scopesLength, &scopesJSON, &fingerprintLength, &fingerprint, &bodyLength, &body, &status) != nil ||
+			!boundedRequiredText(enrollmentIDLength, enrollmentID, maxUUIDBytes) || enrollmentIDLength != maxUUIDBytes || validateUUID(enrollmentID.String) != nil ||
+			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			!boundedRequiredBytes(createdCursorLength, createdCursorBytes, 8) || createdCursorLength != 8 ||
+			!boundedRequiredBytes(tokenHashLength, tokenHash, 32) || tokenHashLength != 32 ||
+			!boundedRequiredBytes(fingerprintLength, fingerprint, 32) || fingerprintLength != 32 ||
+			!deviceExists(devices, deviceID.String) ||
+			!boundedRequiredText(scopesLength, scopesJSON, len(wantScopes)) || scopesJSON.String != string(wantScopes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
+			status != http.StatusCreated || validateStoredEnrollmentResponse(body, identity, deviceID.String) != nil {
+			enrollmentRows.Close()
+			return invalidPersistentState("invalid enrollment row")
+		}
+		createdCursor, cursorErr := DecodeUint64(createdCursorBytes)
+		if cursorErr != nil || createdCursor == 0 || devices[deviceID.String].createdCursor != createdCursor {
+			enrollmentRows.Close()
+			return invalidPersistentState("invalid enrollment cursor")
+		}
+		enrolledDevices[deviceID.String] = struct{}{}
+	}
+	if enrollmentRows.Err() != nil || enrollmentRows.Close() != nil {
+		return invalidPersistentState("read enrollment rows")
+	}
+	for deviceID, device := range devices {
+		_, enrolled := enrolledDevices[deviceID]
+		if enrolled != (device.createdCursor != 0) {
+			return invalidPersistentState("device enrollment provenance mismatch")
+		}
+	}
+
+	rotationRows, err := query.QueryContext(ctx, `
+		SELECT octet_length(rotation_id),
+		       CASE WHEN typeof(rotation_id) = 'text'
+		                  AND octet_length(rotation_id) = ? THEN rotation_id END,
+		       octet_length(device_id),
+		       CASE WHEN typeof(device_id) = 'text'
+		                  AND octet_length(device_id) = ? THEN device_id END,
+		       octet_length(old_token_hash),
+		       CASE WHEN typeof(old_token_hash) = 'blob' AND octet_length(old_token_hash) = 32 THEN old_token_hash END,
+		       octet_length(new_token_hash),
+		       CASE WHEN typeof(new_token_hash) = 'blob' AND octet_length(new_token_hash) = 32 THEN new_token_hash END,
+		       octet_length(request_fingerprint),
+		       CASE WHEN typeof(request_fingerprint) = 'blob' AND octet_length(request_fingerprint) = 32 THEN request_fingerprint END,
+		       length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END,
+		       created_at_ms
+		FROM token_rotations ORDER BY rotation_id`, maxUUIDBytes, maxUUIDBytes, maxBodyBytes)
+	if err != nil {
+		return invalidPersistentState("read rotation rows")
+	}
+	for rotationRows.Next() {
+		var rotationID, deviceID sql.NullString
+		var oldHash, newHash, fingerprint, body []byte
+		var rotationIDLength, deviceIDLength, oldHashLength, newHashLength, fingerprintLength, bodyLength int64
+		var createdAt int64
+		var response device
+		if rotationRows.Scan(&rotationIDLength, &rotationID, &deviceIDLength, &deviceID, &oldHashLength, &oldHash, &newHashLength, &newHash, &fingerprintLength, &fingerprint, &bodyLength, &body, &createdAt) != nil ||
+			!boundedRequiredText(rotationIDLength, rotationID, maxUUIDBytes) || rotationIDLength != maxUUIDBytes || validateUUID(rotationID.String) != nil ||
+			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			!deviceExists(devices, deviceID.String) ||
+			!boundedRequiredBytes(oldHashLength, oldHash, 32) || oldHashLength != 32 ||
+			!boundedRequiredBytes(newHashLength, newHash, 32) || newHashLength != 32 ||
+			!boundedRequiredBytes(fingerprintLength, fingerprint, 32) || fingerprintLength != 32 ||
+			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) || validateTimestamp(formatTimestamp(createdAt)) != nil ||
+			decodeStoredCanonical(body, &response) != nil || validateDevice(response) != nil || response.DeviceID != deviceID.String {
+			rotationRows.Close()
+			return invalidPersistentState("invalid token rotation row")
+		}
+	}
+	if rotationRows.Err() != nil || rotationRows.Close() != nil {
+		return invalidPersistentState("read rotation rows")
+	}
+
+	selfRows, err := query.QueryContext(ctx, `
+		SELECT octet_length(device_id),
+		       CASE WHEN typeof(device_id) = 'text'
+		                  AND octet_length(device_id) = ? THEN device_id END,
+		       octet_length(request_id),
+		       CASE WHEN typeof(request_id) = 'text'
+		                  AND octet_length(request_id) = ? THEN request_id END,
+		       octet_length(body_fingerprint),
+		       CASE WHEN typeof(body_fingerprint) = 'blob' AND octet_length(body_fingerprint) = 32 THEN body_fingerprint END,
+		       octet_length(pre_revocation_token_hash),
+		       CASE WHEN typeof(pre_revocation_token_hash) = 'blob' AND octet_length(pre_revocation_token_hash) = 32 THEN pre_revocation_token_hash END,
+		       response_status, length(response_headers_json),
+		       CASE WHEN length(response_headers_json) BETWEEN 1 AND ? THEN response_headers_json END,
+		       length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
+		FROM self_revocation_receipts ORDER BY device_id`, maxUUIDBytes, maxUUIDBytes, maxBodyBytes, maxBodyBytes)
+	if err != nil {
+		return invalidPersistentState("read self-revocation receipts")
+	}
+	for selfRows.Next() {
+		var deviceID, requestID sql.NullString
+		var fingerprint, tokenHash, headersBody, body []byte
+		var deviceIDLength, requestIDLength, fingerprintLength, tokenHashLength, headersLength, bodyLength int64
+		var status int
+		var headers []api.Header
+		var response device
+		if selfRows.Scan(&deviceIDLength, &deviceID, &requestIDLength, &requestID, &fingerprintLength, &fingerprint, &tokenHashLength, &tokenHash, &status, &headersLength, &headersBody, &bodyLength, &body) != nil ||
+			!boundedRequiredText(deviceIDLength, deviceID, maxUUIDBytes) || validateUUID(deviceID.String) != nil ||
+			!boundedRequiredText(requestIDLength, requestID, maxUUIDBytes) || requestIDLength != maxUUIDBytes || validateUUID(requestID.String) != nil ||
+			!boundedRequiredBytes(fingerprintLength, fingerprint, 32) || fingerprintLength != 32 ||
+			!boundedRequiredBytes(tokenHashLength, tokenHash, 32) || tokenHashLength != 32 ||
+			!devices[deviceID.String].revoked || status != http.StatusOK ||
+			!boundedRequiredBytes(headersLength, headersBody, maxBodyBytes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
+			json.Unmarshal(headersBody, &headers) != nil || !slices.Equal(headers, api.V1ResponseHeaders(requestID.String, len(body))) ||
+			decodeStoredCanonical(body, &response) != nil || validateDevice(response) != nil || response.DeviceID != deviceID.String || response.Status != "revoked" {
+			selfRows.Close()
+			return invalidPersistentState("invalid self-revocation receipt")
+		}
+		canonicalHeaders, _ := json.Marshal(headers)
+		if !bytes.Equal(canonicalHeaders, headersBody) {
+			selfRows.Close()
+			return invalidPersistentState("noncanonical self-revocation headers")
+		}
+	}
+	if selfRows.Err() != nil || selfRows.Close() != nil {
+		return invalidPersistentState("read self-revocation receipts")
+	}
+	return nil
+}
+
+func validatePersistentSnapshots(ctx context.Context, query schemaQueryer, identity Identity, devices map[string]validatedDeviceRow, serverCursor, envelopeGeneration, collectionGeneration uint64) error {
+	type validatedSnapshot struct {
+		ownerID              string
+		requestID            string
+		cutCursor            uint64
+		envelopeGeneration   uint64
+		collectionGeneration uint64
+		expiresAt            int64
+		metadataBytes        int64
+		createBodyLength     int64
+		createBody           []byte
+		create               snapshotCreateResponse
+		pages                []storedSnapshotPage
+		pageBodyLengths      []int64
+		references           []snapshotRevisionReference
+		referenceRecordIDs   map[string]string
+		sourceCounters       map[string]uint64
+		markerBodies         map[string][]byte
+		orderedRevisionIDs   []string
+		validationAccount    snapshotMetadataAccounting
+	}
+	snapshots := make(map[string]*validatedSnapshot)
+	snapshotCuts := make([]uint64, 0, 8)
+	ownerCounts := make(map[string]int)
+	declaredMetadata := int64(0)
+	rows, err := query.QueryContext(ctx, `
+		SELECT octet_length(snapshot_id),
+		       CASE WHEN typeof(snapshot_id) = 'text'
+		                  AND octet_length(snapshot_id) = ? THEN snapshot_id END,
+		       octet_length(owner_device_id),
+		       CASE WHEN typeof(owner_device_id) = 'text'
+		                  AND octet_length(owner_device_id) = ? THEN owner_device_id END,
+		       octet_length(request_id),
+		       CASE WHEN typeof(request_id) = 'text'
+		                  AND octet_length(request_id) = ? THEN request_id END,
+		       octet_length(request_fingerprint),
+		       CASE WHEN typeof(request_fingerprint) = 'blob'
+		                  AND octet_length(request_fingerprint) = 32 THEN request_fingerprint END,
+		       octet_length(cut_cursor),
+		       CASE WHEN typeof(cut_cursor) = 'blob' AND octet_length(cut_cursor) = 8 THEN cut_cursor END,
+		       octet_length(envelope_generation),
+		       CASE WHEN typeof(envelope_generation) = 'blob' AND octet_length(envelope_generation) = 8 THEN envelope_generation END,
+		       octet_length(collection_generation),
+		       CASE WHEN typeof(collection_generation) = 'blob' AND octet_length(collection_generation) = 8 THEN collection_generation END,
+		       expires_at_ms, metadata_bytes, length(create_response_json)
+		FROM snapshots ORDER BY snapshot_id`, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes)
+	if err != nil {
+		return invalidPersistentState("read snapshots")
+	}
+	for rows.Next() {
+		var snapshotID, ownerID, requestID sql.NullString
+		var fingerprint, cutBytes, generationBytes, snapshotCollectionBytes []byte
+		var snapshotIDLength, ownerIDLength, requestIDLength, fingerprintLength int64
+		var cutLength, generationLength, snapshotCollectionLength int64
+		var expiresAt, metadataBytes, createBodyLength int64
+		if rows.Scan(
+			&snapshotIDLength, &snapshotID, &ownerIDLength, &ownerID, &requestIDLength, &requestID,
+			&fingerprintLength, &fingerprint, &cutLength, &cutBytes, &generationLength, &generationBytes,
+			&snapshotCollectionLength, &snapshotCollectionBytes, &expiresAt, &metadataBytes, &createBodyLength,
+		) != nil ||
+			!boundedRequiredText(snapshotIDLength, snapshotID, maxUUIDBytes) || snapshotIDLength != maxUUIDBytes || validateUUID(snapshotID.String) != nil ||
+			!boundedRequiredText(requestIDLength, requestID, maxUUIDBytes) || requestIDLength != maxUUIDBytes || validateUUID(requestID.String) != nil ||
+			!boundedRequiredText(ownerIDLength, ownerID, maxUUIDBytes) || validateUUID(ownerID.String) != nil || !deviceExists(devices, ownerID.String) ||
+			!boundedRequiredBytes(fingerprintLength, fingerprint, 32) || fingerprintLength != 32 ||
+			!boundedRequiredBytes(cutLength, cutBytes, 8) || cutLength != 8 ||
+			!boundedRequiredBytes(generationLength, generationBytes, 8) || generationLength != 8 ||
+			!boundedRequiredBytes(snapshotCollectionLength, snapshotCollectionBytes, 8) || snapshotCollectionLength != 8 ||
+			metadataBytes < 0 || metadataBytes > snapshotMetadataLimit || len(snapshots) >= 8 {
+			rows.Close()
+			return invalidPersistentState("invalid snapshot row")
+		}
+		cut, cutErr := DecodeUint64(cutBytes)
+		generation, generationErr := DecodeUint64(generationBytes)
+		snapshotCollectionGeneration, snapshotCollectionErr := DecodeUint64(snapshotCollectionBytes)
+		owner := devices[ownerID.String]
+		if cutErr != nil || generationErr != nil || snapshotCollectionErr != nil ||
+			cut > serverCursor || snapshotCollectionGeneration > collectionGeneration || owner.createdCursor != 0 && owner.createdCursor > cut {
+			rows.Close()
+			return invalidPersistentState("inconsistent snapshot row")
+		}
+		if createBodyLength <= 0 || createBodyLength > metadataBytes || createBodyLength > maxBodyBytes {
+			rows.Close()
+			return invalidPersistentState("snapshot create response exceeds declared metadata")
+		}
+		if metadataBytes > snapshotMetadataLimit-declaredMetadata {
+			rows.Close()
+			return invalidPersistentState("active snapshot metadata exceeds limit")
+		}
+		validationAccount := snapshotMetadataAccounting{}
+		accountSnapshotBase(&validationAccount, snapshotID.String, ownerID.String, requestID.String, nil)
+		validationAccount.addLength64(createBodyLength)
+		if !validationAccount.ok() || validationAccount.total > metadataBytes {
+			rows.Close()
+			return invalidPersistentState("snapshot metadata undercounts base row")
+		}
+		declaredMetadata += metadataBytes
+		ownerCounts[ownerID.String]++
+		if ownerCounts[ownerID.String] > 1 {
+			rows.Close()
+			return invalidPersistentState("multiple active snapshots for one owner")
+		}
+		snapshots[snapshotID.String] = &validatedSnapshot{
+			ownerID: ownerID.String, requestID: requestID.String, cutCursor: cut, envelopeGeneration: generation,
+			collectionGeneration: snapshotCollectionGeneration,
+			expiresAt:            expiresAt, metadataBytes: metadataBytes, createBodyLength: createBodyLength,
+			referenceRecordIDs: make(map[string]string),
+			sourceCounters:     make(map[string]uint64),
+			markerBodies:       make(map[string][]byte), validationAccount: validationAccount,
+		}
+		snapshotCuts = append(snapshotCuts, cut)
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		return invalidPersistentState("read snapshots")
+	}
+	generationsAtCut, err := validatePersistentChangeOrigins(ctx, query, serverCursor, envelopeGeneration, snapshotCuts)
+	if err != nil {
+		return err
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.envelopeGeneration != generationsAtCut[snapshot.cutCursor] {
+			return invalidPersistentState("snapshot envelope generation does not match cut")
+		}
+	}
+
+	createRows, err := query.QueryContext(ctx, `
+		SELECT octet_length(snapshot_id),
+		       CASE WHEN typeof(snapshot_id) = 'text'
+		                  AND octet_length(snapshot_id) = ? THEN snapshot_id END,
+		       length(create_response_json),
+		       CASE WHEN length(create_response_json) BETWEEN 1 AND ? THEN create_response_json END
+		FROM snapshots ORDER BY snapshot_id`, maxUUIDBytes, maxBodyBytes)
+	if err != nil {
+		return invalidPersistentState("read snapshot create responses")
+	}
+	createCount := 0
+	for createRows.Next() {
+		var snapshotID sql.NullString
+		var snapshotIDLength, bodyLength int64
+		var body []byte
+		if createRows.Scan(&snapshotIDLength, &snapshotID, &bodyLength, &body) != nil ||
+			!boundedRequiredText(snapshotIDLength, snapshotID, maxUUIDBytes) || snapshotIDLength != maxUUIDBytes || validateUUID(snapshotID.String) != nil {
+			createRows.Close()
+			return invalidPersistentState("invalid snapshot create response")
+		}
+		snapshot := snapshots[snapshotID.String]
+		if snapshot == nil || bodyLength != snapshot.createBodyLength || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
+			createRows.Close()
+			return invalidPersistentState("snapshot create response exceeds declared metadata")
+		}
+		var create snapshotCreateResponse
+		if validateStoredSnapshotCreateResponse(body, identity, snapshotID.String, snapshot.ownerID, snapshot.cutCursor, snapshot.envelopeGeneration, snapshot.expiresAt) != nil ||
+			decodeStoredCanonical(body, &create) != nil {
+			createRows.Close()
+			return invalidPersistentState("inconsistent snapshot row")
+		}
+		snapshot.createBody = body
+		snapshot.create = create
+		createCount++
+	}
+	if createRows.Err() != nil || createRows.Close() != nil || createCount != len(snapshots) {
+		return invalidPersistentState("read snapshot create responses")
+	}
+
+	pageRows, err := query.QueryContext(ctx, `
+		SELECT octet_length(snapshot_id),
+		       CASE WHEN typeof(snapshot_id) = 'text'
+		                  AND octet_length(snapshot_id) = ? THEN snapshot_id END,
+		       page_index, octet_length(page_token),
+		       CASE WHEN typeof(page_token) = 'text'
+		                  AND octet_length(page_token) = 43 THEN page_token END,
+		       length(response_json)
+		FROM snapshot_pages ORDER BY snapshot_id, page_index`, maxUUIDBytes)
+	if err != nil {
+		return invalidPersistentState("read snapshot pages")
+	}
+	for pageRows.Next() {
+		var snapshotID, token sql.NullString
+		var snapshotIDLength, index, tokenLength, bodyLength int64
+		if pageRows.Scan(&snapshotIDLength, &snapshotID, &index, &tokenLength, &token, &bodyLength) != nil ||
+			!boundedRequiredText(snapshotIDLength, snapshotID, maxUUIDBytes) || snapshotIDLength != maxUUIDBytes || validateUUID(snapshotID.String) != nil ||
+			!boundedRequiredText(tokenLength, token, 43) || tokenLength != 43 {
+			pageRows.Close()
+			return invalidPersistentState("invalid snapshot page")
+		}
+		snapshot := snapshots[snapshotID.String]
+		if snapshot == nil || index < 0 || index != int64(len(snapshot.pages)) || decodeBase64Token(token.String) != nil {
+			pageRows.Close()
+			return invalidPersistentState("invalid snapshot page")
+		}
+		if bodyLength <= 0 || bodyLength > snapshot.metadataBytes || bodyLength > maxBodyBytes {
+			pageRows.Close()
+			return invalidPersistentState("snapshot page response exceeds declared metadata")
+		}
+		accountSnapshotPage(&snapshot.validationAccount, snapshotID.String, len(snapshot.pages), token.String, nil)
+		snapshot.validationAccount.addLength64(bodyLength)
+		if !snapshot.validationAccount.ok() || snapshot.validationAccount.total > snapshot.metadataBytes {
+			pageRows.Close()
+			return invalidPersistentState("snapshot pages exceed declared metadata")
+		}
+		snapshot.pages = append(snapshot.pages, storedSnapshotPage{token: token.String})
+		snapshot.pageBodyLengths = append(snapshot.pageBodyLengths, bodyLength)
+	}
+	if pageRows.Err() != nil || pageRows.Close() != nil {
+		return invalidPersistentState("read snapshot pages")
+	}
+
+	pageBodyRows, err := query.QueryContext(ctx, `
+		SELECT octet_length(snapshot_id),
+		       CASE WHEN typeof(snapshot_id) = 'text'
+		                  AND octet_length(snapshot_id) = ? THEN snapshot_id END,
+		       page_index, length(response_json),
+		       CASE WHEN length(response_json) BETWEEN 1 AND ? THEN response_json END
+		FROM snapshot_pages ORDER BY snapshot_id, page_index`, maxUUIDBytes, maxBodyBytes)
+	if err != nil {
+		return invalidPersistentState("read snapshot page responses")
+	}
+	pageBodyCount := 0
+	for pageBodyRows.Next() {
+		var snapshotID sql.NullString
+		var snapshotIDLength, index, bodyLength int64
+		var body []byte
+		if pageBodyRows.Scan(&snapshotIDLength, &snapshotID, &index, &bodyLength, &body) != nil ||
+			!boundedRequiredText(snapshotIDLength, snapshotID, maxUUIDBytes) || snapshotIDLength != maxUUIDBytes || validateUUID(snapshotID.String) != nil {
+			pageBodyRows.Close()
+			return invalidPersistentState("invalid snapshot page response")
+		}
+		snapshot := snapshots[snapshotID.String]
+		if snapshot == nil || index < 0 || index >= int64(len(snapshot.pages)) || snapshot.pageBodyLengths[index] != bodyLength ||
+			!boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
+			pageBodyRows.Close()
+			return invalidPersistentState("snapshot page response exceeds declared metadata")
+		}
+		var descriptor snapshotPageDescriptor
+		if decodeStoredSnapshotPageDescriptor(body, &descriptor) != nil {
+			pageBodyRows.Close()
+			return invalidPersistentState("invalid snapshot page")
+		}
+		snapshot.pages[index].body = body
+		snapshot.pages[index].descriptor = descriptor
+		pageBodyCount++
+	}
+	if pageBodyRows.Err() != nil || pageBodyRows.Close() != nil {
+		return invalidPersistentState("read snapshot page responses")
+	}
+	pageCount := 0
+	for _, snapshot := range snapshots {
+		pageCount += len(snapshot.pages)
+	}
+	if pageBodyCount != pageCount {
+		return invalidPersistentState("snapshot page response count mismatch")
+	}
+	for _, snapshot := range snapshots {
+		if len(snapshot.pages) == 0 || snapshot.create.FirstPageToken != snapshot.pages[0].token {
+			return invalidPersistentState("snapshot has no valid first page")
+		}
+		for index, page := range snapshot.pages {
+			last := index+1 == len(snapshot.pages)
+			if last {
+				if page.descriptor.HasMore || page.descriptor.NextPageToken != nil {
+					return invalidPersistentState("snapshot final page is not terminal")
+				}
+			} else if !page.descriptor.HasMore || page.descriptor.NextPageToken == nil || *page.descriptor.NextPageToken != snapshot.pages[index+1].token {
+				return invalidPersistentState("snapshot page token chain is broken")
+			}
+			for _, source := range page.descriptor.SourceDevices {
+				counter, err := parseUint64(source.MaxAuthorCounter)
+				if err != nil {
+					return invalidPersistentState("invalid snapshot source counter")
+				}
+				if _, exists := snapshot.sourceCounters[source.DeviceID]; exists {
+					return invalidPersistentState("duplicate snapshot source device")
+				}
+				snapshot.sourceCounters[source.DeviceID] = counter
+			}
+		}
+		phase := -1
+		var previousMarkerID, previousSourceID string
+		for _, page := range snapshot.pages {
+			pagePhase := 3
+			switch {
+			case len(page.descriptor.RevisionIDs) != 0:
+				pagePhase = 0
+			case len(page.descriptor.CollectionMarkers) != 0:
+				pagePhase = 1
+			case len(page.descriptor.SourceDevices) != 0:
+				pagePhase = 2
+			}
+			if pagePhase == 3 && len(snapshot.pages) != 1 || pagePhase < phase {
+				return invalidPersistentState("invalid snapshot phase order")
+			}
+			phase = pagePhase
+			for _, revisionID := range page.descriptor.RevisionIDs {
+				snapshot.orderedRevisionIDs = append(snapshot.orderedRevisionIDs, revisionID)
+			}
+			for _, marker := range page.descriptor.CollectionMarkers {
+				if previousMarkerID != "" && previousMarkerID >= marker.RecordID {
+					return invalidPersistentState("snapshot markers are not globally ordered")
+				}
+				frontier, barrier, _, _ := validateCollectionMarker(marker)
+				if barrier > snapshot.cutCursor {
+					return invalidPersistentState("snapshot marker barrier exceeds cut")
+				}
+				markerBody, err := marshalJSON(marker)
+				if err != nil {
+					return invalidPersistentState("invalid snapshot marker")
+				}
+				snapshot.markerBodies[marker.RecordID] = markerBody
+				for deviceID, counter := range frontier {
+					maximum, exists := snapshot.sourceCounters[deviceID]
+					if !exists || counter > maximum {
+						return invalidPersistentState("snapshot marker exceeds source registry")
+					}
+				}
+				previousMarkerID = marker.RecordID
+			}
+			for _, source := range page.descriptor.SourceDevices {
+				if previousSourceID != "" && previousSourceID >= source.DeviceID {
+					return invalidPersistentState("snapshot sources are not globally ordered")
+				}
+				previousSourceID = source.DeviceID
+			}
+		}
+	}
+
+	refRows, err := query.QueryContext(ctx, `
+		SELECT octet_length(s.snapshot_id),
+		       CASE WHEN typeof(s.snapshot_id) = 'text'
+		                  AND octet_length(s.snapshot_id) = ? THEN s.snapshot_id END,
+		       octet_length(s.revision_id),
+		       CASE WHEN typeof(s.revision_id) = 'text'
+		                  AND octet_length(s.revision_id) = ? THEN s.revision_id END,
+		       octet_length(s.content_hash),
+		       CASE WHEN typeof(s.content_hash) = 'blob' AND octet_length(s.content_hash) = 32 THEN s.content_hash END,
+		       octet_length(r.revision_id),
+		       CASE WHEN typeof(r.revision_id) = 'text'
+		                  AND octet_length(r.revision_id) = ? THEN r.revision_id END,
+		       octet_length(r.record_id),
+		       CASE WHEN typeof(r.record_id) = 'text'
+		                  AND octet_length(r.record_id) = ? THEN r.record_id END,
+		       octet_length(r.author_device_id),
+		       CASE WHEN typeof(r.author_device_id) = 'text'
+		                  AND octet_length(r.author_device_id) = ? THEN r.author_device_id END,
+		       octet_length(r.author_counter),
+		       CASE WHEN typeof(r.author_counter) = 'blob' AND octet_length(r.author_counter) = 8 THEN r.author_counter END,
+		       length(r.vector_json),
+		       CASE WHEN length(r.vector_json) BETWEEN 1 AND ? THEN r.vector_json END,
+		       octet_length(r.collected_generation),
+		       CASE WHEN typeof(r.collected_generation) = 'blob'
+		                  AND octet_length(r.collected_generation) = 8 THEN r.collected_generation END,
+		       r.retained,
+		       octet_length(r.change_cursor),
+		       CASE WHEN typeof(r.change_cursor) = 'blob' AND octet_length(r.change_cursor) = 8 THEN r.change_cursor END,
+		       octet_length(o.content_hash),
+		       CASE WHEN typeof(o.content_hash) = 'blob' AND octet_length(o.content_hash) = 32 THEN o.content_hash END
+		FROM snapshot_revision_refs s
+		LEFT JOIN record_revisions r
+		  ON r.revision_id = s.revision_id AND r.content_hash = s.content_hash
+		LEFT JOIN revision_objects o ON o.content_hash = s.content_hash
+		ORDER BY s.snapshot_id, s.revision_id`, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes, maxVectorBytes)
+	if err != nil {
+		return invalidPersistentState("read snapshot refs")
+	}
+	for refRows.Next() {
+		var snapshotID, revisionID sql.NullString
+		var hashBytes, counterBytes, vectorBody, collectedBytes, changeCursorBytes, objectHash []byte
+		var matchingRevision, recordID, authorID sql.NullString
+		var snapshotIDLength, revisionIDLength, hashLength int64
+		var matchingRevisionLength, recordIDLength, authorIDLength, counterLength, vectorLength sql.NullInt64
+		var collectedLength, changeCursorLength, objectHashLength sql.NullInt64
+		var retained int
+		if refRows.Scan(
+			&snapshotIDLength, &snapshotID, &revisionIDLength, &revisionID, &hashLength, &hashBytes,
+			&matchingRevisionLength, &matchingRevision, &recordIDLength, &recordID, &authorIDLength, &authorID,
+			&counterLength, &counterBytes, &vectorLength, &vectorBody, &collectedLength, &collectedBytes, &retained,
+			&changeCursorLength, &changeCursorBytes, &objectHashLength, &objectHash,
+		) != nil {
+			refRows.Close()
+			return invalidPersistentState("invalid snapshot reference")
+		}
+		snapshot := snapshots[snapshotID.String]
+		counter, counterErr := DecodeUint64(counterBytes)
+		collectedGeneration := uint64(0)
+		var collectedErr error
+		if collectedBytes != nil {
+			collectedGeneration, collectedErr = DecodeUint64(collectedBytes)
+		}
+		var entries []vectorEntry
+		if snapshot == nil || !boundedRequiredText(snapshotIDLength, snapshotID, maxUUIDBytes) || snapshotIDLength != maxUUIDBytes || validateUUID(snapshotID.String) != nil ||
+			!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength != maxUUIDBytes || validateUUID(revisionID.String) != nil ||
+			!boundedRequiredBytes(hashLength, hashBytes, 32) || hashLength != 32 ||
+			!boundedOptionalText(matchingRevisionLength, matchingRevision, maxUUIDBytes) || !matchingRevisionLength.Valid || validateUUID(matchingRevision.String) != nil || matchingRevision.String != revisionID.String ||
+			!boundedOptionalText(recordIDLength, recordID, maxUUIDBytes) || !recordIDLength.Valid || validateUUID(recordID.String) != nil ||
+			!boundedOptionalText(authorIDLength, authorID, maxUUIDBytes) || !authorIDLength.Valid || validateUUID(authorID.String) != nil ||
+			!boundedOptionalBytes(counterLength, counterBytes, 8) || !counterLength.Valid || counterLength.Int64 != 8 || counterErr != nil ||
+			!boundedOptionalBytes(collectedLength, collectedBytes, 8) || collectedLength.Valid && collectedLength.Int64 != 8 ||
+			!boundedOptionalBytes(changeCursorLength, changeCursorBytes, 8) || !changeCursorLength.Valid || changeCursorLength.Int64 != 8 ||
+			!boundedOptionalBytes(objectHashLength, objectHash, 32) || !objectHashLength.Valid || objectHashLength.Int64 != 32 ||
+			collectedErr != nil || retained < 0 || retained > 1 || (retained == 0) != (collectedBytes != nil) ||
+			collectedBytes != nil && (collectedGeneration == 0 || collectedGeneration > collectionGeneration) ||
+			!boundedOptionalBytes(vectorLength, vectorBody, maxVectorBytes) || !vectorLength.Valid || json.Unmarshal(vectorBody, &entries) != nil || !bytes.Equal(objectHash, hashBytes) {
+			refRows.Close()
+			return invalidPersistentState("invalid snapshot reference")
+		}
+		if collectedGeneration != 0 && collectedGeneration <= snapshot.collectionGeneration {
+			refRows.Close()
+			return invalidPersistentState("snapshot reference was collected before snapshot")
+		}
+		changeCursor, changeCursorErr := DecodeUint64(changeCursorBytes)
+		if changeCursorErr != nil || changeCursor > snapshot.cutCursor {
+			refRows.Close()
+			return invalidPersistentState("snapshot reference accepted after cut")
+		}
+		vector, vectorErr := validateVector(entries)
+		if vectorErr != nil || vector[authorID.String] != counter {
+			refRows.Close()
+			return invalidPersistentState("invalid snapshot reference vector")
+		}
+		for deviceID, vectorCounter := range vector {
+			maximum, exists := snapshot.sourceCounters[deviceID]
+			if !exists || vectorCounter > maximum {
+				refRows.Close()
+				return invalidPersistentState("snapshot revision exceeds source registry")
+			}
+		}
+		var contentHash [32]byte
+		copy(contentHash[:], hashBytes)
+		reference := snapshotRevisionReference{revisionID: revisionID.String, contentHash: contentHash}
+		accountSnapshotReference(&snapshot.validationAccount, snapshotID.String, reference)
+		if !snapshot.validationAccount.ok() || snapshot.validationAccount.total > snapshot.metadataBytes {
+			refRows.Close()
+			return invalidPersistentState("snapshot references exceed declared metadata")
+		}
+		snapshot.references = append(snapshot.references, reference)
+		snapshot.referenceRecordIDs[revisionID.String] = recordID.String
+	}
+	if refRows.Err() != nil || refRows.Close() != nil {
+		return invalidPersistentState("read snapshot refs")
+	}
+	type snapshotCutFrontierItem struct {
+		id                  string
+		vector              map[string]uint64
+		tombstone           bool
+		collectedGeneration uint64
+	}
+	for _, snapshot := range snapshots {
+		encodedCut := EncodeUint64(snapshot.cutCursor)
+		referencesByRecord := make(map[string]map[string]struct{})
+		for revisionID, recordID := range snapshot.referenceRecordIDs {
+			if referencesByRecord[recordID] == nil {
+				referencesByRecord[recordID] = make(map[string]struct{})
+			}
+			referencesByRecord[recordID][revisionID] = struct{}{}
+		}
+		cutRows, err := query.QueryContext(ctx, `
+			SELECT octet_length(revision_id),
+			       CASE WHEN typeof(revision_id) = 'text'
+			                  AND octet_length(revision_id) = ? THEN revision_id END,
+			       octet_length(record_id),
+			       CASE WHEN typeof(record_id) = 'text'
+			                  AND octet_length(record_id) = ? THEN record_id END,
+			       octet_length(author_device_id),
+			       CASE WHEN typeof(author_device_id) = 'text'
+			                  AND octet_length(author_device_id) = ? THEN author_device_id END,
+			       octet_length(author_counter),
+			       CASE WHEN typeof(author_counter) = 'blob' AND octet_length(author_counter) = 8 THEN author_counter END,
+			       length(vector_json),
+			       CASE WHEN length(vector_json) BETWEEN 1 AND ? THEN vector_json END,
+			       tombstone,
+			       octet_length(collected_generation),
+			       CASE WHEN typeof(collected_generation) = 'blob'
+			                  AND octet_length(collected_generation) = 8 THEN collected_generation END,
+			       retained,
+			       octet_length(change_cursor),
+			       CASE WHEN typeof(change_cursor) = 'blob' AND octet_length(change_cursor) = 8 THEN change_cursor END
+			FROM record_revisions
+			WHERE change_cursor <= ?
+			ORDER BY record_id, change_cursor`, maxUUIDBytes, maxUUIDBytes, maxUUIDBytes, maxVectorBytes, encodedCut[:])
+		if err != nil {
+			return invalidPersistentState("read snapshot cut revisions")
+		}
+		authorMaxima := make(map[string]uint64, len(devices))
+		currentRecord := ""
+		var frontier []snapshotCutFrontierItem
+		flushFrontier := func() error {
+			if currentRecord == "" {
+				return nil
+			}
+			references := referencesByRecord[currentRecord]
+			heads := make(map[string]struct{}, len(frontier))
+			for _, item := range frontier {
+				heads[item.id] = struct{}{}
+			}
+			for revisionID := range references {
+				if _, exists := heads[revisionID]; !exists {
+					return invalidPersistentState("snapshot reference was dominated at cut")
+				}
+			}
+			for _, item := range frontier {
+				if _, exists := references[item.id]; exists {
+					continue
+				}
+				markerBody, hasMarker := snapshot.markerBodies[currentRecord]
+				// Collection does not allocate a second cursor when it later
+				// removes an exact tombstone witness. Its durable collection
+				// generation proves whether that removal preceded this snapshot.
+				if item.tombstone && item.collectedGeneration != 0 &&
+					item.collectedGeneration <= snapshot.collectionGeneration && hasMarker {
+					marker, markerErr := decodeStoredCollectionMarker(markerBody)
+					markerFrontier, _, _, frontierErr := validateCollectionMarker(marker)
+					if markerErr == nil && frontierErr == nil && marker.WitnessRevisionID == item.id && vectorsEqual(markerFrontier, item.vector) {
+						continue
+					}
+				}
+				return invalidPersistentState("snapshot frontier head is missing at cut")
+			}
+			delete(referencesByRecord, currentRecord)
+			return nil
+		}
+		for cutRows.Next() {
+			var revisionID, recordID, authorID sql.NullString
+			var counterBytes, vectorBody, collectedBytes, cursorBytes []byte
+			var revisionIDLength, recordIDLength, authorIDLength, counterLength, vectorLength, cursorLength int64
+			var collectedLength sql.NullInt64
+			var tombstone, retained int
+			if cutRows.Scan(
+				&revisionIDLength, &revisionID, &recordIDLength, &recordID, &authorIDLength, &authorID,
+				&counterLength, &counterBytes, &vectorLength, &vectorBody, &tombstone,
+				&collectedLength, &collectedBytes, &retained, &cursorLength, &cursorBytes,
+			) != nil ||
+				!boundedRequiredText(revisionIDLength, revisionID, maxUUIDBytes) || revisionIDLength != maxUUIDBytes || validateUUID(revisionID.String) != nil ||
+				!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
+				!boundedRequiredText(authorIDLength, authorID, maxUUIDBytes) || validateUUID(authorID.String) != nil ||
+				!boundedRequiredBytes(counterLength, counterBytes, 8) || counterLength != 8 ||
+				!boundedRequiredBytes(vectorLength, vectorBody, maxVectorBytes) ||
+				!boundedOptionalBytes(collectedLength, collectedBytes, 8) || collectedLength.Valid && collectedLength.Int64 != 8 ||
+				!boundedRequiredBytes(cursorLength, cursorBytes, 8) || cursorLength != 8 ||
+				tombstone < 0 || tombstone > 1 || retained < 0 || retained > 1 {
+				cutRows.Close()
+				return invalidPersistentState("invalid snapshot cut revision")
+			}
+			counter, counterErr := DecodeUint64(counterBytes)
+			cursor, cursorErr := DecodeUint64(cursorBytes)
+			collectedGeneration := uint64(0)
+			var collectedErr error
+			if collectedBytes != nil {
+				collectedGeneration, collectedErr = DecodeUint64(collectedBytes)
+			}
+			var entries []vectorEntry
+			if counterErr != nil || cursorErr != nil || collectedErr != nil || cursor == 0 || cursor > snapshot.cutCursor ||
+				(retained == 0) != (collectedBytes != nil) || json.Unmarshal(vectorBody, &entries) != nil {
+				cutRows.Close()
+				return invalidPersistentState("invalid snapshot cut revision")
+			}
+			vector, vectorErr := validateVector(entries)
+			if _, exists := devices[authorID.String]; !exists || vectorErr != nil || vector[authorID.String] != counter {
+				cutRows.Close()
+				return invalidPersistentState("invalid snapshot cut revision vector")
+			}
+			if currentRecord != recordID.String {
+				if err := flushFrontier(); err != nil {
+					cutRows.Close()
+					return err
+				}
+				currentRecord = recordID.String
+				frontier = nil
+			}
+			dominated := false
+			next := frontier[:0]
+			for _, existing := range frontier {
+				if vectorsEqual(existing.vector, vector) {
+					cutRows.Close()
+					return invalidPersistentState("equal-vector revision equivocation at snapshot cut")
+				}
+				if vectorDominates(existing.vector, vector) {
+					dominated = true
+				}
+				if !vectorDominates(vector, existing.vector) {
+					next = append(next, existing)
+				}
+			}
+			if !dominated {
+				next = append(next, snapshotCutFrontierItem{
+					id: revisionID.String, vector: vector, tombstone: tombstone == 1, collectedGeneration: collectedGeneration,
+				})
+				if len(next) > 32 {
+					cutRows.Close()
+					return invalidPersistentState("snapshot cut has too many undominated revisions")
+				}
+			}
+			frontier = next
+			if counter > authorMaxima[authorID.String] {
+				authorMaxima[authorID.String] = counter
+			}
+		}
+		if cutRows.Err() != nil {
+			cutRows.Close()
+			return invalidPersistentState("read snapshot cut revisions")
+		}
+		if err := flushFrontier(); err != nil {
+			cutRows.Close()
+			return err
+		}
+		if cutRows.Close() != nil {
+			return invalidPersistentState("read snapshot cut revisions")
+		}
+		if len(referencesByRecord) != 0 {
+			return invalidPersistentState("snapshot reference was not accepted at cut")
+		}
+		expectedSources := 0
+		for deviceID, device := range devices {
+			if device.createdCursor != 0 && device.createdCursor > snapshot.cutCursor {
+				continue
+			}
+			expectedSources++
+			counter, exists := snapshot.sourceCounters[deviceID]
+			if !exists || counter != authorMaxima[deviceID] {
+				return invalidPersistentState("snapshot source registry does not match cut")
+			}
+		}
+		if len(snapshot.sourceCounters) != expectedSources {
+			return invalidPersistentState("snapshot source registry does not match cut")
+		}
+
+		remainingMarkers := make(map[string][]byte, len(snapshot.markerBodies))
+		for recordID, body := range snapshot.markerBodies {
+			remainingMarkers[recordID] = body
+		}
+		markerRows, err := query.QueryContext(ctx, `
+			SELECT octet_length(collection_marker_record_id),
+			       CASE WHEN typeof(collection_marker_record_id) = 'text'
+			                  AND octet_length(collection_marker_record_id) = ? THEN collection_marker_record_id END,
+			       octet_length(cursor),
+			       CASE WHEN typeof(cursor) = 'blob' AND octet_length(cursor) = 8 THEN cursor END,
+			       length(collection_marker_json),
+			       CASE WHEN length(collection_marker_json) BETWEEN 1 AND ? THEN collection_marker_json END
+			FROM changes
+			WHERE kind = 'collection_marker' AND cursor <= ?
+			ORDER BY collection_marker_record_id, cursor`, maxUUIDBytes, maxBodyBytes, encodedCut[:])
+		if err != nil {
+			return invalidPersistentState("read snapshot cut markers")
+		}
+		currentMarkerRecord := ""
+		var latestMarkerBody []byte
+		flushMarker := func() error {
+			if currentMarkerRecord == "" {
+				return nil
+			}
+			descriptorBody, exists := remainingMarkers[currentMarkerRecord]
+			if !exists || !bytes.Equal(descriptorBody, latestMarkerBody) {
+				return invalidPersistentState("snapshot marker does not match cut")
+			}
+			delete(remainingMarkers, currentMarkerRecord)
+			return nil
+		}
+		for markerRows.Next() {
+			var recordID sql.NullString
+			var cursorBytes, body []byte
+			var recordIDLength, cursorLength, bodyLength int64
+			if markerRows.Scan(&recordIDLength, &recordID, &cursorLength, &cursorBytes, &bodyLength, &body) != nil ||
+				!boundedRequiredText(recordIDLength, recordID, maxUUIDBytes) || recordIDLength != maxUUIDBytes || validateUUID(recordID.String) != nil ||
+				!boundedRequiredBytes(cursorLength, cursorBytes, 8) || cursorLength != 8 ||
+				!boundedRequiredBytes(bodyLength, body, maxBodyBytes) {
+				markerRows.Close()
+				return invalidPersistentState("invalid snapshot cut marker")
+			}
+			cursor, cursorErr := DecodeUint64(cursorBytes)
+			marker, markerErr := decodeStoredCollectionMarker(body)
+			if cursorErr != nil || cursor == 0 || cursor > snapshot.cutCursor || markerErr != nil || marker.RecordID != recordID.String {
+				markerRows.Close()
+				return invalidPersistentState("invalid snapshot cut marker")
+			}
+			if currentMarkerRecord != recordID.String {
+				if err := flushMarker(); err != nil {
+					markerRows.Close()
+					return err
+				}
+				currentMarkerRecord = recordID.String
+			}
+			latestMarkerBody = append(latestMarkerBody[:0], body...)
+		}
+		if markerRows.Err() != nil {
+			markerRows.Close()
+			return invalidPersistentState("read snapshot cut markers")
+		}
+		if err := flushMarker(); err != nil {
+			markerRows.Close()
+			return err
+		}
+		if markerRows.Close() != nil {
+			return invalidPersistentState("read snapshot cut markers")
+		}
+		if len(remainingMarkers) != 0 {
+			return invalidPersistentState("snapshot marker does not match cut")
+		}
+	}
+	var totalMetadata int64
+	for snapshotID, snapshot := range snapshots {
+		seen := make(map[string]struct{}, len(snapshot.orderedRevisionIDs))
+		var previousRecordID, previousRevisionID string
+		for _, revisionID := range snapshot.orderedRevisionIDs {
+			recordID, exists := snapshot.referenceRecordIDs[revisionID]
+			if !exists {
+				return invalidPersistentState("snapshot descriptor has no reference")
+			}
+			if _, duplicate := seen[revisionID]; duplicate || previousRecordID != "" && (recordID < previousRecordID || recordID == previousRecordID && revisionID <= previousRevisionID) {
+				return invalidPersistentState("snapshot revisions are not globally ordered")
+			}
+			seen[revisionID] = struct{}{}
+			previousRecordID, previousRevisionID = recordID, revisionID
+		}
+		if len(seen) != len(snapshot.references) {
+			return invalidPersistentState("snapshot references do not match descriptors")
+		}
+		metadataBytes, ok := snapshotMetadataBytes(snapshotID, snapshot.ownerID, snapshot.requestID, snapshot.createBody, snapshot.pages, snapshot.references)
+		if !ok || metadataBytes != snapshot.metadataBytes || metadataBytes > snapshotMetadataLimit || metadataBytes > math.MaxInt64-totalMetadata {
+			return invalidPersistentState("snapshot metadata accounting mismatch")
+		}
+		totalMetadata += metadataBytes
+	}
+	if totalMetadata > snapshotMetadataLimit {
+		return invalidPersistentState("active snapshot metadata exceeds limit")
+	}
+	return nil
+}
+
+func decodeBase64Token(value string) error {
+	_, err := decodeBase64(value, 32, 0, 0)
+	return err
+}
