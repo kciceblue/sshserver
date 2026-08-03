@@ -302,8 +302,15 @@ func validateGoBuildInfo(info *runtimedebug.BuildInfo, target deployment.Target,
 		return fmt.Errorf("%s Go version %q does not match %q", targetKey(target), info.GoVersion, toolchain)
 	}
 	const runtimeModule = "github.com/kciceblue/sshserver/runtime"
-	if info.Path != runtimeModule+"/cmd/sshserver" || info.Main.Path != runtimeModule || info.Main.Version != "(devel)" || info.Main.Replace != nil {
-		return fmt.Errorf("%s main package metadata is not the exact sshserver runtime module", targetKey(target))
+	// Go has emitted both an empty version and "(devel)" for a local main
+	// module across supported patch toolchains. Neither denotes a fetched module
+	// version; the clean-source gate and encoded revision bind the local tree.
+	localMainVersion := info.Main.Version == "" || info.Main.Version == "(devel)"
+	if info.Path != runtimeModule+"/cmd/sshserver" || info.Main.Path != runtimeModule || !localMainVersion || info.Main.Replace != nil {
+		return fmt.Errorf(
+			"%s main package metadata is not the exact local sshserver runtime module (path=%q main=%q version=%q replaced=%t)",
+			targetKey(target), info.Path, info.Main.Path, info.Main.Version, info.Main.Replace != nil,
+		)
 	}
 	settings := make(map[string]string, len(info.Settings))
 	for _, setting := range info.Settings {

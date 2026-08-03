@@ -285,6 +285,12 @@ func TestFrozenGoBuildMetadataValidationIsExact(t *testing.T) {
 			}
 		})
 	}
+	emptyMainVersion := *valid
+	emptyMainVersion.Settings = append([]debug.BuildSetting(nil), valid.Settings...)
+	emptyMainVersion.Main.Version = ""
+	if err := validateGoBuildInfo(&emptyMainVersion, target, sourceRevision, toolchain); err != nil {
+		t.Fatalf("supported empty local main-module version was rejected: %v", err)
+	}
 	if err := verifyGoBuildMetadata([]byte("not a Go executable"), target, release, sourceRevision, toolchain, identity); err == nil {
 		t.Fatal("non-Go artifact metadata accepted")
 	}

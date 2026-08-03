@@ -24,7 +24,7 @@ func TestRealNativeBinaryStagesAttestsRunsAndUninstalls(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real release-binary integration is disabled in short mode")
 	}
-	layout := shortIntegrationLayout(t)
+	layout := testLayout(t)
 	uploadDir := filepath.Join(layout.HomeDir, "verified-upload")
 	if err := os.Mkdir(uploadDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -259,32 +259,4 @@ func integrationGoEnvironment(overrides ...string) []string {
 		}
 	}
 	return append(environment, overrides...)
-}
-
-func shortIntegrationLayout(t *testing.T) Layout {
-	t.Helper()
-	userHome, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	physicalHome, err := filepath.EvalSymlinks(userHome)
-	if err != nil {
-		t.Fatal(err)
-	}
-	home, err := os.MkdirTemp(physicalHome, ".jat-lifecycle-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(home) })
-	layout, err := NewLayout(home, filepath.Join(home, "deployment"), filepath.Join(home, "state"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := PrepareLayout(layout); err != nil {
-		t.Fatal(err)
-	}
-	return layout
 }

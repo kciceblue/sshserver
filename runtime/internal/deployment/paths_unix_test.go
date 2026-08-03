@@ -105,14 +105,21 @@ func TestPrepareLayoutRejectsUnsafeComponents(t *testing.T) {
 
 func secureTestHome(t *testing.T) string {
 	t.Helper()
-	parent := t.TempDir()
-	home := filepath.Join(parent, "home")
-	if err := os.Mkdir(home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := filepath.EvalSymlinks(home)
+	userHome, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return resolved
+	physicalHome, err := filepath.EvalSymlinks(userHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := os.MkdirTemp(physicalHome, ".sshserver-deployment-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	return home
 }
