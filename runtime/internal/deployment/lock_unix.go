@@ -16,8 +16,73 @@ type deploymentLock struct {
 	file *os.File
 }
 
+// acquireDeploymentBootstrapLock serializes the first lifecycle operation
+// without creating deployment metadata. The current user's already-validated
+// home directory is a stable advisory-lock inode on every supported target.
+// Once the lifecycle lock exists, it remains the narrower long-lived lock.
+func acquireDeploymentBootstrapLock(layout Layout) (*deploymentLock, error) {
+	fd, err := unix.Open(layout.HomeDir, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open deployment bootstrap lock: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), layout.HomeDir)
+	if file == nil {
+		unix.Close(fd)
+		return nil, errors.New("wrap deployment bootstrap lock descriptor")
+	}
+	if err := validateDirectoryFD(fd); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("validate deployment bootstrap lock: %w", err)
+	}
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		file.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, errors.New("another deployment bootstrap operation is already running")
+		}
+		return nil, fmt.Errorf("lock deployment bootstrap: %w", err)
+	}
+	return &deploymentLock{file: file}, nil
+}
+
+// acquireDeploymentMutationLocks takes the process-wide first-operation
+// admission lock before it creates or acquires the persistent lifecycle lock.
+// Rollback and uninstall use the same ordering as Apply so a losing operation
+// cannot create layout directories before reporting contention.
+func acquireDeploymentMutationLocks(layout Layout) (*deploymentLock, *deploymentLock, error) {
+	bootstrap, err := acquireDeploymentBootstrapLock(layout)
+	if err != nil {
+		return nil, nil, err
+	}
+	closeBootstrapOnError := func(operationErr error) (*deploymentLock, *deploymentLock, error) {
+		if closeErr := bootstrap.Close(); closeErr != nil {
+			operationErr = errors.Join(operationErr, fmt.Errorf("release deployment bootstrap lock: %w", closeErr))
+		}
+		return nil, nil, operationErr
+	}
+
+	var lifecycle *deploymentLock
+	if _, statErr := os.Lstat(layout.LockPath); statErr == nil {
+		lifecycle, err = acquireExistingDeploymentLock(layout)
+	} else if errors.Is(statErr, os.ErrNotExist) {
+		if err := PrepareDeploymentLockRoot(layout); err != nil {
+			return closeBootstrapOnError(err)
+		}
+		lifecycle, err = acquireDeploymentLock(layout)
+	} else {
+		return closeBootstrapOnError(fmt.Errorf("inspect deployment lock: %w", statErr))
+	}
+	if err != nil {
+		return closeBootstrapOnError(err)
+	}
+	return bootstrap, lifecycle, nil
+}
+
 func acquireDeploymentLock(layout Layout) (*deploymentLock, error) {
 	return acquireDeploymentFileLock(layout, unix.O_CREAT, unix.LOCK_EX)
+}
+
+func acquireExistingDeploymentLock(layout Layout) (*deploymentLock, error) {
+	return acquireDeploymentFileLock(layout, 0, unix.LOCK_EX)
 }
 
 func acquireDeploymentSharedLock(layout Layout) (*deploymentLock, error) {
@@ -25,6 +90,35 @@ func acquireDeploymentSharedLock(layout Layout) (*deploymentLock, error) {
 	// missing file instead of manufacturing deployment metadata from the
 	// enrollment path.
 	return acquireDeploymentFileLock(layout, 0, unix.LOCK_SH)
+}
+
+// acquireDeploymentSharedLockIfPresent validates and shares an existing
+// lifecycle lock without creating it. Read-only preflight surfaces use this to
+// take a coherent snapshot while preserving the missing-layout cancellation
+// guarantee.
+func acquireDeploymentSharedLockIfPresent(layout Layout) (*deploymentLock, bool, error) {
+	lock, err := acquireDeploymentFileLock(layout, 0, unix.LOCK_SH)
+	if errors.Is(err, unix.ENOENT) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	return lock, true, nil
+}
+
+func validateExistingDeploymentLock(layout Layout) error {
+	lock, _, err := acquireDeploymentSharedLockIfPresent(layout)
+	if err != nil {
+		return err
+	}
+	if lock == nil {
+		return nil
+	}
+	if err := lock.Close(); err != nil {
+		return fmt.Errorf("release deployment preflight lock: %w", err)
+	}
+	return nil
 }
 
 func acquireDeploymentFileLock(layout Layout, openFlags, lockMode int) (*deploymentLock, error) {

@@ -28,19 +28,19 @@ func TestGenerateProducesDeterministicPinnedBundleForFourTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(manifest.Artifacts) != 4 || len(result.ActivationPaths) != 4 || len(result.UploadFiles) != 4 || manifest.SourceRevision != options.SourceRevision {
+	if len(manifest.Artifacts) != 4 || len(result.PreviewPaths) != 4 || len(result.UploadFiles) != 4 || manifest.SourceRevision != options.SourceRevision {
 		t.Fatalf("manifest/result=%+v / %+v", manifest, result)
 	}
 	firstManifest := append([]byte(nil), manifestPayload...)
-	firstActivations := make(map[string][]byte)
-	for key, path := range result.ActivationPaths {
+	firstPreviews := make(map[string][]byte)
+	for key, path := range result.PreviewPaths {
 		payload, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		firstActivations[key] = payload
-		if deployment.SHA256Hex(payload) != result.ActivationSHA256[key] {
-			t.Fatalf("activation %s hash mismatch", key)
+		firstPreviews[key] = payload
+		if deployment.SHA256Hex(payload) != result.PreviewSHA256[key] {
+			t.Fatalf("preview %s hash mismatch", key)
 		}
 	}
 	second, err := generate(options, acceptTestMetadata)
@@ -51,10 +51,10 @@ func TestGenerateProducesDeterministicPinnedBundleForFourTargets(t *testing.T) {
 	if !bytes.Equal(firstManifest, secondManifest) || result.ManifestSHA256 != second.ManifestSHA256 {
 		t.Fatal("identical release inputs produced different manifest bytes")
 	}
-	for key, first := range firstActivations {
-		secondPayload, _ := os.ReadFile(second.ActivationPaths[key])
-		if !bytes.Equal(first, secondPayload) || result.ActivationSHA256[key] != second.ActivationSHA256[key] {
-			t.Fatalf("identical release inputs produced different %s activation", key)
+	for key, first := range firstPreviews {
+		secondPayload, _ := os.ReadFile(second.PreviewPaths[key])
+		if !bytes.Equal(first, secondPayload) || result.PreviewSHA256[key] != second.PreviewSHA256[key] {
+			t.Fatalf("identical release inputs produced different %s preview", key)
 		}
 	}
 	for _, name := range []string{"release-manifest.json", "LICENSE", "NOTICE"} {
@@ -78,7 +78,7 @@ func TestGenerateProducesDeterministicPinnedBundleForFourTargets(t *testing.T) {
 	}
 }
 
-func TestActivationLineIsPinnedTargetSpecificAndUsesNoHostTool(t *testing.T) {
+func TestPreviewAndConfirmedActivationLinesArePinnedTargetSpecificAndUseNoHostTool(t *testing.T) {
 	options := testBundleOptions(t)
 	result, err := generate(options, acceptTestMetadata)
 	if err != nil {
@@ -90,40 +90,59 @@ func TestActivationLineIsPinnedTargetSpecificAndUsesNoHostTool(t *testing.T) {
 	}
 	for _, target := range deployment.SupportedTargets() {
 		key := targetKey(target)
-		payload, err := os.ReadFile(result.ActivationPaths[key])
+		payload, err := os.ReadFile(result.PreviewPaths[key])
 		if err != nil {
 			t.Fatal(err)
 		}
-		line := string(payload)
-		if strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
-			t.Fatalf("%s activation is not exactly one line", key)
+		previewLine := string(payload)
+		if strings.Count(previewLine, "\n") != 1 || !strings.HasSuffix(previewLine, "\n") {
+			t.Fatalf("%s preview is not exactly one line", key)
 		}
 		for _, forbidden := range []string{
 			"curl", "wget", "fetch", "openssl", "sh ", "bash", "sudo", "sha256sum", "shasum",
 			"chmod ", "mkdir ", "rm ", "uname ", "latest", "instance_secret", "enrollment_grant",
 			"device_token", "bearer", "password", "|", ";", ">", "<", "(", ")", "$", "'", `"`,
 		} {
-			if strings.Contains(line, forbidden) {
-				t.Fatalf("%s activation contains forbidden %q: %s", key, forbidden, line)
+			if strings.Contains(previewLine, forbidden) {
+				t.Fatalf("%s preview contains forbidden %q: %s", key, forbidden, previewLine)
 			}
 		}
-		if !strings.Contains(line, "--consume-inputs") || !strings.Contains(line, result.ManifestSHA256) ||
-			strings.Count(line, " deploy apply ") != 1 || strings.Count(line, " --artifact ") != 1 {
-			t.Fatalf("%s activation lacks the pinned apply command: %s", key, line)
+		if strings.Contains(previewLine, "--consume-inputs") || strings.Contains(previewLine, "--confirmed-preview-sha256") ||
+			!strings.Contains(previewLine, result.ManifestSHA256) || strings.Count(previewLine, " deploy preview ") != 1 ||
+			strings.Count(previewLine, " --artifact ") != 1 {
+			t.Fatalf("%s preview lacks the pinned read-only command: %s", key, previewLine)
 		}
 		files := result.UploadFiles[key]
 		for _, name := range []string{files.Directory, files.Manifest, files.Artifact, files.License, files.Notice} {
-			if name == "" || !strings.Contains(line, "~/"+name) || !strings.Contains(name, result.ManifestSHA256[:16]) {
-				t.Fatalf("%s activation/upload contract lacks %q", key, name)
+			if name == "" || !strings.Contains(previewLine, "~/"+name) || !strings.Contains(name, result.ManifestSHA256[:16]) {
+				t.Fatalf("%s preview/upload contract lacks %q", key, name)
 			}
 		}
 		if files.DirectoryMode != "0700" || files.ManifestMode != "0400" || files.ArtifactMode != "0500" || files.LicenseMode != "0400" || files.NoticeMode != "0400" {
 			t.Fatalf("%s upload modes=%+v", key, files)
 		}
 		for otherKey, otherFiles := range result.UploadFiles {
-			if otherKey != key && strings.Contains(line, "~/"+otherFiles.Artifact) {
-				t.Fatalf("%s activation contains another target upload %s", key, otherFiles.Artifact)
+			if otherKey != key && strings.Contains(previewLine, "~/"+otherFiles.Artifact) {
+				t.Fatalf("%s preview contains another target upload %s", key, otherFiles.Artifact)
 			}
+		}
+		manifest, err := deployment.ParsePinnedManifest(manifestPayload, result.ManifestSHA256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		artifact, err := manifest.Artifact(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		confirmed := strings.Repeat("c", 64)
+		activation, err := ActivationLine(manifest, int64(len(manifestPayload)), result.ManifestSHA256, artifact, confirmed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		activationLine := string(activation)
+		if strings.Count(activationLine, " deploy apply ") != 1 || !strings.Contains(activationLine, "--confirmed-preview-sha256 "+confirmed) ||
+			!strings.Contains(activationLine, "--consume-inputs") || strings.Contains(activationLine, " deploy preview ") {
+			t.Fatalf("%s activation is not bound to the confirmed preview: %s", key, activationLine)
 		}
 	}
 }
@@ -437,7 +456,7 @@ func removeBuildSetting(info *debug.BuildInfo, key string) {
 	}
 }
 
-func TestActivationRejectsWrongManifestPin(t *testing.T) {
+func TestDeploymentCommandsRejectWrongManifestPinAndConfirmation(t *testing.T) {
 	options := testBundleOptions(t)
 	result, err := generate(options, acceptTestMetadata)
 	if err != nil {
@@ -445,14 +464,20 @@ func TestActivationRejectsWrongManifestPin(t *testing.T) {
 	}
 	payload, _ := os.ReadFile(result.ManifestPath)
 	manifest, _ := deployment.ParsePinnedManifest(payload, result.ManifestSHA256)
-	if _, err := ActivationLine(manifest, int64(len(payload)), strings.Repeat("A", 64), manifest.Artifacts[0]); err == nil {
+	if _, err := PreviewLine(manifest, int64(len(payload)), strings.Repeat("A", 64), manifest.Artifacts[0]); err == nil {
 		t.Fatal("uppercase manifest pin accepted")
 	}
-	if _, err := ActivationLine(manifest, int64(len(payload)), strings.Repeat("0", 64), manifest.Artifacts[0]); err == nil {
+	if _, err := PreviewLine(manifest, int64(len(payload)), strings.Repeat("0", 64), manifest.Artifacts[0]); err == nil {
 		t.Fatal("wrong lowercase manifest pin accepted")
 	}
-	if _, err := ActivationLine(manifest, int64(len(payload))+1, result.ManifestSHA256, manifest.Artifacts[0]); err == nil {
+	if _, err := PreviewLine(manifest, int64(len(payload))+1, result.ManifestSHA256, manifest.Artifacts[0]); err == nil {
 		t.Fatal("wrong manifest byte count accepted")
+	}
+	if _, err := ActivationLine(manifest, int64(len(payload)), result.ManifestSHA256, manifest.Artifacts[0], strings.Repeat("A", 64)); err == nil {
+		t.Fatal("uppercase preview confirmation accepted")
+	}
+	if _, err := ActivationLine(manifest, int64(len(payload)), result.ManifestSHA256, manifest.Artifacts[0], strings.Repeat("0", 63)); err == nil {
+		t.Fatal("short preview confirmation accepted")
 	}
 }
 

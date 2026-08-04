@@ -62,13 +62,38 @@ device credentials are hashed before persistence.
 
 The `service render` and `service install` commands generate a systemd user
 unit or per-user LaunchAgent that executes the same foreground path without a
-credential in arguments, environment, or service files. The transactional
-`deploy apply`, `deploy recover`, `deploy status`, `deploy rollback`, and
-`deploy uninstall` commands validate an exact pinned release, publish its
-binary and LICENSE/NOTICE without replacement, preserve protected instance
-state, and drive only the current user's native service manager. Recognized
-manager absence returns an explicit supervised-foreground command; a manager
-failure is never silently treated as success.
+credential in arguments, environment, or service files. Before confirmation,
+`deploy preview` accepts the same pinned manifest, artifact, LICENSE, NOTICE,
+and layout arguments as `deploy apply`. It emits deterministic canonical JSON
+covering the exact identities, paths, native-manager or supervised-foreground
+outcome, existing transaction classification, remaining actions, preserved
+data, and loopback-only listeners. Preview verifies its inputs and probes the
+current-user service-manager domain without creating the install root, state
+directory, lifecycle or initialization lock, journal, service definition,
+instance, or release artifact. Its exact action sequence records whether each
+lock must be created and records bootstrap admission, lifecycle locking, and
+the initialization lease in Apply order before the remaining layout repair,
+journal, or idempotent release work. Rollback and uninstall recovery plans
+likewise record bootstrap and lifecycle admission before full layout repair.
+A journal already checkpointed at `state_saved` is resumable only when the
+saved deployment state exactly matches that transaction and its prior rollback
+release remains verified. Discarding the result is therefore a complete
+cancellation.
+
+The transactional `deploy apply` and `deploy recover` require the SHA-256 of
+the exact canonical preview bytes, including their terminal newline. They
+rebuild that plan while holding the lifecycle and initialization locks and
+refuse before product mutation if any field or action changed. The leased
+initialization-lock path is re-attested against its flocked descriptor before
+each journal mutation, release staging, and initialization, so unlink or
+replacement fails closed. `deploy status`, `deploy rollback`, and `deploy
+uninstall` commands validate an exact pinned release, publish its binary and
+LICENSE/NOTICE without replacement, preserve protected instance state, and
+drive only the current user's native service manager.
+Apply detects the manager before its first mutation and revalidates the exact
+outcome before deployment work. Recognized manager absence returns an explicit
+supervised-foreground command; a manager failure or changed preflight outcome
+is never silently treated as success.
 
 Release builds contain one encoded identity covering release, source revision,
 exact Go patch toolchain, target-derived build identity, protocol version, and

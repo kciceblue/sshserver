@@ -5,20 +5,23 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/kciceblue/sshserver/runtime/internal/auth"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/uuidv4"
-	_ "github.com/ncruces/go-sqlite3/driver"
+	sqliteDriver "github.com/ncruces/go-sqlite3/driver"
 	_ "github.com/ncruces/go-sqlite3/embed"
 )
 
@@ -41,15 +44,166 @@ type Store struct {
 	ephemeral *ephemeralState
 }
 
+type closedDatabaseValidationSnapshot struct {
+	source     *os.File
+	sourceInfo os.FileInfo
+	root       string
+	path       string
+	bytes      int64
+	digest     [sha256.Size]byte
+}
+
+func captureClosedDatabaseValidationSnapshot(path string) (_ *closedDatabaseValidationSnapshot, returnErr error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open closed SQLite database for validation snapshot: %w", err)
+	}
+	source := os.NewFile(uintptr(fd), path)
+	if source == nil {
+		_ = syscall.Close(fd)
+		return nil, errors.New("wrap closed SQLite validation source descriptor")
+	}
+	keepSource := false
+	defer func() {
+		if !keepSource {
+			if closeErr := source.Close(); closeErr != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("close closed SQLite validation source: %w", closeErr))
+			}
+		}
+	}()
+	sourceInfo, err := source.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat closed SQLite validation source: %w", err)
+	}
+	if err := validateClosedDatabaseDescriptor(sourceInfo); err != nil {
+		return nil, err
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("recheck closed SQLite validation source path: %w", err)
+	}
+	if !os.SameFile(sourceInfo, pathInfo) {
+		return nil, errors.New("closed SQLite validation source was replaced while opening it")
+	}
+
+	root, err := os.MkdirTemp("", "jat-store-closed-validation-")
+	if err != nil {
+		return nil, fmt.Errorf("create private closed-database validation directory: %w", err)
+	}
+	keepRoot := false
+	defer func() {
+		if !keepRoot {
+			if removeErr := os.RemoveAll(root); removeErr != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("remove private closed-database validation directory: %w", removeErr))
+			}
+		}
+	}()
+	snapshotPath := filepath.Join(root, "server.db")
+	destination, err := os.OpenFile(snapshotPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("create closed SQLite validation snapshot: %w", err)
+	}
+	hasher := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(destination, hasher), source)
+	closeErr := destination.Close()
+	if copyErr != nil {
+		copyErr = fmt.Errorf("copy closed SQLite validation snapshot: %w", copyErr)
+	}
+	if closeErr != nil {
+		closeErr = fmt.Errorf("close closed SQLite validation snapshot: %w", closeErr)
+	}
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return nil, err
+	}
+	afterCopy, err := source.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("recheck closed SQLite source after snapshot: %w", err)
+	}
+	if !os.SameFile(sourceInfo, afterCopy) || written != sourceInfo.Size() || afterCopy.Size() != sourceInfo.Size() ||
+		!afterCopy.ModTime().Equal(sourceInfo.ModTime()) {
+		return nil, errors.New("closed SQLite database changed while capturing validation snapshot")
+	}
+	pathInfo, err = os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("recheck closed SQLite source path after snapshot: %w", err)
+	}
+	if !os.SameFile(afterCopy, pathInfo) {
+		return nil, errors.New("closed SQLite database was replaced while capturing validation snapshot")
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hasher.Sum(nil))
+	keepSource = true
+	keepRoot = true
+	return &closedDatabaseValidationSnapshot{
+		source: source, sourceInfo: sourceInfo, root: root, path: snapshotPath,
+		bytes: written, digest: digest,
+	}, nil
+}
+
+func validateClosedDatabaseDescriptor(info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return errors.New("closed SQLite database must be a regular file")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("cannot validate closed SQLite database metadata")
+	}
+	if stat.Uid != uint32(os.Geteuid()) {
+		return errors.New("closed SQLite database must be owned by the current user")
+	}
+	if uint64(stat.Nlink) != 1 {
+		return errors.New("closed SQLite database must have exactly one hard link")
+	}
+	if info.Mode().Perm()&^0o600 != 0 {
+		return fmt.Errorf("closed SQLite database permissions %04o are broader than 0600", info.Mode().Perm())
+	}
+	return nil
+}
+
+func (snapshot *closedDatabaseValidationSnapshot) attestSource(path string) error {
+	if _, err := snapshot.source.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind closed SQLite validation source: %w", err)
+	}
+	hasher := sha256.New()
+	read, err := io.Copy(hasher, snapshot.source)
+	if err != nil {
+		return fmt.Errorf("hash closed SQLite validation source: %w", err)
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hasher.Sum(nil))
+	if read != snapshot.bytes || digest != snapshot.digest {
+		return errors.New("closed SQLite database contents changed during read-only validation")
+	}
+	if err := config.ValidateProtectedFile(path, 0o600); err != nil {
+		return fmt.Errorf("recheck closed SQLite database protection: %w", err)
+	}
+	sourceInfo, err := snapshot.source.Stat()
+	if err != nil {
+		return fmt.Errorf("recheck closed SQLite database descriptor: %w", err)
+	}
+	if err := validateClosedDatabaseDescriptor(sourceInfo); err != nil {
+		return err
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("recheck closed SQLite database path: %w", err)
+	}
+	if !os.SameFile(snapshot.sourceInfo, sourceInfo) || !os.SameFile(sourceInfo, pathInfo) {
+		return errors.New("closed SQLite database was replaced during read-only validation")
+	}
+	return nil
+}
+
+func (snapshot *closedDatabaseValidationSnapshot) Close() error {
+	if snapshot == nil {
+		return nil
+	}
+	return errors.Join(snapshot.source.Close(), os.RemoveAll(snapshot.root))
+}
+
 func Open(ctx context.Context, path string, identity Identity) (*Store, error) {
-	if _, err := uuidv4.Parse(identity.InstanceID); err != nil {
-		return nil, fmt.Errorf("instance ID: %w", err)
-	}
-	if _, err := uuidv4.Parse(identity.VaultID); err != nil {
-		return nil, fmt.Errorf("vault ID: %w", err)
-	}
-	if identity.InstanceID == identity.VaultID {
-		return nil, errors.New("instance and vault IDs must differ")
+	if err := validateIdentityInput(identity); err != nil {
+		return nil, err
 	}
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("database path must be absolute")
@@ -91,6 +245,262 @@ func Open(ctx context.Context, path string, identity Identity) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+// ValidateExisting performs the same exact-schema, instance-identity, and
+// persistent-content validation as startup without issuing SQL writes or
+// intentionally creating or migrating source state. A closed database is
+// validated only through a private byte-exact snapshot, then the protected
+// source descriptor is SHA-256-attested against those validated bytes. An
+// active WAL reader may transiently update SQLite's shared-memory lock state;
+// raced replacement of any database/WAL/SHM path is detected and rejected.
+// Deployment preview/apply use this before journaling a resumable instance so
+// malformed or foreign state cannot become a partially applied transaction.
+func ValidateExisting(ctx context.Context, path string, identity Identity) error {
+	return validateExisting(ctx, path, identity, nil)
+}
+
+func validateExisting(ctx context.Context, path string, identity Identity, beforeOpen func()) (returnErr error) {
+	if err := validateIdentityInput(identity); err != nil {
+		return err
+	}
+	if !filepath.IsAbs(path) {
+		return errors.New("database path must be absolute")
+	}
+	if err := config.ValidateProtectedFile(path, 0o600); err != nil {
+		return fmt.Errorf("validate database file: %w", err)
+	}
+	if err := validateSQLiteFiles(path); err != nil {
+		return err
+	}
+	walPresent, err := existingPath(path + "-wal")
+	if err != nil {
+		return fmt.Errorf("inspect SQLite WAL: %w", err)
+	}
+	shmPresent, err := existingPath(path + "-shm")
+	if err != nil {
+		return fmt.Errorf("inspect SQLite shared memory: %w", err)
+	}
+	journalPresent, err := existingPath(path + "-journal")
+	if err != nil {
+		return fmt.Errorf("inspect SQLite rollback journal: %w", err)
+	}
+	if walPresent != shmPresent {
+		return errors.New("read-only SQLite validation requires a complete WAL/shared-memory pair")
+	}
+	if journalPresent {
+		return errors.New("read-only SQLite validation refuses a pending rollback journal")
+	}
+	var closedSnapshot *closedDatabaseValidationSnapshot
+	activeSnapshots := make(map[string]os.FileInfo)
+	validationPath := path
+	if !walPresent {
+		closedSnapshot, err = captureClosedDatabaseValidationSnapshot(path)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if closeErr := closedSnapshot.Close(); closeErr != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("release closed SQLite validation snapshot: %w", closeErr))
+			}
+		}()
+		validationPath = closedSnapshot.path
+	} else {
+		for _, activePath := range []string{path, path + "-wal", path + "-shm"} {
+			activeSnapshots[activePath], err = os.Lstat(activePath)
+			if err != nil {
+				return fmt.Errorf("snapshot active SQLite file %s: %w", filepath.Base(activePath), err)
+			}
+		}
+	}
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+
+	dsnURL := &url.URL{Scheme: "file", Path: validationPath}
+	query := dsnURL.Query()
+	query.Set("mode", "ro")
+	if !walPresent {
+		// With no journal sidecars, the closed database is a complete immutable
+		// snapshot. This suppresses SQLite's otherwise surprising creation of
+		// empty WAL/SHM files while opening a WAL-mode database read-only. The
+		// exact file and absence of sidecars are rechecked below so a racing
+		// writer cannot make the immutable assumption stale and be accepted.
+		query.Set("immutable", "1")
+	}
+	for _, pragma := range []string{
+		"busy_timeout(5000)",
+		"foreign_keys(1)",
+		"query_only(1)",
+		"trusted_schema(0)",
+	} {
+		query.Add("_pragma", pragma)
+	}
+	dsnURL.RawQuery = query.Encode()
+	database, err := sql.Open("sqlite3", dsnURL.String())
+	if err != nil {
+		return fmt.Errorf("open SQLite read-only: %w", err)
+	}
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+	defer func() {
+		if closeErr := database.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close read-only SQLite validation: %w", closeErr))
+		}
+	}()
+	if err := database.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping SQLite read-only: %w", err)
+	}
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("reserve read-only SQLite connection: %w", err)
+	}
+	defer func() {
+		if closeErr := connection.Close(); closeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("release read-only SQLite connection: %w", closeErr))
+		}
+	}()
+	transaction, err := connection.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin read-only SQLite validation: %w", err)
+	}
+	defer transaction.Rollback()
+	var integrity string
+	if err := transaction.QueryRowContext(ctx, "PRAGMA quick_check(1)").Scan(&integrity); err != nil {
+		return fmt.Errorf("check SQLite integrity: %w", err)
+	}
+	if integrity != "ok" {
+		return fmt.Errorf("check SQLite integrity: %s", integrity)
+	}
+	kind, version, err := inspectSchemaState(ctx, transaction)
+	if err != nil {
+		return err
+	}
+	migratable := false
+	switch kind {
+	case schemaEmpty:
+		if version != 0 {
+			return ErrUnexpectedSchema
+		}
+	case schemaFull:
+		if version != SchemaVersion {
+			return ErrUnexpectedSchema
+		}
+		if err := validateIdentity(ctx, transaction, identity); err != nil {
+			return err
+		}
+		if err := validatePersistentState(ctx, transaction, identity); err != nil {
+			return fmt.Errorf("validate persistent state read-only: %w", err)
+		}
+	case schemaLegacy, schemaPriorFull, schemaPriorAcceptanceOrigin:
+		if version != SchemaVersion {
+			return ErrUnexpectedSchema
+		}
+		migratable = true
+	default:
+		return ErrUnexpectedSchema
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit read-only SQLite validation: %w", err)
+	}
+	if migratable {
+		if err := validateMigratableCopy(ctx, connection, identity); err != nil {
+			return err
+		}
+	}
+	if closedSnapshot != nil {
+		if err := closedSnapshot.attestSource(path); err != nil {
+			return err
+		}
+		for _, sidecar := range []string{path + "-wal", path + "-shm", path + "-journal"} {
+			present, err := existingPath(sidecar)
+			if err != nil {
+				return fmt.Errorf("recheck SQLite sidecar: %w", err)
+			}
+			if present {
+				return errors.New("SQLite sidecar appeared during read-only validation")
+			}
+		}
+	} else {
+		for _, activePath := range []string{path, path + "-wal", path + "-shm"} {
+			if err := config.ValidateProtectedFile(activePath, 0o600); err != nil {
+				return fmt.Errorf("recheck active SQLite file %s: %w", filepath.Base(activePath), err)
+			}
+			current, err := os.Lstat(activePath)
+			if err != nil {
+				return fmt.Errorf("recheck active SQLite file %s: %w", filepath.Base(activePath), err)
+			}
+			if !os.SameFile(activeSnapshots[activePath], current) {
+				return fmt.Errorf("active SQLite file %s was replaced during read-only validation", filepath.Base(activePath))
+			}
+		}
+		journalPresent, err := existingPath(path + "-journal")
+		if err != nil {
+			return fmt.Errorf("recheck SQLite rollback journal: %w", err)
+		}
+		if journalPresent {
+			return errors.New("SQLite rollback journal appeared during read-only validation")
+		}
+	}
+	return nil
+}
+
+func validateMigratableCopy(ctx context.Context, source *sql.Conn, identity Identity) (returnErr error) {
+	temporaryRoot, err := os.MkdirTemp("", "jat-store-validation-")
+	if err != nil {
+		return fmt.Errorf("create private migration-validation directory: %w", err)
+	}
+	defer func() {
+		if removeErr := os.RemoveAll(temporaryRoot); removeErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove migration-validation directory: %w", removeErr))
+		}
+	}()
+	destination := filepath.Join(temporaryRoot, "server.db")
+	destinationURL := (&url.URL{Scheme: "file", Path: destination}).String()
+	if err := source.Raw(func(raw any) error {
+		connection, ok := raw.(sqliteDriver.Conn)
+		if !ok {
+			return errors.New("SQLite driver does not expose the reviewed backup interface")
+		}
+		return connection.Raw().Backup("main", destinationURL)
+	}); err != nil {
+		return fmt.Errorf("copy migratable SQLite snapshot: %w", err)
+	}
+	if err := os.Chmod(destination, 0o600); err != nil {
+		return fmt.Errorf("protect migratable SQLite snapshot: %w", err)
+	}
+	opened, err := Open(ctx, destination, identity)
+	if err != nil {
+		return fmt.Errorf("validate migratable SQLite snapshot: %w", err)
+	}
+	if err := opened.Close(); err != nil {
+		return fmt.Errorf("close migrated SQLite validation snapshot: %w", err)
+	}
+	return nil
+}
+
+func validateIdentityInput(identity Identity) error {
+	if _, err := uuidv4.Parse(identity.InstanceID); err != nil {
+		return fmt.Errorf("instance ID: %w", err)
+	}
+	if _, err := uuidv4.Parse(identity.VaultID); err != nil {
+		return fmt.Errorf("vault ID: %w", err)
+	}
+	if identity.InstanceID == identity.VaultID {
+		return errors.New("instance and vault IDs must differ")
+	}
+	return nil
+}
+
+func existingPath(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (store *Store) Close() error {

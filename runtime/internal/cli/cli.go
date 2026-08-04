@@ -103,9 +103,11 @@ func (runner Runner) runVersion(args []string) error {
 
 func (runner Runner) runDeploy(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("deploy requires apply, recover, status, rollback, or uninstall")
+		return errors.New("deploy requires preview, apply, recover, status, rollback, or uninstall")
 	}
 	switch args[0] {
+	case "preview":
+		return runner.runDeployPreview(ctx, args[1:])
 	case "apply", "recover":
 		return runner.runDeployApply(ctx, args[0], args[1:])
 	case "status":
@@ -119,6 +121,65 @@ func (runner Runner) runDeploy(ctx context.Context, args []string) error {
 	}
 }
 
+func (runner Runner) runDeployPreview(ctx context.Context, args []string) error {
+	values, flags, err := runner.newDeploymentFlags("deploy preview")
+	if err != nil {
+		return err
+	}
+	manifestPath := ""
+	manifestSHA256 := ""
+	artifactPath := ""
+	licensePath := ""
+	noticePath := ""
+	flags.StringVar(&manifestPath, "manifest", manifestPath, "absolute owner-only release manifest path")
+	flags.StringVar(&manifestSHA256, "manifest-sha256", manifestSHA256, "pinned lowercase manifest SHA-256")
+	flags.StringVar(&artifactPath, "artifact", artifactPath, "absolute verified release artifact path")
+	flags.StringVar(&licensePath, "license", licensePath, "absolute verified LICENSE path")
+	flags.StringVar(&noticePath, "notice", noticePath, "absolute verified NOTICE path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("deploy preview accepts no positional arguments")
+	}
+	if manifestPath == "" || manifestSHA256 == "" || artifactPath == "" || licensePath == "" || noticePath == "" {
+		return errors.New("deploy preview requires --manifest, --manifest-sha256, --artifact, --license, and --notice")
+	}
+	inputPaths := []string{manifestPath, artifactPath, licensePath, noticePath}
+	seenInputs := make(map[string]bool, len(inputPaths))
+	for _, inputPath := range inputPaths {
+		if seenInputs[inputPath] {
+			return errors.New("deployment input paths must be distinct")
+		}
+		seenInputs[inputPath] = true
+	}
+	lifecycle, err := values.lifecycle()
+	if err != nil {
+		return err
+	}
+	payload, err := deployment.ReadPinnedManifestFile(manifestPath, manifestSHA256)
+	if err != nil {
+		return err
+	}
+	preview, err := lifecycle.Preview(ctx, deployment.PreviewRequest{
+		ManifestPath: manifestPath, ManifestPayload: payload, ManifestSHA256: manifestSHA256,
+		ArtifactPath: artifactPath, LicensePath: licensePath, NoticePath: noticePath,
+	})
+	if err != nil {
+		return err
+	}
+	return runner.writePreviewResult(preview)
+}
+
+func (runner Runner) writePreviewResult(preview deployment.DeploymentPreview) error {
+	canonical, err := preview.CanonicalBytes()
+	if err != nil {
+		return err
+	}
+	_, err = runner.Stdout.Write(canonical)
+	return err
+}
+
 func (runner Runner) runDeployApply(ctx context.Context, operation string, args []string) error {
 	values, flags, err := runner.newDeploymentFlags("deploy " + operation)
 	if err != nil {
@@ -129,12 +190,14 @@ func (runner Runner) runDeployApply(ctx context.Context, operation string, args 
 	artifactPath := ""
 	licensePath := ""
 	noticePath := ""
+	confirmedPreviewSHA256 := ""
 	consumeInputs := false
 	flags.StringVar(&manifestPath, "manifest", manifestPath, "absolute owner-only release manifest path")
 	flags.StringVar(&manifestSHA256, "manifest-sha256", manifestSHA256, "pinned lowercase manifest SHA-256")
 	flags.StringVar(&artifactPath, "artifact", artifactPath, "absolute verified release artifact path")
 	flags.StringVar(&licensePath, "license", licensePath, "absolute verified LICENSE path")
 	flags.StringVar(&noticePath, "notice", noticePath, "absolute verified NOTICE path")
+	flags.StringVar(&confirmedPreviewSHA256, "confirmed-preview-sha256", confirmedPreviewSHA256, "SHA-256 of the exact canonical preview bytes shown to the user")
 	flags.BoolVar(&consumeInputs, "consume-inputs", consumeInputs, "remove verified manifest and artifact inputs after success")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -142,8 +205,8 @@ func (runner Runner) runDeployApply(ctx context.Context, operation string, args 
 	if flags.NArg() != 0 {
 		return fmt.Errorf("deploy %s accepts no positional arguments", operation)
 	}
-	if manifestPath == "" || manifestSHA256 == "" || artifactPath == "" || licensePath == "" || noticePath == "" {
-		return fmt.Errorf("deploy %s requires --manifest, --manifest-sha256, --artifact, --license, and --notice", operation)
+	if manifestPath == "" || manifestSHA256 == "" || artifactPath == "" || licensePath == "" || noticePath == "" || confirmedPreviewSHA256 == "" {
+		return fmt.Errorf("deploy %s requires --manifest, --manifest-sha256, --artifact, --license, --notice, and --confirmed-preview-sha256", operation)
 	}
 	inputPaths := []string{manifestPath, artifactPath, licensePath, noticePath}
 	seenInputs := make(map[string]bool, len(inputPaths))
@@ -162,11 +225,13 @@ func (runner Runner) runDeployApply(ctx context.Context, operation string, args 
 		return err
 	}
 	result, err := lifecycle.Apply(ctx, deployment.ApplyRequest{
-		ManifestPayload: payload,
-		ManifestSHA256:  manifestSHA256,
-		ArtifactPath:    artifactPath,
-		LicensePath:     licensePath,
-		NoticePath:      noticePath,
+		ManifestPath:           manifestPath,
+		ManifestPayload:        payload,
+		ManifestSHA256:         manifestSHA256,
+		ArtifactPath:           artifactPath,
+		LicensePath:            licensePath,
+		NoticePath:             noticePath,
+		ConfirmedPreviewSHA256: confirmedPreviewSHA256,
 	})
 	if err != nil {
 		return err

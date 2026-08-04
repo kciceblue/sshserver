@@ -20,48 +20,139 @@ type Instance struct {
 	lock     *fileLock
 }
 
-func Initialize(ctx context.Context, stateDir string, requestedListeners []string) (returnSettings config.Settings, returnErr error) {
+// InitializationLease serializes validation and initialization of one state
+// directory. Deployment apply acquires it before its final instance preflight
+// and hands the same lease into Initialize, closing the race between validation
+// and the journaled initialization step.
+type InitializationLease struct {
+	stateDir string
+	lock     *fileLock
+}
+
+// InitializationLockCreated reports whether this exact lease atomically
+// created the persistent lock path rather than opening a previously disclosed
+// lock. Deployment confirmation uses it to enforce the previewed action plan.
+func (lease *InitializationLease) InitializationLockCreated() bool {
+	return lease != nil && lease.lock != nil && lease.lock.created
+}
+
+// AttestLockPath proves that the initialization-lock path still names the
+// exact descriptor carrying this lease's flock.
+func (lease *InitializationLease) AttestLockPath() error {
+	if lease == nil || lease.lock == nil {
+		return errors.New("initialization lease is closed")
+	}
+	return lease.lock.attestPathIdentity()
+}
+
+func AcquireInitializationLease(stateDir string) (*InitializationLease, error) {
+	return acquireInitializationLease(stateDir, nil)
+}
+
+// AcquireInitializationLeaseWithLockPresence takes a lease without changing
+// the caller's previously confirmed lock-path presence. A present lock is
+// opened without O_CREATE; an absent lock is created with O_EXCL and is never
+// silently replaced by opening a concurrently created path.
+func AcquireInitializationLeaseWithLockPresence(stateDir string, lockPresent bool) (*InitializationLease, error) {
+	return acquireInitializationLease(stateDir, &lockPresent)
+}
+
+func acquireInitializationLease(stateDir string, lockPresent *bool) (*InitializationLease, error) {
 	paths := config.ForStateDir(stateDir)
 	if err := config.EnsureStateDirectory(paths.StateDir); err != nil {
+		return nil, err
+	}
+	var lock *fileLock
+	var err error
+	if lockPresent == nil {
+		lock, err = acquireLock(paths.StateDir)
+	} else {
+		lock, err = acquireLockWithPresence(paths.StateDir, *lockPresent)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &InitializationLease{stateDir: paths.StateDir, lock: lock}, nil
+}
+
+func (lease *InitializationLease) Initialize(ctx context.Context, requestedListeners []string) (config.Settings, error) {
+	if lease == nil || lease.lock == nil {
+		return config.Settings{}, errors.New("initialization lease is closed")
+	}
+	attest := func() error {
+		if err := lease.AttestLockPath(); err != nil {
+			return fmt.Errorf("attest initialization lease: %w", err)
+		}
+		return nil
+	}
+	if err := attest(); err != nil {
 		return config.Settings{}, err
 	}
-	lock, err := acquireLock(paths.StateDir)
+	return initializeWithLease(ctx, lease.stateDir, requestedListeners, attest)
+}
+
+func (lease *InitializationLease) Close() error {
+	if lease == nil || lease.lock == nil {
+		return nil
+	}
+	err := lease.lock.Close()
+	lease.lock = nil
+	return err
+}
+
+func Initialize(ctx context.Context, stateDir string, requestedListeners []string) (returnSettings config.Settings, returnErr error) {
+	lease, err := AcquireInitializationLease(stateDir)
 	if err != nil {
 		return config.Settings{}, err
 	}
 	defer func() {
-		if closeErr := lock.Close(); closeErr != nil {
+		if closeErr := lease.Close(); closeErr != nil {
 			returnErr = errors.Join(
 				returnErr,
 				fmt.Errorf("release initialization lock: %w", closeErr),
 			)
 		}
 	}()
+	return lease.Initialize(ctx, requestedListeners)
+}
 
+func initializeWithLease(ctx context.Context, stateDir string, requestedListeners []string, attest func() error) (config.Settings, error) {
+	if attest == nil {
+		return config.Settings{}, errors.New("initialization lease attestation is required")
+	}
+	paths := config.ForStateDir(stateDir)
 	marker, markerErr := config.LoadMarker(paths.InstallMarker)
 	markerExists := markerErr == nil
 	if markerErr != nil && !errors.Is(markerErr, os.ErrNotExist) {
 		return config.Settings{}, fmt.Errorf("load install marker: %w", markerErr)
 	}
 	if markerExists && marker.Phase == "ready" {
+		if err := attest(); err != nil {
+			return config.Settings{}, err
+		}
 		opened, err := Open(ctx, stateDir)
 		if err != nil {
 			return config.Settings{}, fmt.Errorf("validate completed installation: %w", err)
 		}
-		defer func() {
-			if closeErr := opened.Close(); closeErr != nil {
-				returnErr = errors.Join(
-					returnErr,
-					fmt.Errorf("close validated installation: %w", closeErr),
-				)
-			}
-		}()
 		if requestedListeners != nil && !config.SameListeners(requestedListeners, opened.Settings.Listeners) {
-			return config.Settings{}, errors.New("refusing to change listeners during idempotent initialization")
+			return config.Settings{}, errors.Join(
+				errors.New("refusing to change listeners during idempotent initialization"),
+				closeInstanceWithContext(opened, "close validated installation"),
+			)
 		}
-		return opened.Settings, nil
+		settings := opened.Settings
+		if err := closeInstanceWithContext(opened, "close validated installation"); err != nil {
+			return config.Settings{}, err
+		}
+		if err := attest(); err != nil {
+			return config.Settings{}, err
+		}
+		return settings, nil
 	}
 
+	if err := attest(); err != nil {
+		return config.Settings{}, err
+	}
 	if err := config.SaveMarker(paths.InstallMarker, config.InstallMarker{
 		Generation: "1",
 		Phase:      "initializing",
@@ -86,6 +177,9 @@ func Initialize(ctx context.Context, stateDir string, requestedListeners []strin
 		if err != nil {
 			return config.Settings{}, err
 		}
+		if err := attest(); err != nil {
+			return config.Settings{}, err
+		}
 		if err := config.SaveSettings(paths.Config, settings); err != nil {
 			return config.Settings{}, fmt.Errorf("write config: %w", err)
 		}
@@ -107,6 +201,9 @@ func Initialize(ctx context.Context, stateDir string, requestedListeners []strin
 		if _, err := rand.Read(secret); err != nil {
 			return config.Settings{}, fmt.Errorf("generate instance secret: %w", err)
 		}
+		if err := attest(); err != nil {
+			return config.Settings{}, err
+		}
 		if err := config.WriteSecret(paths.InstanceSecret, secret); err != nil {
 			return config.Settings{}, fmt.Errorf("write instance secret: %w", err)
 		}
@@ -116,6 +213,9 @@ func Initialize(ctx context.Context, stateDir string, requestedListeners []strin
 		}
 	}
 
+	if err := attest(); err != nil {
+		return config.Settings{}, err
+	}
 	database, err := store.Open(ctx, paths.Database, store.Identity{
 		InstanceID: settings.InstanceID,
 		VaultID:    settings.VaultID,
@@ -126,6 +226,9 @@ func Initialize(ctx context.Context, stateDir string, requestedListeners []strin
 	if err := database.Close(); err != nil {
 		return config.Settings{}, fmt.Errorf("close initialized database: %w", err)
 	}
+	if err := attest(); err != nil {
+		return config.Settings{}, err
+	}
 	if err := config.SaveMarker(paths.InstallMarker, config.InstallMarker{
 		Generation: "1",
 		Phase:      "ready",
@@ -133,7 +236,17 @@ func Initialize(ctx context.Context, stateDir string, requestedListeners []strin
 	}); err != nil {
 		return config.Settings{}, fmt.Errorf("record installation completion: %w", err)
 	}
+	if err := attest(); err != nil {
+		return config.Settings{}, err
+	}
 	return settings, nil
+}
+
+func closeInstanceWithContext(opened *Instance, operation string) error {
+	if err := opened.Close(); err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	return nil
 }
 
 func Open(ctx context.Context, stateDir string) (*Instance, error) {
@@ -214,6 +327,13 @@ func OpenForServe(ctx context.Context, stateDir string) (*Instance, error) {
 			return nil, errors.Join(err, fmt.Errorf("release server lock: %w", closeErr))
 		}
 		return nil, err
+	}
+	if err := lock.attestPathIdentity(); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("attest server lock after opening instance: %w", err),
+			opened.Close(),
+			lock.Close(),
+		)
 	}
 	opened.lock = lock
 	return opened, nil
