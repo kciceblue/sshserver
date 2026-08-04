@@ -32,12 +32,27 @@ class ReleaseManifestSchemaTests(unittest.TestCase):
         download_origin = properties["download_origin"]
         self.assertEqual(download_origin["maxLength"], 512)
         origin_pattern = re.compile(download_origin["pattern"])
+        oversized_path_pattern = re.compile(download_origin["not"]["pattern"])
+
+        def accepts_origin(value: str) -> bool:
+            return (
+                len(value) <= download_origin["maxLength"]
+                and origin_pattern.fullmatch(value) is not None
+                and oversized_path_pattern.search(value) is None
+            )
+
+        maximum_path = "https://downloads.example.test/" + ("a" * 255)
         for value in (
             "https://downloads.example.test",
             "https://kciceblue.github.io/sshserver",
             "https://downloads.example.test/products/sshserver-v1",
+            maximum_path,
         ):
-            self.assertIsNotNone(origin_pattern.fullmatch(value), value)
+            self.assertTrue(accepts_origin(value), value)
+        oversized_path = "https://downloads.example.test/" + ("a" * 256)
+        self.assertLess(len(oversized_path), download_origin["maxLength"])
+        self.assertIsNotNone(origin_pattern.fullmatch(oversized_path))
+        self.assertIsNotNone(oversized_path_pattern.search(oversized_path))
         for value in (
             "http://downloads.example.test",
             "https://downloads.example.test/",
@@ -45,8 +60,10 @@ class ReleaseManifestSchemaTests(unittest.TestCase):
             "https://downloads.example.test/project/../release",
             "https://downloads.example.test/%72elease",
             "https://downloads.example.test/project?release=1",
+            oversized_path,
+            "https://downloads.example.test/" + ("a" * 300),
         ):
-            self.assertIsNone(origin_pattern.fullmatch(value), value)
+            self.assertFalse(accepts_origin(value), value)
 
     def test_release_grammar_accepts_only_exact_immutable_versions(self) -> None:
         release = self.schema["properties"]["release"]

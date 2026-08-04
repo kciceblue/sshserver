@@ -11,7 +11,9 @@ Authors and licensed under the BSD 3-Clause License; their complete license
 texts are in ThirdPartyLicenses/.
 
 External GitHub Actions used by CI are recorded in DEPENDENCIES.json and are
-not redistributed by this repository.
+not redistributed by this repository. Release publication uses
+`actions/upload-pages-artifact@v4` and `actions/deploy-pages@v4`; both are
+licensed under the MIT License.
 
 The independent Swift cryptographic KAT invokes an explicitly selected OpenSSL
 3.6.3 command-line tool (Apache-2.0) for Argon2id only.

@@ -41,7 +41,11 @@
     "download_origin": {
       "type": "string",
       "maxLength": 512,
-      "pattern": "^https://[^/?#]+(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+      "pattern": "^https://[^/?#]+(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$",
+      "$comment": "The canonical path is ASCII-only and at most 256 bytes including its leading slash.",
+      "not": {
+        "pattern": "^https://[^/?#]+/.{256,}$"
+      }
     },
     "artifacts": {
       "type": "array",

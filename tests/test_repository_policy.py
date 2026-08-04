@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import unittest
@@ -118,6 +119,23 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn('.assets == []', workflow)
         self.assertNotIn("sudo", workflow)
         self.assertNotIn("curl |", workflow)
+
+    def test_pages_actions_are_inventoried_and_attributed(self) -> None:
+        inventory = json.loads(
+            (ROOT / "DEPENDENCIES.json").read_text(encoding="utf-8")
+        )
+        dependencies = {
+            item["selector"]: item for item in inventory["dependencies"]
+        }
+        notice = (ROOT / "NOTICE").read_text(encoding="utf-8")
+        for selector in (
+            "actions/upload-pages-artifact@v4",
+            "actions/deploy-pages@v4",
+        ):
+            with self.subTest(selector=selector):
+                self.assertEqual(dependencies[selector]["license"], "MIT")
+                self.assertEqual(dependencies[selector]["usage"], "ci-action")
+                self.assertIn(selector, notice)
 
     def test_manual_ci_reports_existing_branch_protection_context(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(

@@ -38,7 +38,9 @@ exact origin, release, source revision, Go toolchain, four target identities,
 byte counts, SHA-256 digests, LICENSE, and NOTICE.
 
 The download base is an exact lowercase HTTPS host with an optional canonical,
-unescaped path prefix. Every file URL must append exactly
+unescaped path prefix. The prefix is at most 256 ASCII bytes including its
+leading slash, and the existing 512-character bound still applies to the
+complete origin. Every file URL must append exactly
 `/releases/<release>/<file>` to that base. This permits a repository-scoped
 GitHub Pages site while still rejecting redirects, queries, fragments, encoded
 segments, dot segments, empty segments, and moving release labels.
