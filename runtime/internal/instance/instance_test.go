@@ -3,11 +3,15 @@ package instance
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/kciceblue/sshserver/runtime/internal/config"
 )
 
 func TestInitializationLeaseSerializesValidationThroughInitialize(t *testing.T) {
@@ -85,6 +89,169 @@ func TestInitializationLeaseRejectsUnlinkedOrReplacedLockPath(t *testing.T) {
 	}
 	if _, err := lease.Initialize(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "attest initialization lease") {
 		t.Fatalf("orphaned lease initialize error=%v", err)
+	}
+}
+
+func TestInitializeWithLeaseReattestsBeforeEveryMutationAndSuccess(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		targetCall    int
+		markerPhase   string
+		configPresent bool
+		secretPresent bool
+		databaseFound bool
+	}{
+		{name: "initializing marker", targetCall: 1},
+		{name: "settings", targetCall: 2, markerPhase: "initializing"},
+		{name: "secret", targetCall: 3, markerPhase: "initializing", configPresent: true},
+		{name: "database", targetCall: 4, markerPhase: "initializing", configPresent: true, secretPresent: true},
+		{name: "ready marker", targetCall: 5, markerPhase: "initializing", configPresent: true, secretPresent: true, databaseFound: true},
+		{name: "successful return", targetCall: 6, markerPhase: "ready", configPresent: true, secretPresent: true, databaseFound: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), "state")
+			lease, err := AcquireInitializationLease(stateDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if closeErr := lease.Close(); closeErr != nil {
+					t.Error(closeErr)
+				}
+			})
+			attestationCalls := 0
+			var replacement *InitializationLease
+			attest := func() error {
+				attestationCalls++
+				if attestationCalls == testCase.targetCall {
+					lockPath := filepath.Join(stateDir, ".instance.lock")
+					if err := os.Remove(lockPath); err != nil {
+						return err
+					}
+					if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+						return err
+					}
+					var err error
+					replacement, err = AcquireInitializationLeaseWithLockPresence(stateDir, true)
+					if err != nil {
+						return err
+					}
+				}
+				if err := lease.AttestLockPath(); err != nil {
+					return fmt.Errorf("attest initialization lease: %w", err)
+				}
+				return nil
+			}
+
+			_, err = initializeWithLease(context.Background(), stateDir, []string{"127.0.0.1:37421"}, attest)
+			if replacement == nil {
+				t.Fatal("initialization boundary did not acquire the replacement lease")
+			}
+			if closeErr := replacement.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			if attestationCalls != testCase.targetCall || err == nil || !strings.Contains(err.Error(), "attest initialization lease") {
+				t.Fatalf("initialization boundary calls=%d error=%v", attestationCalls, err)
+			}
+
+			paths := config.ForStateDir(stateDir)
+			marker, markerErr := config.LoadMarker(paths.InstallMarker)
+			if testCase.markerPhase == "" {
+				if !errors.Is(markerErr, os.ErrNotExist) {
+					t.Fatalf("initialization boundary created marker=%+v err=%v", marker, markerErr)
+				}
+			} else if markerErr != nil || marker.Phase != testCase.markerPhase {
+				t.Fatalf("initialization boundary marker=%+v err=%v", marker, markerErr)
+			}
+			for _, expected := range []struct {
+				path    string
+				present bool
+			}{
+				{path: paths.Config, present: testCase.configPresent},
+				{path: paths.InstanceSecret, present: testCase.secretPresent},
+				{path: paths.Database, present: testCase.databaseFound},
+			} {
+				_, statErr := os.Lstat(expected.path)
+				if expected.present && statErr != nil {
+					t.Fatalf("initialization boundary missing %s: %v", expected.path, statErr)
+				}
+				if !expected.present && !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("initialization boundary unexpectedly created %s: %v", expected.path, statErr)
+				}
+			}
+		})
+	}
+
+	for _, targetCall := range []int{1, 2} {
+		name := "ready validation"
+		if targetCall == 2 {
+			name = "ready successful return"
+		}
+		t.Run(name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), "state")
+			if _, err := Initialize(context.Background(), stateDir, []string{"127.0.0.1:37421"}); err != nil {
+				t.Fatal(err)
+			}
+			lease, err := AcquireInitializationLease(stateDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if closeErr := lease.Close(); closeErr != nil {
+					t.Error(closeErr)
+				}
+			})
+			paths := config.ForStateDir(stateDir)
+			protectedPaths := []string{paths.InstallMarker, paths.Config, paths.InstanceSecret, paths.Database}
+			atReplacement := make(map[string][]byte, len(protectedPaths))
+			attestationCalls := 0
+			var replacement *InitializationLease
+			attest := func() error {
+				attestationCalls++
+				if attestationCalls == targetCall {
+					for _, path := range protectedPaths {
+						payload, err := os.ReadFile(path)
+						if err != nil {
+							return err
+						}
+						atReplacement[path] = payload
+					}
+					lockPath := filepath.Join(stateDir, ".instance.lock")
+					if err := os.Remove(lockPath); err != nil {
+						return err
+					}
+					if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+						return err
+					}
+					var err error
+					replacement, err = AcquireInitializationLeaseWithLockPresence(stateDir, true)
+					if err != nil {
+						return err
+					}
+				}
+				if err := lease.AttestLockPath(); err != nil {
+					return fmt.Errorf("attest initialization lease: %w", err)
+				}
+				return nil
+			}
+
+			_, err = initializeWithLease(context.Background(), stateDir, []string{"127.0.0.1:37421"}, attest)
+			if replacement == nil {
+				t.Fatal("ready initialization boundary did not acquire the replacement lease")
+			}
+			if closeErr := replacement.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			if attestationCalls != targetCall || err == nil || !strings.Contains(err.Error(), "attest initialization lease") {
+				t.Fatalf("ready initialization boundary calls=%d error=%v", attestationCalls, err)
+			}
+			for _, path := range protectedPaths {
+				after, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(after, atReplacement[path]) {
+					t.Fatalf("ready initialization mutated %s after replacement: equal=%v err=%v", path, bytes.Equal(after, atReplacement[path]), err)
+				}
+			}
+		})
 	}
 }
 

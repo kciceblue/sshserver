@@ -720,6 +720,60 @@ func TestIdempotentRepairReattestsInitializationLeaseAtEveryMutationAndReturn(t 
 	}
 }
 
+func TestApplyReattestsInitializationLeaseAfterVersionDirectoryBeforeArtifactPublication(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	request, desired := fixture.release(t, "v1.2.3", "forward-artifact-publication")
+	fixture.lifecycle.failAfterPhase = PhasePlanned
+	if _, err := applyConfirmed(t, fixture.lifecycle, request); !errors.Is(err, ErrInjectedDeploymentCrash) {
+		t.Fatalf("injected planned apply error=%v", err)
+	}
+	fixture.lifecycle.failAfterPhase = ""
+	journalBefore, err := os.ReadFile(fixture.layout.JournalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestationCalls := 0
+	var replacement *instance.InitializationLease
+	originalAcquire := fixture.lifecycle.acquireInstanceLease
+	fixture.lifecycle.acquireInstanceLease = func(stateDir string, initializationLockPresent bool) (instanceInitializationLease, error) {
+		lease, err := originalAcquire(stateDir, initializationLockPresent)
+		if err != nil {
+			return nil, err
+		}
+		return replaceInitializationLockAtAttestation(lease, stateDir, 4, &attestationCalls, &replacement), nil
+	}
+	stageBefore, supportBefore, initializeBefore := fixture.stageCalls, fixture.supportStageCalls, fixture.initializeCalls
+
+	_, err = applyConfirmed(t, fixture.lifecycle, request)
+	if replacement == nil {
+		t.Fatal("forward artifact boundary did not acquire the replacement initialization lock")
+	}
+	if closeErr := replacement.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if attestationCalls != 5 || !errors.Is(err, ErrDeploymentPreviewConfirmationMismatch) ||
+		!strings.Contains(err.Error(), "leased initialization lock path changed") {
+		t.Fatalf("forward artifact boundary attestation calls=%d error=%v", attestationCalls, err)
+	}
+	journalAfter, err := os.ReadFile(fixture.layout.JournalPath)
+	if err != nil || !bytes.Equal(journalAfter, journalBefore) {
+		t.Fatalf("forward artifact boundary changed journal: equal=%v err=%v", bytes.Equal(journalAfter, journalBefore), err)
+	}
+	journal, err := LoadJournal(fixture.layout)
+	if err != nil || journal.Phase != PhasePlanned || journal.Desired == nil || *journal.Desired != desired {
+		t.Fatalf("forward artifact recovery journal=%+v err=%v", journal, err)
+	}
+	if fixture.stageCalls != stageBefore || fixture.supportStageCalls != supportBefore || fixture.initializeCalls != initializeBefore {
+		t.Fatalf("forward artifact boundary stage/support/init=%d/%d/%d", fixture.stageCalls-stageBefore, fixture.supportStageCalls-supportBefore, fixture.initializeCalls-initializeBefore)
+	}
+	if _, err := LoadState(fixture.layout); !errors.Is(err, ErrNoDeploymentState) {
+		t.Fatalf("forward artifact boundary created state: %v", err)
+	}
+	if _, err := os.Lstat(desired.BinaryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("forward artifact boundary published binary: %v", err)
+	}
+}
+
 func TestApplyReattestsInitializationLeaseBeforeForwardServiceMutations(t *testing.T) {
 	replaceInitializationLock := func(stateDir string) (*instance.InitializationLease, error) {
 		lockPath := filepath.Join(stateDir, ".instance.lock")

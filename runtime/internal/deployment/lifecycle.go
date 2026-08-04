@@ -1220,6 +1220,9 @@ func (lifecycle *Lifecycle) runApply(
 		if err != nil {
 			return ApplyResult{}, err
 		}
+		if err := attest(); err != nil {
+			return ApplyResult{}, err
+		}
 		staged, err := lifecycle.stageArtifact(journal.SourcePath, versionDir, filepath.Base(desired.BinaryPath), desired.BinaryBytes, desired.BinarySHA256)
 		if err != nil {
 			return ApplyResult{}, err
