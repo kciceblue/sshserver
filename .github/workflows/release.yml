@@ -191,16 +191,50 @@ jobs:
             git tag -a "$RELEASE_VERSION" "$SOURCE_REVISION" -m "sshserver $RELEASE_VERSION"
             git push origin "refs/tags/$RELEASE_VERSION"
           fi
-          if gh release view "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION" --jq .object.sha)" != ""
+          release_notes="$RUNNER_TEMP/release-notes.txt"
+          printf '%s\n\n%s' \
+            "Immutable release bundle: $DOWNLOAD_BASE/releases/$RELEASE_VERSION/" \
+            "release-manifest.json SHA-256: $MANIFEST_SHA256" \
+            > "$release_notes"
+          release_is_prerelease=false
+          release_flags=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            release_is_prerelease=true
+            release_flags+=(--prerelease)
+          fi
+          repository_owner="${GITHUB_REPOSITORY%%/*}"
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          test -n "$repository_owner"
+          test "$repository_name" != "$GITHUB_REPOSITORY"
+          release_id="$(gh api graphql \
+            -f query='query($owner:String!,$name:String!,$tag:String!){repository(owner:$owner,name:$name){release(tagName:$tag){id}}}' \
+            -F owner="$repository_owner" \
+            -F name="$repository_name" \
+            -F tag="$RELEASE_VERSION" \
+            --jq '.data.repository.release.id // ""')"
+          if test -n "$release_id"; then
+            release_json="$RUNNER_TEMP/github-release.json"
+            gh release view "$RELEASE_VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets,body,isDraft,isPrerelease,name,tagName \
+              > "$release_json"
+            jq --exit-status \
+              --arg expected_tag "$RELEASE_VERSION" \
+              --arg expected_name "sshserver $RELEASE_VERSION" \
+              --rawfile expected_body "$release_notes" \
+              --argjson expected_prerelease "$release_is_prerelease" \
+              '.tagName == $expected_tag and
+               .name == $expected_name and
+               .body == $expected_body and
+               .isDraft == false and
+               .isPrerelease == $expected_prerelease and
+               .assets == []' \
+              "$release_json" >/dev/null
           else
-            printf '%s\n\n%s\n' \
-              "Immutable release bundle: $DOWNLOAD_BASE/releases/$RELEASE_VERSION/" \
-              "release-manifest.json SHA-256: $MANIFEST_SHA256" \
-              > "$RUNNER_TEMP/release-notes.txt"
             gh release create "$RELEASE_VERSION" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "sshserver $RELEASE_VERSION" \
-              --notes-file "$RUNNER_TEMP/release-notes.txt"
+              --notes-file "$release_notes" \
+              "${release_flags[@]}"
           fi

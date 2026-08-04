@@ -101,6 +101,21 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("id-token: write", workflow)
         self.assertIn("--proto '=https'", workflow)
         self.assertIn("--verify-tag", workflow)
+        self.assertIn('release_is_prerelease=false', workflow)
+        self.assertIn('if [[ "$RELEASE_VERSION" == *-* ]]; then', workflow)
+        self.assertIn('release_is_prerelease=true', workflow)
+        self.assertIn('release_flags+=(--prerelease)', workflow)
+        self.assertIn('"${release_flags[@]}"', workflow)
+        self.assertIn(
+            "--json assets,body,isDraft,isPrerelease,name,tagName",
+            workflow,
+        )
+        self.assertIn('.tagName == $expected_tag', workflow)
+        self.assertIn('.name == $expected_name', workflow)
+        self.assertIn('.body == $expected_body', workflow)
+        self.assertIn('.isDraft == false', workflow)
+        self.assertIn('.isPrerelease == $expected_prerelease', workflow)
+        self.assertIn('.assets == []', workflow)
         self.assertNotIn("sudo", workflow)
         self.assertNotIn("curl |", workflow)
 
