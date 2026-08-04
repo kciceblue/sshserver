@@ -47,7 +47,10 @@ runtime-build-one:
 	test -n "$(RUNTIME_GOARCH)"
 	if test "$(VERSION)" != dev; then test "$(BUILD_ATTESTATION)" != dev; fi
 	mkdir -p "$(DIST_DIR)"
-	cd runtime && GOENV=off GOWORK=off GOFLAGS= GOEXPERIMENT= GOTOOLCHAIN=local GOAMD64=v1 GOARM64=v8.0 CGO_ENABLED=0 GOOS="$(RUNTIME_GOOS)" GOARCH="$(RUNTIME_GOARCH)" $(GO) build -mod=readonly -buildmode=exe -buildvcs=true -tags="" -trimpath -ldflags "-X github.com/kciceblue/sshserver/runtime/internal/buildinfo.EncodedIdentity=$(BUILD_ATTESTATION)" -o "../$(DIST_DIR)/sshserver-$(RUNTIME_GOOS)-$(RUNTIME_GOARCH)" ./cmd/sshserver
+	@set -eu; \
+		output_dir="$$( $(PYTHON) -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$(DIST_DIR)")"; \
+		cd runtime; \
+		GOENV=off GOWORK=off GOFLAGS= GOEXPERIMENT= GOTOOLCHAIN=local GOAMD64=v1 GOARM64=v8.0 CGO_ENABLED=0 GOOS="$(RUNTIME_GOOS)" GOARCH="$(RUNTIME_GOARCH)" $(GO) build -mod=readonly -buildmode=exe -buildvcs=true -tags="" -trimpath -ldflags "-X github.com/kciceblue/sshserver/runtime/internal/buildinfo.EncodedIdentity=$(BUILD_ATTESTATION)" -o "$$output_dir/sshserver-$(RUNTIME_GOOS)-$(RUNTIME_GOARCH)" ./cmd/sshserver
 
 runtime-release:
 	$(MAKE) runtime-build-one RUNTIME_GOOS=linux RUNTIME_GOARCH=amd64
@@ -72,7 +75,12 @@ runtime-release-bundle: runtime-release-source-check
 	$(MAKE) runtime-release-bundle-one RUNTIME_GOOS=linux RUNTIME_GOARCH=arm64 DIST_DIR="$(RELEASE_ARTIFACT_DIR)"
 	$(MAKE) runtime-release-bundle-one RUNTIME_GOOS=darwin RUNTIME_GOARCH=amd64 DIST_DIR="$(RELEASE_ARTIFACT_DIR)"
 	$(MAKE) runtime-release-bundle-one RUNTIME_GOOS=darwin RUNTIME_GOARCH=arm64 DIST_DIR="$(RELEASE_ARTIFACT_DIR)"
-	cd runtime && GOENV=off GOWORK=off GOFLAGS= GOEXPERIMENT= GOTOOLCHAIN=local $(GO) run -mod=readonly ./cmd/releasebundle generate --artifacts "$(abspath $(RELEASE_ARTIFACT_DIR))" --dist "$(abspath $(RELEASE_BUNDLE_DIR))" --license "$(abspath LICENSE)" --notice "$(abspath NOTICE)" --release "$(VERSION)" --source-revision "$(SOURCE_REVISION)" --build-toolchain "$(BUILD_TOOLCHAIN)" --download-origin "$(DOWNLOAD_ORIGIN)"
+	@set -eu; \
+		repository_root="$$(pwd -P)"; \
+		artifact_dir="$$( $(PYTHON) -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$(RELEASE_ARTIFACT_DIR)")"; \
+		bundle_dir="$$( $(PYTHON) -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$(RELEASE_BUNDLE_DIR)")"; \
+		cd runtime; \
+		GOENV=off GOWORK=off GOFLAGS= GOEXPERIMENT= GOTOOLCHAIN=local $(GO) run -mod=readonly ./cmd/releasebundle generate --artifacts "$$artifact_dir" --dist "$$bundle_dir" --license "$$repository_root/LICENSE" --notice "$$repository_root/NOTICE" --release "$(VERSION)" --source-revision "$(SOURCE_REVISION)" --build-toolchain "$(BUILD_TOOLCHAIN)" --download-origin "$(DOWNLOAD_ORIGIN)"
 
 runtime-release-bundle-check: runtime-release-bundle
 	$(PYTHON) scripts/check_runtime_release.py --dist "$(RELEASE_BUNDLE_DIR)" --version "$(VERSION)" --execute-native

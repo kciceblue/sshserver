@@ -121,6 +121,34 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertNotIn("sudo", workflow)
         self.assertNotIn("curl |", workflow)
 
+    def test_runtime_build_preserves_absolute_and_whitespace_directories(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn(
+            "output_dir=\"$$( $(PYTHON) -c 'import os, sys; "
+            "print(os.path.abspath(sys.argv[1]))' \"$(DIST_DIR)\")\"",
+            makefile,
+        )
+        self.assertIn(
+            '-o "$$output_dir/sshserver-$(RUNTIME_GOOS)-$(RUNTIME_GOARCH)"',
+            makefile,
+        )
+        self.assertNotIn("$(abspath $(DIST_DIR))", makefile)
+
+        self.assertIn(
+            "artifact_dir=\"$$( $(PYTHON) -c 'import os, sys; "
+            "print(os.path.abspath(sys.argv[1]))' "
+            "\"$(RELEASE_ARTIFACT_DIR)\")\"",
+            makefile,
+        )
+        self.assertIn(
+            "bundle_dir=\"$$( $(PYTHON) -c 'import os, sys; "
+            "print(os.path.abspath(sys.argv[1]))' "
+            "\"$(RELEASE_BUNDLE_DIR)\")\"",
+            makefile,
+        )
+        self.assertNotIn("$(abspath $(RELEASE_ARTIFACT_DIR))", makefile)
+        self.assertNotIn("$(abspath $(RELEASE_BUNDLE_DIR))", makefile)
+
     def test_pages_actions_are_inventoried_and_attributed(self) -> None:
         inventory = json.loads(
             (ROOT / "DEPENDENCIES.json").read_text(encoding="utf-8")
