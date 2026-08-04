@@ -44,6 +44,8 @@ func TestGeneratedInstallerAndOneLineCommandHavePinnedShellSyntax(t *testing.T) 
 		`"$physical_home/.jat-sshserver-install.XXXXXXXX"`,
 		`run_clean ./sshserver deploy preview`,
 		`run_clean ./sshserver deploy apply`,
+		`command : 3<'/dev/tty'`,
+		`command : 4>'/dev/tty'`,
 		`exec 3<'/dev/tty'`,
 		`exec 4>'/dev/tty'`,
 		`exec 3<&-`,

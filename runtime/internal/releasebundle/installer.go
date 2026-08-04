@@ -237,8 +237,15 @@ for xdg_pair in "XDG_DATA_HOME:$XDG_DATA_HOME" "XDG_STATE_HOME:$XDG_STATE_HOME" 
   fi
 done
 
-exec 3<{{quote .TTYReadPath}} || fail 'an interactive controlling terminal is required'
-exec 4>{{quote .TTYWritePath}} || fail 'an interactive controlling terminal is required'
+# A redirection failure on the POSIX special builtin exec may terminate dash
+# before its OR handler runs. Probe each fixed terminal path through the
+# regular command builtin first so every supported /bin/sh reports the
+# product diagnostic, then retain the descriptors for the exact preview and
+# confirmation exchange.
+command : 3<{{quote .TTYReadPath}} || fail 'an interactive controlling terminal is required'
+command : 4>{{quote .TTYWritePath}} || fail 'an interactive controlling terminal is required'
+exec 3<{{quote .TTYReadPath}}
+exec 4>{{quote .TTYWritePath}}
 
 tool_path() {
   resolved_tool=$(command -v "$1" 2>/dev/null || true)
