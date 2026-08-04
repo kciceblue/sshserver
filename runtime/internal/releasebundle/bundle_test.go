@@ -2,6 +2,7 @@ package releasebundle
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +32,28 @@ func TestGenerateProducesDeterministicPinnedBundleForFourTargets(t *testing.T) {
 	if len(manifest.Artifacts) != 4 || len(result.PreviewPaths) != 4 || len(result.UploadFiles) != 4 || manifest.SourceRevision != options.SourceRevision {
 		t.Fatalf("manifest/result=%+v / %+v", manifest, result)
 	}
+	installerPayload, err := os.ReadFile(result.InstallerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installCommandPayload, err := os.ReadFile(result.InstallCommandPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.InstallerURL != options.DownloadOrigin+"/releases/"+options.Release+"/install.sh" ||
+		result.InstallerBytes != int64(len(installerPayload)) || result.InstallerSHA256 != deployment.SHA256Hex(installerPayload) ||
+		result.InstallCommandBytes != int64(len(installCommandPayload)) || result.InstallCommandSHA256 != deployment.SHA256Hex(installCommandPayload) {
+		t.Fatalf("installer result pins=%+v", result)
+	}
+	if strings.Count(string(installCommandPayload), "\n") != 1 || !strings.HasSuffix(string(installCommandPayload), "\n") ||
+		!strings.Contains(string(installCommandPayload), result.InstallerURL) ||
+		!strings.Contains(string(installCommandPayload), result.InstallerSHA256) ||
+		!strings.Contains(string(installCommandPayload), fmt.Sprint(result.InstallerBytes)) {
+		t.Fatalf("install command is not one exact pinned line: %q", installCommandPayload)
+	}
 	firstManifest := append([]byte(nil), manifestPayload...)
+	firstInstaller := append([]byte(nil), installerPayload...)
+	firstInstallCommand := append([]byte(nil), installCommandPayload...)
 	firstPreviews := make(map[string][]byte)
 	for key, path := range result.PreviewPaths {
 		payload, err := os.ReadFile(path)
@@ -51,13 +73,19 @@ func TestGenerateProducesDeterministicPinnedBundleForFourTargets(t *testing.T) {
 	if !bytes.Equal(firstManifest, secondManifest) || result.ManifestSHA256 != second.ManifestSHA256 {
 		t.Fatal("identical release inputs produced different manifest bytes")
 	}
+	secondInstaller, _ := os.ReadFile(second.InstallerPath)
+	secondInstallCommand, _ := os.ReadFile(second.InstallCommandPath)
+	if !bytes.Equal(firstInstaller, secondInstaller) || !bytes.Equal(firstInstallCommand, secondInstallCommand) ||
+		result.InstallerSHA256 != second.InstallerSHA256 || result.InstallCommandSHA256 != second.InstallCommandSHA256 {
+		t.Fatal("identical release inputs produced different installer bytes")
+	}
 	for key, first := range firstPreviews {
 		secondPayload, _ := os.ReadFile(second.PreviewPaths[key])
 		if !bytes.Equal(first, secondPayload) || result.PreviewSHA256[key] != second.PreviewSHA256[key] {
 			t.Fatalf("identical release inputs produced different %s preview", key)
 		}
 	}
-	for _, name := range []string{"release-manifest.json", "LICENSE", "NOTICE"} {
+	for _, name := range []string{"release-manifest.json", "install.sh", "install-command.txt", "LICENSE", "NOTICE"} {
 		info, err := os.Lstat(filepath.Join(options.DistDir, name))
 		if err != nil {
 			t.Fatal(err)
@@ -235,8 +263,8 @@ func TestGenerateConcurrentIdenticalPublishersConvergeWithoutReplacement(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 11 {
-		t.Fatalf("published entries=%d want=11", len(entries))
+	if len(entries) != 13 {
+		t.Fatalf("published entries=%d want=13", len(entries))
 	}
 }
 

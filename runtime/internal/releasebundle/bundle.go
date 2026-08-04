@@ -38,11 +38,18 @@ type Options struct {
 }
 
 type Result struct {
-	ManifestPath   string                 `json:"manifest_path"`
-	ManifestSHA256 string                 `json:"manifest_sha256"`
-	PreviewPaths   map[string]string      `json:"preview_paths"`
-	PreviewSHA256  map[string]string      `json:"preview_sha256"`
-	UploadFiles    map[string]UploadFiles `json:"upload_files"`
+	ManifestPath         string                 `json:"manifest_path"`
+	ManifestSHA256       string                 `json:"manifest_sha256"`
+	InstallerPath        string                 `json:"installer_path"`
+	InstallerURL         string                 `json:"installer_url"`
+	InstallerBytes       int64                  `json:"installer_bytes"`
+	InstallerSHA256      string                 `json:"installer_sha256"`
+	InstallCommandPath   string                 `json:"install_command_path"`
+	InstallCommandBytes  int64                  `json:"install_command_bytes"`
+	InstallCommandSHA256 string                 `json:"install_command_sha256"`
+	PreviewPaths         map[string]string      `json:"preview_paths"`
+	PreviewSHA256        map[string]string      `json:"preview_sha256"`
+	UploadFiles          map[string]UploadFiles `json:"upload_files"`
 }
 
 // UploadFiles are the exact owner-only names that the SSH client must create
@@ -177,14 +184,34 @@ func generate(options Options, verifyMetadata metadataVerifier) (Result, error) 
 		return Result{}, err
 	}
 	manifestSHA256 := deployment.SHA256Hex(manifestPayload)
-	result := Result{
-		ManifestPath:   filepath.Join(options.DistDir, "release-manifest.json"),
-		ManifestSHA256: manifestSHA256,
-		PreviewPaths:   make(map[string]string),
-		PreviewSHA256:  make(map[string]string),
-		UploadFiles:    make(map[string]UploadFiles),
+	installerPayload, err := InstallerScript(manifest, int64(len(manifestPayload)), manifestSHA256)
+	if err != nil {
+		return Result{}, err
 	}
-	outputs = append(outputs, bundleOutput{name: "release-manifest.json", payload: manifestPayload, mode: 0o400})
+	installerURL := releaseURL(options, "install.sh")
+	installCommandPayload, err := InstallCommand(installerURL, installerPayload)
+	if err != nil {
+		return Result{}, err
+	}
+	result := Result{
+		ManifestPath:         filepath.Join(options.DistDir, "release-manifest.json"),
+		ManifestSHA256:       manifestSHA256,
+		InstallerPath:        filepath.Join(options.DistDir, "install.sh"),
+		InstallerURL:         installerURL,
+		InstallerBytes:       int64(len(installerPayload)),
+		InstallerSHA256:      deployment.SHA256Hex(installerPayload),
+		InstallCommandPath:   filepath.Join(options.DistDir, "install-command.txt"),
+		InstallCommandBytes:  int64(len(installCommandPayload)),
+		InstallCommandSHA256: deployment.SHA256Hex(installCommandPayload),
+		PreviewPaths:         make(map[string]string),
+		PreviewSHA256:        make(map[string]string),
+		UploadFiles:          make(map[string]UploadFiles),
+	}
+	outputs = append(outputs,
+		bundleOutput{name: "release-manifest.json", payload: manifestPayload, mode: 0o400},
+		bundleOutput{name: "install.sh", payload: installerPayload, mode: 0o400},
+		bundleOutput{name: "install-command.txt", payload: installCommandPayload, mode: 0o400},
+	)
 	for _, target := range deployment.SupportedTargets() {
 		artifact, err := manifest.Artifact(target)
 		if err != nil {

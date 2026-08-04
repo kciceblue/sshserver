@@ -26,6 +26,8 @@ dist/releases/<release>/
   LICENSE
   NOTICE
   release-manifest.json
+  install.sh
+  install-command.txt
   sshserver-{linux,darwin}-{amd64,arm64}
   preview-{linux,darwin}-{amd64,arm64}.txt
 ```
@@ -73,12 +75,74 @@ files only after a successful transaction. On success, the confirmed activation
 line passes through the one-line `deploy apply` JSON result, including its
 `deployment_locator`, unchanged.
 
-This is deliberately the server activation foundation, not yet a standalone
-copy-and-paste installer: target detection, downloads, local verification,
-atomic SSH upload, supervision of a foreground fallback, and enrollment
-handoff belong to the following private-client adapter and UI work. A clean
-sync host needs only its existing SSH service; ordinary SSH targets never
-receive this server.
+## Copyable one-line installer
+
+`install-command.txt` contains exactly one shell command. Obtain that command
+from the trusted app release catalog or another authenticated release channel;
+the command itself is the trust root and carries the literal `install.sh` URL,
+exact byte count, and lowercase SHA-256. It starts a clean `/bin/sh`, disables
+curl configuration, permits HTTPS only, refuses redirect following, applies
+finite connect and transfer timeouts plus both curl's expected-size check and an
+independent process file-size limit for unknown-length responses, downloads to
+a new owner-only temporary directory, and independently checks the final byte
+count and digest before invoking the installer file. Downloaded
+bytes are never piped into a shell, and a separately downloaded checksum file
+is never trusted.
+
+The verified `install.sh` starts again with a sanitized environment. It retains
+only a validated absolute `HOME` and optional absolute XDG data, state,
+configuration, and runtime directories; fixes `PATH` and `LC_ALL`; uses a new
+owner-only executable workspace beneath the physical home rather than `/tmp`;
+enters and reprotects that directory before writing it; and keeps every
+download, digest check, preview, and artifact execution relative to that pinned
+working-directory inode. Renaming or replacing its parent pathname therefore
+cannot substitute executable bytes. A symlink or automounted `HOME` remains
+supported because the deployment process receives the original `HOME` while
+the staging directory uses its physical location. The installer
+requires system curl 7.58.0 or newer plus either `sha256sum` or `shasum`. Both
+the bootstrap and verified installer preflight that curl floor before their
+first download, so an older or unparseable system curl fails with an explicit
+diagnostic. It maps the
+execution architecture as follows:
+
+```text
+Linux  x86_64 or amd64   -> linux/amd64
+Linux  aarch64 or arm64  -> linux/arm64
+Darwin x86_64 or amd64   -> darwin/amd64
+Darwin arm64 or aarch64  -> darwin/arm64
+```
+
+This intentionally follows the architecture reported to the executing shell;
+an x86_64 shell under Rosetta installs the amd64 binary. Unknown and 32-bit
+targets fail before downloading or executing an artifact.
+
+The installer embeds the exact manifest, LICENSE, NOTICE, and all four artifact
+URLs, byte counts, and SHA-256 digests. It downloads and verifies the manifest,
+support files, and selected artifact before any artifact execution. The
+artifact then reopens and revalidates those same pinned files and its frozen Go
+attestation. A controlling `/dev/tty` is mandatory: the installer writes the
+exact canonical read-only deployment preview there and proceeds only after the
+user types the literal word `yes`. The installer closes both terminal
+descriptors before apply, so neither the apply child nor a long-lived foreground
+server inherits them. Decline, missing tools or terminal, redirect, timeout,
+truncation, oversize response, checksum mismatch, unsupported target, or preview
+failure leaves the artifact unapplied.
+
+After confirmation the installer invokes `deploy apply --consume-inputs
+--supervise-foreground`. A native current-user systemd or LaunchAgent result
+prints one credential-free locator receipt and returns. If no supported user
+service manager is available, the apply command first emits that same receipt,
+validates the committed foreground state and exact installed locator argv, then
+replaces itself with `<installed-binary> serve --state-dir <installed-state>`;
+the SSH or terminal session must supervise it for its full lifetime. Neither
+path invokes `sudo`, requests a public listener, changes another user, or
+installs anything on ordinary SSH target hosts.
+
+The authenticated app flow remains package-manager and downloader independent:
+it verifies catalog bytes locally, transfers them over the existing
+host-key-verified SFTP generation, and uses the target-specific preview/apply
+contract above. First-device enrollment and locator binding remain app-owned;
+the one-line installer emits no credential or enrollment material.
 
 ## Service-manager behavior
 

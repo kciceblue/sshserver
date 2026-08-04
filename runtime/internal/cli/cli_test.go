@@ -459,6 +459,240 @@ func TestDeployApplyResultWritesOneCredentialFreeLocatorLine(t *testing.T) {
 	}
 }
 
+func TestSupervisedForegroundCommandRequiresExactCommittedLocatorAndArgv(t *testing.T) {
+	foreground := supervisedApplyResult(t, true)
+	command, err := supervisedForegroundCommand(foreground)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		foreground.DeploymentLocator.LifecycleBinaryPath,
+		"serve",
+		"--state-dir",
+		foreground.DeploymentLocator.StateDir,
+	}
+	if !reflect.DeepEqual(command, want) {
+		t.Fatalf("foreground command=%q want=%q", command, want)
+	}
+
+	active := supervisedApplyResult(t, false)
+	command, err = supervisedForegroundCommand(active)
+	if err != nil || len(command) != 0 {
+		t.Fatalf("active command=%q err=%v", command, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*deployment.ApplyResult)
+	}{
+		{name: "status", mutate: func(result *deployment.ApplyResult) { result.Status = "active" }},
+		{name: "manager", mutate: func(result *deployment.ApplyResult) { result.State.Manager = deployment.ManagerNone }},
+		{name: "unsupervised", mutate: func(result *deployment.ApplyResult) { result.Foreground.Supervised = false }},
+		{name: "reason", mutate: func(result *deployment.ApplyResult) { result.Foreground.Reason = "other" }},
+		{name: "argv", mutate: func(result *deployment.ApplyResult) { result.Foreground.Command[3] += "-other" }},
+		{name: "locator", mutate: func(result *deployment.ApplyResult) { result.DeploymentLocator.BinarySHA256 = strings.Repeat("0", 64) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := supervisedApplyResult(t, true)
+			test.mutate(&candidate)
+			if command, err := supervisedForegroundCommand(candidate); err == nil || len(command) != 0 {
+				t.Fatalf("tampered command=%q err=%v", command, err)
+			}
+		})
+	}
+}
+
+func TestWriteAndSuperviseApplyResultWritesReceiptBeforeExactExec(t *testing.T) {
+	result := supervisedApplyResult(t, true)
+	wantEnvironment := os.Environ()
+	var events []string
+	var receipt []byte
+	var gotPath string
+	var gotArgv, gotEnvironment []string
+	execError := errors.New("exec failed")
+	runner := Runner{
+		Stdout: writerFunc(func(payload []byte) (int, error) {
+			events = append(events, "receipt")
+			receipt = append(receipt, payload...)
+			return len(payload), nil
+		}),
+		foregroundExec: func(path string, argv, environment []string) error {
+			events = append(events, "exec")
+			gotPath = path
+			gotArgv = append([]string(nil), argv...)
+			gotEnvironment = append([]string(nil), environment...)
+			return execError
+		},
+	}
+	if err := runner.writeAndSuperviseApplyResult(result); !errors.Is(err, execError) {
+		t.Fatalf("exec error=%v", err)
+	}
+	if !reflect.DeepEqual(events, []string{"receipt", "exec"}) {
+		t.Fatalf("events=%q", events)
+	}
+	var gotResult deployment.ApplyResult
+	if err := json.Unmarshal(receipt, &gotResult); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotResult, result) {
+		t.Fatalf("receipt=%+v want=%+v", gotResult, result)
+	}
+	wantArgv := []string{result.DeploymentLocator.LifecycleBinaryPath, "serve", "--state-dir", result.DeploymentLocator.StateDir}
+	if gotPath != wantArgv[0] || !reflect.DeepEqual(gotArgv, wantArgv) || !reflect.DeepEqual(gotEnvironment, wantEnvironment) {
+		t.Fatalf("exec path=%q argv=%q environment=%q", gotPath, gotArgv, gotEnvironment)
+	}
+}
+
+func TestWriteAndSuperviseApplyResultActiveDoesNotExec(t *testing.T) {
+	result := supervisedApplyResult(t, false)
+	var stdout bytes.Buffer
+	runner := Runner{
+		Stdout: &stdout,
+		foregroundExec: func(string, []string, []string) error {
+			t.Fatal("active result attempted foreground exec")
+			return nil
+		},
+	}
+	if err := runner.writeAndSuperviseApplyResult(result); err != nil {
+		t.Fatal(err)
+	}
+	var got deployment.ApplyResult
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, result) {
+		t.Fatalf("receipt=%+v want=%+v", got, result)
+	}
+}
+
+func TestWriteAndSuperviseApplyResultStopsBeforeExecOnValidationOrWriterFailure(t *testing.T) {
+	writeError := errors.New("write failed")
+	for _, test := range []struct {
+		name   string
+		result deployment.ApplyResult
+		writer io.Writer
+		want   string
+	}{
+		{
+			name: "validation",
+			result: func() deployment.ApplyResult {
+				result := supervisedApplyResult(t, true)
+				result.Foreground.Reason = "other"
+				return result
+			}(),
+			writer: io.Discard,
+			want:   "exact foreground requirement",
+		},
+		{
+			name:   "writer",
+			result: supervisedApplyResult(t, true),
+			writer: writerFunc(func([]byte) (int, error) { return 0, writeError }),
+			want:   writeError.Error(),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := Runner{
+				Stdout: test.writer,
+				foregroundExec: func(string, []string, []string) error {
+					t.Fatal("failed finishing step attempted foreground exec")
+					return nil
+				},
+			}
+			if err := runner.writeAndSuperviseApplyResult(test.result); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (write writerFunc) Write(payload []byte) (int, error) {
+	return write(payload)
+}
+
+func TestSuperviseForegroundFlagIsApplyOnlyAndConsumesInputs(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "recover",
+			args: []string{"deploy", "recover", "--consume-inputs", "--supervise-foreground"},
+			want: "supported only by deploy apply",
+		},
+		{
+			name: "inputs retained",
+			args: []string{"deploy", "apply", "--supervise-foreground"},
+			want: "requires --consume-inputs",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := (Runner{Stdout: &stdout, Stderr: &stderr}).Run(context.Background(), test.args)
+			if code == 0 || stdout.Len() != 0 || !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func supervisedApplyResult(t *testing.T, foreground bool) deployment.ApplyResult {
+	t.Helper()
+	home := t.TempDir()
+	installRoot := filepath.Join(home, "deployment")
+	stateDir := filepath.Join(home, "state")
+	target := deployment.Target{OS: "linux", Architecture: "amd64"}
+	buildIdentity, err := deployment.DeriveBuildIdentity(
+		"v1.2.3",
+		strings.Repeat("a", 40),
+		"go1.25.0",
+		target,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(installRoot, "versions", "v1.2.3", "sshserver-linux-amd64")
+	active := &deployment.InstalledRelease{
+		Release: "v1.2.3", SourceRevision: strings.Repeat("a", 40), BuildToolchain: "go1.25.0",
+		BuildIdentity: buildIdentity, ManifestSHA256: strings.Repeat("b", 64),
+		ProtocolVersion: "1", StorageSchema: "1", OS: target.OS, Architecture: target.Architecture,
+		BinaryPath: binaryPath, BinaryBytes: 12345, BinarySHA256: strings.Repeat("c", 64),
+		LicenseBytes: 12, LicenseSHA256: strings.Repeat("d", 64),
+		NoticeBytes: 13, NoticeSHA256: strings.Repeat("e", 64),
+	}
+	state := deployment.DeploymentState{
+		StateVersion:      deployment.DeploymentStateVersion,
+		Generation:        1,
+		Status:            deployment.StatusActive,
+		Manager:           deployment.ManagerSystemd,
+		StateDir:          stateDir,
+		ServiceDefinition: filepath.Join(home, ".config", "systemd", "user", "com.jat.sshserver.service"),
+		Active:            active,
+	}
+	result := deployment.ApplyResult{
+		Status: "active",
+		DeploymentLocator: deployment.DeploymentLocator{
+			Version: "1", LifecycleBinaryPath: binaryPath, HomeDir: home, InstallRoot: installRoot,
+			StateDir: stateDir, Release: active.Release, OS: active.OS, Architecture: active.Architecture,
+			ManifestSHA256: active.ManifestSHA256, BinarySHA256: active.BinarySHA256, BinaryBytes: active.BinaryBytes,
+		},
+		State: state,
+	}
+	if foreground {
+		result.Status = "foreground_required"
+		result.State.Status = deployment.StatusForeground
+		result.State.Manager = deployment.ManagerForeground
+		result.State.ServiceDefinition = ""
+		result.Foreground = &deployment.ForegroundFallback{
+			Required: true, Reason: "user_service_manager_unavailable", Supervised: true,
+			Command: []string{binaryPath, "serve", "--state-dir", stateDir},
+		}
+	}
+	return result
+}
+
 func TestDeployPreviewWriterEmitsDeterministicCanonicalJSON(t *testing.T) {
 	home := "/home/alice"
 	installRoot := filepath.Join(home, "deployment")
