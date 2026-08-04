@@ -20,6 +20,18 @@
       "usage": "ci-action"
     },
     {
+      "license": "MIT",
+      "name": "actions/upload-pages-artifact",
+      "selector": "actions/upload-pages-artifact@v4",
+      "usage": "ci-action"
+    },
+    {
+      "license": "MIT",
+      "name": "actions/deploy-pages",
+      "selector": "actions/deploy-pages@v4",
+      "usage": "ci-action"
+    },
+    {
       "command": "openssl",
       "license": "Apache-2.0",
       "name": "System OpenSSL 3 command-line tool",

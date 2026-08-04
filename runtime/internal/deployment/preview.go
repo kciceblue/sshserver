@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 
 	"golang.org/x/sys/unix"
 
@@ -1326,7 +1327,12 @@ func validatePreviewURLs(preview DeploymentPreview) error {
 	if err != nil || artifactURL.Scheme == "" || artifactURL.Host == "" {
 		return errors.New("deployment preview artifact URL is invalid")
 	}
-	origin, err := parseDownloadOrigin(artifactURL.Scheme + "://" + artifactURL.Host)
+	artifactName := "sshserver-" + preview.Target.OS + "-" + preview.Target.Architecture
+	origin, err := previewDownloadOrigin(
+		artifactURL,
+		preview.Release.Release,
+		artifactName,
+	)
 	if err != nil {
 		return errors.New("deployment preview download origin is invalid")
 	}
@@ -1334,7 +1340,7 @@ func validatePreviewURLs(preview DeploymentPreview) error {
 		value string
 		name  string
 	}{
-		{value: preview.Inputs.Artifact.URL, name: "sshserver-" + preview.Target.OS + "-" + preview.Target.Architecture},
+		{value: preview.Inputs.Artifact.URL, name: artifactName},
 		{value: preview.Inputs.License.URL, name: "LICENSE"},
 		{value: preview.Inputs.Notice.URL, name: "NOTICE"},
 	}
@@ -1345,6 +1351,24 @@ func validatePreviewURLs(preview DeploymentPreview) error {
 		}
 	}
 	return nil
+}
+
+func previewDownloadOrigin(artifactURL *url.URL, release, artifactName string) (*url.URL, error) {
+	segments := splitCanonicalURLPath(artifactURL.Path)
+	if len(segments) < 3 || segments[len(segments)-3] != "releases" ||
+		segments[len(segments)-2] != release || segments[len(segments)-1] != artifactName {
+		return nil, errors.New("artifact URL does not identify the exact release")
+	}
+	originPath := ""
+	if prefix := segments[:len(segments)-3]; len(prefix) > 0 {
+		originPath = "/" + strings.Join(prefix, "/")
+	}
+	origin := url.URL{
+		Scheme: artifactURL.Scheme,
+		Host:   artifactURL.Host,
+		Path:   originPath,
+	}
+	return parseDownloadOrigin(origin.String())
 }
 
 func validateForegroundPreview(preview DeploymentPreview) error {

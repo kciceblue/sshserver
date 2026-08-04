@@ -91,7 +91,11 @@ func TestReleaseManifestRejectsMovingIncompleteAndUnsafeArtifacts(t *testing.T) 
 		{name: "toolchain", mutate: func(value *ReleaseManifest) { value.BuildToolchain = "go1.25" }, want: "toolchain"},
 		{name: "protocol", mutate: func(value *ReleaseManifest) { value.ProtocolVersion = "2" }, want: "protocol"},
 		{name: "schema", mutate: func(value *ReleaseManifest) { value.StorageSchema = "2" }, want: "storage schema"},
-		{name: "origin path", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/release" }, want: "origin"},
+		{name: "origin trailing slash", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/" }, want: "path"},
+		{name: "origin empty segment", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/project//release" }, want: "path"},
+		{name: "origin dot segment", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/project/../release" }, want: "path"},
+		{name: "origin escaped segment", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/%72elease" }, want: "base"},
+		{name: "origin path over 256 bytes", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/" + strings.Repeat("a", 256) }, want: "base"},
 		{name: "origin port", mutate: func(value *ReleaseManifest) { value.DownloadOrigin = "https://downloads.example.test:443" }, want: "canonical"},
 		{name: "missing target", mutate: func(value *ReleaseManifest) { value.Artifacts = value.Artifacts[:3] }, want: "exactly four"},
 		{name: "target order", mutate: func(value *ReleaseManifest) {
@@ -133,6 +137,40 @@ func TestReleaseManifestRejectsMovingIncompleteAndUnsafeArtifacts(t *testing.T) 
 			test.mutate(&value)
 			if err := value.Validate(); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestReleaseManifestAcceptsCanonicalDownloadOriginPaths(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		origin string
+	}{
+		{name: "pages project", origin: "https://kciceblue.github.io/sshserver"},
+		{name: "maximum path", origin: "https://downloads.example.test/" + strings.Repeat("a", 255)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := testReleaseManifest()
+			manifest.DownloadOrigin = test.origin
+			for index := range manifest.Artifacts {
+				manifest.Artifacts[index].URL = strings.Replace(
+					manifest.Artifacts[index].URL,
+					"https://downloads.example.test",
+					manifest.DownloadOrigin,
+					1,
+				)
+			}
+			for index := range manifest.ReleaseFiles {
+				manifest.ReleaseFiles[index].URL = strings.Replace(
+					manifest.ReleaseFiles[index].URL,
+					"https://downloads.example.test",
+					manifest.DownloadOrigin,
+					1,
+				)
+			}
+			if err := manifest.Validate(); err != nil {
+				t.Fatalf("canonical project download base rejected: %v", err)
 			}
 		})
 	}

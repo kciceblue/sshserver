@@ -187,9 +187,12 @@ func parseReleaseURL(value string, origin *url.URL, release string) (*url.URL, e
 		parsed.EscapedPath() != parsed.Path {
 		return nil, errors.New("release URL is not canonical")
 	}
-	segments := strings.Split(strings.TrimPrefix(parsed.Path, "/"), "/")
-	if len(segments) != 3 || segments[0] != "releases" || segments[1] != release {
-		return nil, errors.New("release URL must use the exact /releases/<release>/<file> layout")
+	originSegments := splitCanonicalURLPath(origin.Path)
+	segments := splitCanonicalURLPath(parsed.Path)
+	if len(segments) != len(originSegments)+3 ||
+		!slices.Equal(segments[:len(originSegments)], originSegments) ||
+		segments[len(originSegments)] != "releases" || segments[len(originSegments)+1] != release {
+		return nil, errors.New("release URL must use the exact download-origin/releases/<release>/<file> layout")
 	}
 	for _, segment := range segments {
 		if !urlSegmentPattern.MatchString(segment) || segment == "." || segment == ".." {
@@ -201,9 +204,10 @@ func parseReleaseURL(value string, origin *url.URL, release string) (*url.URL, e
 
 func parseDownloadOrigin(value string) (*url.URL, error) {
 	origin, err := url.Parse(value)
-	if err != nil || origin.Scheme != "https" || origin.Host == "" || origin.User != nil ||
-		origin.Path != "" || origin.RawPath != "" || origin.RawQuery != "" || origin.Fragment != "" || origin.Opaque != "" {
-		return nil, errors.New("download origin must be an exact HTTPS origin without credentials, path, query, or fragment")
+	if err != nil || len(value) > 512 || origin.Scheme != "https" || origin.Host == "" || origin.User != nil ||
+		origin.RawPath != "" || origin.RawQuery != "" || origin.Fragment != "" || origin.Opaque != "" ||
+		origin.EscapedPath() != origin.Path || len(origin.Path) > 256 {
+		return nil, errors.New("download origin must be an exact HTTPS base without credentials, escaped path, query, or fragment")
 	}
 	if origin.Hostname() == "" || origin.Port() != "" || strings.Contains(origin.Host, "@") {
 		return nil, errors.New("download origin host is not canonical")
@@ -211,7 +215,23 @@ func parseDownloadOrigin(value string) (*url.URL, error) {
 	if strings.ToLower(origin.Host) != origin.Host {
 		return nil, errors.New("download origin host must be lowercase")
 	}
+	if origin.Path != "" &&
+		(origin.Path == "/" || strings.HasSuffix(origin.Path, "/") || path.Clean(origin.Path) != origin.Path) {
+		return nil, errors.New("download origin path is not canonical")
+	}
+	for _, segment := range splitCanonicalURLPath(origin.Path) {
+		if !urlSegmentPattern.MatchString(segment) || segment == "." || segment == ".." {
+			return nil, errors.New("download origin path contains an unsafe segment")
+		}
+	}
 	return origin, nil
+}
+
+func splitCanonicalURLPath(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return strings.Split(strings.TrimPrefix(value, "/"), "/")
 }
 
 func (manifest ReleaseManifest) CanonicalBytes() ([]byte, error) {
