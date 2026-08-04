@@ -94,6 +94,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("run: make check", workflow)
+        self.assertIn('PYTHONDONTWRITEBYTECODE: "1"', workflow)
         self.assertIn("make runtime-release-bundle-check", workflow)
         self.assertIn("DOWNLOAD_BASE: https://kciceblue.github.io/sshserver", workflow)
         self.assertIn("actions/upload-pages-artifact@v4", workflow)

@@ -57,6 +57,8 @@ jobs:
           go-version-file: runtime/go.mod
           cache-dependency-path: runtime/go.sum
       - name: Validate complete source revision
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
         run: make check
       - name: Build, verify, and archive immutable bundle
         id: release
