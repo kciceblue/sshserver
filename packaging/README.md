@@ -8,7 +8,7 @@ revision being released:
 make runtime-release-bundle-check \
   VERSION=v1.2.3 \
   SOURCE_REVISION="$(git rev-parse HEAD)" \
-  DOWNLOAD_ORIGIN=https://downloads.example.test
+  DOWNLOAD_ORIGIN=https://kciceblue.github.io/sshserver
 ```
 
 The clean-source gate rejects a non-root checkout path, a mismatched 40-byte
@@ -36,6 +36,12 @@ The canonical manifest is frozen by
 [`release-manifest.schema.json`](release-manifest.schema.json). It binds the
 exact origin, release, source revision, Go toolchain, four target identities,
 byte counts, SHA-256 digests, LICENSE, and NOTICE.
+
+The download base is an exact lowercase HTTPS host with an optional canonical,
+unescaped path prefix. Every file URL must append exactly
+`/releases/<release>/<file>` to that base. This permits a repository-scoped
+GitHub Pages site while still rejecting redirects, queries, fragments, encoded
+segments, dot segments, empty segments, and moving release labels.
 
 Release identifiers are 1–64 ASCII bytes and match
 `^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9]+([.-][a-z0-9]+)*)?$`. Examples include

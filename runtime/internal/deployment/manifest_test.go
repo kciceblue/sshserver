@@ -91,7 +91,11 @@ func TestReleaseManifestRejectsMovingIncompleteAndUnsafeArtifacts(t *testing.T) 
 		{name: "toolchain", mutate: func(value *ReleaseManifest) { value.BuildToolchain = "go1.25" }, want: "toolchain"},
 		{name: "protocol", mutate: func(value *ReleaseManifest) { value.ProtocolVersion = "2" }, want: "protocol"},
 		{name: "schema", mutate: func(value *ReleaseManifest) { value.StorageSchema = "2" }, want: "storage schema"},
-		{name: "origin path", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/release" }, want: "origin"},
+		{name: "origin trailing slash", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/" }, want: "path"},
+		{name: "origin empty segment", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/project//release" }, want: "path"},
+		{name: "origin dot segment", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/project/../release" }, want: "path"},
+		{name: "origin escaped segment", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/%72elease" }, want: "base"},
+		{name: "origin oversized path", mutate: func(value *ReleaseManifest) { value.DownloadOrigin += "/" + strings.Repeat("a", 480) }, want: "base"},
 		{name: "origin port", mutate: func(value *ReleaseManifest) { value.DownloadOrigin = "https://downloads.example.test:443" }, want: "canonical"},
 		{name: "missing target", mutate: func(value *ReleaseManifest) { value.Artifacts = value.Artifacts[:3] }, want: "exactly four"},
 		{name: "target order", mutate: func(value *ReleaseManifest) {
@@ -135,6 +139,30 @@ func TestReleaseManifestRejectsMovingIncompleteAndUnsafeArtifacts(t *testing.T) 
 				t.Fatalf("error = %v, want containing %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestReleaseManifestAcceptsCanonicalDownloadOriginPath(t *testing.T) {
+	manifest := testReleaseManifest()
+	manifest.DownloadOrigin = "https://kciceblue.github.io/sshserver"
+	for index := range manifest.Artifacts {
+		manifest.Artifacts[index].URL = strings.Replace(
+			manifest.Artifacts[index].URL,
+			"https://downloads.example.test",
+			manifest.DownloadOrigin,
+			1,
+		)
+	}
+	for index := range manifest.ReleaseFiles {
+		manifest.ReleaseFiles[index].URL = strings.Replace(
+			manifest.ReleaseFiles[index].URL,
+			"https://downloads.example.test",
+			manifest.DownloadOrigin,
+			1,
+		)
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("canonical project download base rejected: %v", err)
 	}
 }
 

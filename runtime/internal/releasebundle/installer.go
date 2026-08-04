@@ -7,6 +7,7 @@ import (
 	"net/url"
 	pathpkg "path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"text/template"
 
@@ -18,6 +19,8 @@ import (
 // boundary comfortably below Linux's per-argument MAX_ARG_STRLEN as well as
 // the overall exec limits on every supported target.
 const maxInstallerBytes = 64 * 1024
+
+var installerURLSegmentPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 type installerPin struct {
 	URL    string
@@ -129,15 +132,23 @@ func installCommandWithOptions(installerURL string, installerPayload []byte, opt
 		return nil, err
 	}
 	parsedURL, err := url.Parse(installerURL)
-	if err != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" || parsedURL.User != nil ||
+	if err != nil || len(installerURL) > 640 || !strings.HasPrefix(installerURL, "https://") ||
+		parsedURL.String() != installerURL || parsedURL.Scheme != "https" || parsedURL.Host == "" || parsedURL.User != nil ||
 		parsedURL.RawQuery != "" || parsedURL.Fragment != "" || parsedURL.Opaque != "" || parsedURL.RawPath != "" ||
 		parsedURL.Hostname() == "" || parsedURL.Port() != "" || strings.ToLower(parsedURL.Host) != parsedURL.Host ||
-		pathpkg.Clean(parsedURL.Path) != parsedURL.Path || parsedURL.EscapedPath() != parsedURL.Path {
+		len(parsedURL.Path) > 384 || pathpkg.Clean(parsedURL.Path) != parsedURL.Path || parsedURL.EscapedPath() != parsedURL.Path {
 		return nil, errors.New("installer URL must be one canonical direct HTTPS install.sh URL")
 	}
 	segments := strings.Split(strings.TrimPrefix(parsedURL.Path, "/"), "/")
-	if len(segments) != 3 || segments[0] != "releases" || !releaseid.Valid(segments[1]) || segments[2] != "install.sh" {
-		return nil, errors.New("installer URL must use the exact /releases/<release>/install.sh layout")
+	releaseIndex := len(segments) - 2
+	if len(segments) < 3 || segments[releaseIndex-1] != "releases" ||
+		!releaseid.Valid(segments[releaseIndex]) || segments[releaseIndex+1] != "install.sh" {
+		return nil, errors.New("installer URL must use the exact download-origin/releases/<release>/install.sh layout")
+	}
+	for _, segment := range segments {
+		if !installerURLSegmentPattern.MatchString(segment) || segment == "." || segment == ".." {
+			return nil, errors.New("installer URL contains an unsafe path segment")
+		}
 	}
 	if len(installerPayload) == 0 || len(installerPayload) > maxInstallerBytes ||
 		!bytes.HasSuffix(installerPayload, []byte("\n")) || bytes.IndexByte(installerPayload, 0) >= 0 {

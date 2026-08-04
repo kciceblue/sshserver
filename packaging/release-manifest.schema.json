@@ -40,7 +40,8 @@
     },
     "download_origin": {
       "type": "string",
-      "pattern": "^https://[^/?#]+$"
+      "maxLength": 512,
+      "pattern": "^https://[^/?#]+(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
     },
     "artifacts": {
       "type": "array",

@@ -81,6 +81,29 @@ class RepositoryPolicyTests(unittest.TestCase):
                 for trigger in ("pull_request", "push", "schedule", "merge_group"):
                     self.assertNotIn(f"\n  {trigger}:", text)
 
+    def test_release_publication_is_exact_manual_and_pages_only(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("release_version:", workflow)
+        self.assertIn("source_revision:", workflow)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"', workflow)
+        self.assertIn(
+            'test "$(git rev-parse refs/remotes/origin/main)" = "$SOURCE_REVISION"',
+            workflow,
+        )
+        self.assertIn("run: make check", workflow)
+        self.assertIn("make runtime-release-bundle-check", workflow)
+        self.assertIn("DOWNLOAD_BASE: https://kciceblue.github.io/sshserver", workflow)
+        self.assertIn("actions/upload-pages-artifact@v4", workflow)
+        self.assertIn("actions/deploy-pages@v4", workflow)
+        self.assertIn("pages: write", workflow)
+        self.assertIn("id-token: write", workflow)
+        self.assertIn("--proto '=https'", workflow)
+        self.assertIn("--verify-tag", workflow)
+        self.assertNotIn("sudo", workflow)
+        self.assertNotIn("curl |", workflow)
+
     def test_manual_ci_reports_existing_branch_protection_context(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"

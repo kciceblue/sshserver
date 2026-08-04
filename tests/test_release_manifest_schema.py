@@ -29,6 +29,24 @@ class ReleaseManifestSchemaTests(unittest.TestCase):
             release["pattern"],
             r"^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9]+([.-][a-z0-9]+)*)?$",
         )
+        download_origin = properties["download_origin"]
+        self.assertEqual(download_origin["maxLength"], 512)
+        origin_pattern = re.compile(download_origin["pattern"])
+        for value in (
+            "https://downloads.example.test",
+            "https://kciceblue.github.io/sshserver",
+            "https://downloads.example.test/products/sshserver-v1",
+        ):
+            self.assertIsNotNone(origin_pattern.fullmatch(value), value)
+        for value in (
+            "http://downloads.example.test",
+            "https://downloads.example.test/",
+            "https://downloads.example.test/project//release",
+            "https://downloads.example.test/project/../release",
+            "https://downloads.example.test/%72elease",
+            "https://downloads.example.test/project?release=1",
+        ):
+            self.assertIsNone(origin_pattern.fullmatch(value), value)
 
     def test_release_grammar_accepts_only_exact_immutable_versions(self) -> None:
         release = self.schema["properties"]["release"]

@@ -116,6 +116,39 @@ func TestGeneratedInstallerAndOneLineCommandHavePinnedShellSyntax(t *testing.T) 
 	}
 }
 
+func TestGenerateAcceptsRepositoryScopedPagesDownloadBase(t *testing.T) {
+	options := testBundleOptions(t)
+	options.DownloadOrigin = "https://kciceblue.github.io/sshserver"
+	result, err := generate(options, acceptTestMetadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.InstallerURL != options.DownloadOrigin+"/releases/"+options.Release+"/install.sh" {
+		t.Fatalf("installer URL=%q", result.InstallerURL)
+	}
+	command, err := os.ReadFile(result.InstallCommandPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(command, []byte(result.InstallerURL)) {
+		t.Fatalf("one-line command does not pin repository-scoped URL: %q", command)
+	}
+}
+
+func TestInstallCommandRejectsUnsafeDownloadBasePrefixes(t *testing.T) {
+	payload := []byte("#!/bin/sh\n")
+	for _, installerURL := range []string{
+		"https://downloads.example.test/project//releases/v1.2.3/install.sh",
+		"https://downloads.example.test/project/../releases/v1.2.3/install.sh",
+		"https://downloads.example.test/%70roject/releases/v1.2.3/install.sh",
+		"https://downloads.example.test/project!/releases/v1.2.3/install.sh",
+	} {
+		if _, err := InstallCommand(installerURL, payload); err == nil {
+			t.Fatalf("unsafe installer URL accepted: %q", installerURL)
+		}
+	}
+}
+
 func TestInstallCommandEnforcesRepresentableShellArgumentBoundary(t *testing.T) {
 	url := "https://downloads.example.test/releases/v1.2.3/install.sh"
 	maximum := append(bytes.Repeat([]byte{'#'}, maxInstallerBytes-1), '\n')

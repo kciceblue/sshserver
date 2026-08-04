@@ -1,0 +1,206 @@
+name: Publish immutable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Exact immutable release identifier, for example v0.1.0
+        required: true
+        type: string
+      source_revision:
+        description: Exact 40-character commit currently at main
+        required: true
+        type: string
+
+concurrency:
+  group: sshserver-immutable-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and archive exact release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      release_version: ${{ steps.release.outputs.release_version }}
+      source_revision: ${{ steps.release.outputs.source_revision }}
+      download_base: ${{ steps.release.outputs.download_base }}
+      manifest_sha256: ${{ steps.release.outputs.manifest_sha256 }}
+      install_command_sha256: ${{ steps.release.outputs.install_command_sha256 }}
+    steps:
+      - name: Check out requested source revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact clean main source
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9]+([.-][a-z0-9]+)*)?$ ]]
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          test "$(git rev-parse refs/remotes/origin/main)" = "$SOURCE_REVISION"
+          git fetch --tags origin
+          if git rev-parse --verify "refs/tags/$RELEASE_VERSION^{commit}" >/dev/null 2>&1; then
+            test "$(git rev-parse "refs/tags/$RELEASE_VERSION^{commit}")" = "$SOURCE_REVISION"
+          fi
+          test -z "$(git status --short)"
+      - name: Set up exact reviewed Go toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: runtime/go.mod
+          cache-dependency-path: runtime/go.sum
+      - name: Validate complete source revision
+        run: make check
+      - name: Build, verify, and archive immutable bundle
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          DOWNLOAD_BASE: https://kciceblue.github.io/sshserver
+        run: |
+          set -euo pipefail
+          site_root="$RUNNER_TEMP/release-site"
+          bundle_root="$RUNNER_TEMP/release-bundle"
+          artifact_root="$RUNNER_TEMP/release-artifacts/$RELEASE_VERSION"
+          pages_root="$RUNNER_TEMP/pages-artifact"
+          gh auth setup-git
+          remote_url="https://github.com/$GITHUB_REPOSITORY.git"
+          branch_status=0
+          git ls-remote --exit-code --heads "$remote_url" gh-pages >/dev/null || branch_status=$?
+          if [ "$branch_status" -eq 0 ]; then
+            git clone --branch gh-pages --single-branch "$remote_url" "$site_root"
+          else
+            test "$branch_status" -eq 2
+            mkdir -p "$site_root"
+            git -C "$site_root" init
+            git -C "$site_root" remote add origin "$remote_url"
+            git -C "$site_root" checkout --orphan gh-pages
+          fi
+          git -C "$site_root" config user.name github-actions[bot]
+          git -C "$site_root" config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          test -z "$(git -C "$site_root" status --short)"
+          if find "$site_root" -mindepth 1 -type l -print -quit | grep -q .; then
+            echo 'release site contains a symbolic link' >&2
+            exit 1
+          fi
+          mkdir -p "$bundle_root" "$artifact_root"
+          make runtime-release-bundle-check \
+            VERSION="$RELEASE_VERSION" \
+            SOURCE_REVISION="$SOURCE_REVISION" \
+            DOWNLOAD_ORIGIN="$DOWNLOAD_BASE" \
+            RELEASE_ARTIFACT_DIR="$artifact_root" \
+            RELEASE_BUNDLE_DIR="$bundle_root/$RELEASE_VERSION"
+          mkdir -p "$site_root/releases"
+          if [ -e "$site_root/releases/$RELEASE_VERSION" ]; then
+            test -d "$site_root/releases/$RELEASE_VERSION"
+            diff -qr "$bundle_root/$RELEASE_VERSION" "$site_root/releases/$RELEASE_VERSION"
+          else
+            cp -a "$bundle_root/$RELEASE_VERSION" "$site_root/releases/$RELEASE_VERSION"
+          fi
+          touch "$site_root/.nojekyll"
+          git -C "$site_root" add -- .nojekyll "releases/$RELEASE_VERSION"
+          if ! git -C "$site_root" diff --cached --quiet; then
+            git -C "$site_root" commit --signoff -m "Publish sshserver $RELEASE_VERSION"
+            git -C "$site_root" push origin HEAD:refs/heads/gh-pages
+          fi
+          mkdir -p "$pages_root"
+          git -C "$site_root" archive --format=tar HEAD | tar -xf - -C "$pages_root"
+          manifest_sha256="$(sha256sum "$site_root/releases/$RELEASE_VERSION/release-manifest.json" | cut -d ' ' -f 1)"
+          install_command_sha256="$(sha256sum "$site_root/releases/$RELEASE_VERSION/install-command.txt" | cut -d ' ' -f 1)"
+          {
+            echo "release_version=$RELEASE_VERSION"
+            echo "source_revision=$SOURCE_REVISION"
+            echo "download_base=$DOWNLOAD_BASE"
+            echo "manifest_sha256=$manifest_sha256"
+            echo "install_command_sha256=$install_command_sha256"
+          } >> "$GITHUB_OUTPUT"
+      - name: Upload complete immutable release site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/pages-artifact
+
+  deploy:
+    name: Deploy exact release site
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  finalize:
+    name: Verify publication and tag source
+    needs: [build, deploy]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out exact published source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify live immutable bytes and publish source tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
+          SOURCE_REVISION: ${{ needs.build.outputs.source_revision }}
+          DOWNLOAD_BASE: ${{ needs.build.outputs.download_base }}
+          MANIFEST_SHA256: ${{ needs.build.outputs.manifest_sha256 }}
+          INSTALL_COMMAND_SHA256: ${{ needs.build.outputs.install_command_sha256 }}
+        run: |
+          set -euo pipefail
+          verify_live_file() {
+            relative_path="$1"
+            expected_sha256="$2"
+            output="$RUNNER_TEMP/$(basename "$relative_path")"
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              if curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+                --connect-timeout 10 --max-time 30 \
+                --output "$output" "$DOWNLOAD_BASE/$relative_path" && \
+                test "$(sha256sum "$output" | cut -d ' ' -f 1)" = "$expected_sha256"; then
+                return 0
+              fi
+              sleep 3
+            done
+            return 1
+          }
+          verify_live_file "releases/$RELEASE_VERSION/release-manifest.json" "$MANIFEST_SHA256"
+          verify_live_file "releases/$RELEASE_VERSION/install-command.txt" "$INSTALL_COMMAND_SHA256"
+          gh auth setup-git
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          if git rev-parse --verify "refs/tags/$RELEASE_VERSION^{commit}" >/dev/null 2>&1; then
+            test "$(git rev-parse "refs/tags/$RELEASE_VERSION^{commit}")" = "$SOURCE_REVISION"
+          else
+            git tag -a "$RELEASE_VERSION" "$SOURCE_REVISION" -m "sshserver $RELEASE_VERSION"
+            git push origin "refs/tags/$RELEASE_VERSION"
+          fi
+          if gh release view "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION" --jq .object.sha)" != ""
+          else
+            printf '%s\n\n%s\n' \
+              "Immutable release bundle: $DOWNLOAD_BASE/releases/$RELEASE_VERSION/" \
+              "release-manifest.json SHA-256: $MANIFEST_SHA256" \
+              > "$RUNNER_TEMP/release-notes.txt"
+            gh release create "$RELEASE_VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "sshserver $RELEASE_VERSION" \
+              --notes-file "$RUNNER_TEMP/release-notes.txt"
+          fi
