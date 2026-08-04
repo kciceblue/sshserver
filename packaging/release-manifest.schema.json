@@ -21,21 +21,9 @@
     },
     "release": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
-      "allOf": [
-        {
-          "not": {
-            "enum": [
-              "latest"
-            ]
-          }
-        },
-        {
-          "not": {
-            "pattern": "\\.\\."
-          }
-        }
-      ]
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[a-z0-9]+([.-][a-z0-9]+)*)?$"
     },
     "source_revision": {
       "$ref": "#/$defs/git_revision"

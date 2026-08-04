@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/kciceblue/sshserver/runtime/internal/config"
+	"github.com/kciceblue/sshserver/runtime/internal/releaseid"
 )
 
 const directoryMode = 0o700
@@ -88,7 +89,7 @@ func NewLayout(homeDir, installRoot, stateDir string) (Layout, error) {
 }
 
 func (layout Layout) VersionDir(release string) (string, error) {
-	if !releaseIDPattern.MatchString(release) || strings.Contains(release, "..") || strings.EqualFold(release, "latest") {
+	if !releaseid.Valid(release) {
 		return "", errors.New("release identifier is not path-safe")
 	}
 	return filepath.Join(layout.VersionsDir, release), nil

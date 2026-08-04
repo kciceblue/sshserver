@@ -11,6 +11,8 @@ import (
 	"sort"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/kciceblue/sshserver/runtime/internal/releaseid"
 )
 
 var installedArtifactNamePattern = regexp.MustCompile(`^sshserver-(linux|darwin)-(amd64|arm64)$`)
@@ -90,7 +92,7 @@ func preflightInstalledVersions(versions *os.File) ([]removableVersion, error) {
 	sort.Strings(names)
 	plan := make([]removableVersion, 0, len(names))
 	for _, name := range names {
-		if !releaseIDPattern.MatchString(name) || name == "latest" || name == "." || name == ".." {
+		if !releaseid.Valid(name) {
 			return nil, fmt.Errorf("installed versions contains unexpected entry %q", name)
 		}
 		fd, err := unix.Openat(int(versions.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)

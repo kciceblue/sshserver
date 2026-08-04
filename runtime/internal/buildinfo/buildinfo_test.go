@@ -23,7 +23,13 @@ func TestEncodedReleaseIdentityRoundTripsAsOneExactRecord(t *testing.T) {
 		t.Fatalf("parsed=%+v err=%v", parsed, err)
 	}
 	for _, invalid := range []string{
-		"", "dev|extra", strings.Replace(encoded, "v1.2.3", "latest", 1),
+		"", "dev|extra",
+		strings.Replace(encoded, "v1.2.3", "latest", 1),
+		strings.Replace(encoded, "v1.2.3", "stable", 1),
+		strings.Replace(encoded, "v1.2.3", "current", 1),
+		strings.Replace(encoded, "v1.2.3", "main", 1),
+		strings.Replace(encoded, "v1.2.3", "nightly", 1),
+		strings.Replace(encoded, "v1.2.3", "v1.2", 1),
 		strings.Replace(encoded, strings.Repeat("a", 40), strings.Repeat("A", 40), 1),
 		encoded + "|future",
 	} {

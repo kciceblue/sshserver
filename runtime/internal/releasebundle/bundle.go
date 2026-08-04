@@ -19,6 +19,7 @@ import (
 
 	internalbuildinfo "github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/deployment"
+	"github.com/kciceblue/sshserver/runtime/internal/releaseid"
 )
 
 const maxBundleArtifactBytes = 256 * 1024 * 1024
@@ -81,6 +82,9 @@ func generate(options Options, verifyMetadata metadataVerifier) (Result, error) 
 	}
 	if verifyMetadata == nil {
 		return Result{}, errors.New("release metadata verifier is required")
+	}
+	if !releaseid.Valid(options.Release) {
+		return Result{}, errors.New("release identifier is not an exact immutable version")
 	}
 	if options.ArtifactDir == options.DistDir {
 		return Result{}, errors.New("artifact and immutable distribution directories must be distinct")

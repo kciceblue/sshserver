@@ -1546,6 +1546,11 @@ func TestDeploymentPreviewRejectsMalformedInputsAndNoncanonicalOutput(t *testing
 	if _, err := tamperedIdentity.CanonicalBytes(); err == nil || !strings.Contains(err.Error(), "build identity") {
 		t.Fatalf("tampered build identity error=%v", err)
 	}
+	movingRelease := preview
+	movingRelease.Release.Release = "stable"
+	if _, err := movingRelease.CanonicalBytes(); err == nil || !strings.Contains(err.Error(), "release identity") {
+		t.Fatalf("moving release error=%v", err)
+	}
 	tamperedActions := preview
 	tamperedActions.Actions = append([]PreviewAction(nil), preview.Actions...)
 	tamperedActions.Actions[0].Operation = "prepare_versions_directory"

@@ -37,6 +37,12 @@ func TestBuildIdentityParserAndPinnedComparison(t *testing.T) {
 	if err := ValidateReleaseIdentity(parsed, expected); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("mismatch error = %v", err)
 	}
+	parsed = identity
+	parsed.Release = "stable"
+	expected.Release = "stable"
+	if err := ValidateReleaseIdentity(parsed, expected); err == nil || !strings.Contains(err.Error(), "exact V1") {
+		t.Fatalf("moving release error = %v", err)
+	}
 }
 
 func TestBuildIdentityParserRejectsUnboundedUnknownAndTrailingData(t *testing.T) {
@@ -47,7 +53,7 @@ func TestBuildIdentityParserRejectsUnboundedUnknownAndTrailingData(t *testing.T)
 	}{
 		{name: "empty", payload: nil, want: "size boundary"},
 		{name: "oversized", payload: make([]byte, maxIdentityBytes+1), want: "size boundary"},
-		{name: "unknown", payload: []byte(`{"release":"v1","source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","build_toolchain":"go1.25.0","build_identity":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","protocol_version":"1","storage_schema":"1","future":true}`), want: "unknown field"},
+		{name: "unknown", payload: []byte(`{"release":"v1.2.3","source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","build_toolchain":"go1.25.0","build_identity":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","protocol_version":"1","storage_schema":"1","future":true}`), want: "unknown field"},
 		{name: "trailing", payload: []byte(`{} {}`), want: "trailing"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

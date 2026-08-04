@@ -35,6 +35,11 @@ The canonical manifest is frozen by
 exact origin, release, source revision, Go toolchain, four target identities,
 byte counts, SHA-256 digests, LICENSE, and NOTICE.
 
+Release identifiers are 1–64 ASCII bytes and match
+`^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9]+([.-][a-z0-9]+)*)?$`. Examples include
+`1.2.3`, `v1.2.3`, and `v1.2.3-rc.1`. Moving channels such as `latest`,
+`stable`, `current`, `main`, and `nightly` are never release identifiers.
+
 ## Client upload, preview, and activation boundary
 
 The bundle generator reports an `upload_files` contract for each target. The

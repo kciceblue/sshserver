@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+
+	"github.com/kciceblue/sshserver/runtime/internal/releaseid"
 )
 
 const AttestationPrefix = "jat-release-v1|"
@@ -17,7 +19,6 @@ const AttestationPrefix = "jat-release-v1|"
 var EncodedIdentity = "dev"
 
 var (
-	releasePattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 	revisionPattern  = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	toolchainPattern = regexp.MustCompile(`^go[1-9][0-9]*\.[0-9]+\.[0-9]+$`)
 	digestPattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -81,7 +82,7 @@ func ValidatedCurrent() (Identity, error) {
 }
 
 func validate(identity Identity) error {
-	if !releasePattern.MatchString(identity.Release) || strings.Contains(identity.Release, "..") || strings.EqualFold(identity.Release, "latest") {
+	if !releaseid.Valid(identity.Release) {
 		return errors.New("build attestation release is invalid")
 	}
 	if !revisionPattern.MatchString(identity.SourceRevision) {

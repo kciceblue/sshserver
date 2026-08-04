@@ -100,6 +100,15 @@ class RepositoryPolicyTests(unittest.TestCase):
         ):
             self.assertIn(f"runner: {runner}", workflow)
         self.assertIn("go-version-file: runtime/go.mod", workflow)
+        self.assertIn(
+            "RUNTIME_VERSION: v0.0.0-ci.${{ needs.policy.outputs.validated_head_sha }}",
+            workflow,
+        )
+        self.assertIn(
+            "SOURCE_REVISION: ${{ needs.policy.outputs.validated_head_sha }}",
+            workflow,
+        )
+        self.assertIn('SOURCE_REVISION="$SOURCE_REVISION"', workflow)
         self.assertIn("--execute-native", workflow)
         self.assertIn("TestRuntimeForegroundSSHTunnel", workflow)
         self.assertIn("TestRuntimeUserServiceSSHTunnel", workflow)

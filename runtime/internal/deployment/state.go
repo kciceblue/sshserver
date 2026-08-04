@@ -11,6 +11,7 @@ import (
 	"regexp"
 
 	"github.com/kciceblue/sshserver/runtime/internal/config"
+	"github.com/kciceblue/sshserver/runtime/internal/releaseid"
 )
 
 const (
@@ -101,7 +102,7 @@ func InstalledFromManifest(layout Layout, manifest ReleaseManifest, manifestSHA2
 }
 
 func (release InstalledRelease) validate(layout Layout) error {
-	if !releaseIDPattern.MatchString(release.Release) || release.Release == "latest" {
+	if !releaseid.Valid(release.Release) {
 		return errors.New("installed release identifier is invalid")
 	}
 	if !sourceRevisionPattern.MatchString(release.SourceRevision) || !toolchainPattern.MatchString(release.BuildToolchain) ||

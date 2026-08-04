@@ -1,10 +1,12 @@
 import json
 from pathlib import Path
+import re
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "packaging" / "release-manifest.schema.json"
+RELEASE_ID_PATH = ROOT / "runtime" / "internal" / "releaseid" / "releaseid.go"
 
 
 class ReleaseManifestSchemaTests(unittest.TestCase):
@@ -21,12 +23,59 @@ class ReleaseManifestSchemaTests(unittest.TestCase):
         self.assertEqual(properties["manifest_version"], {"const": 1})
         self.assertEqual(properties["protocol_version"], {"const": "1"})
         self.assertEqual(properties["storage_schema"], {"const": "1"})
+        release = properties["release"]
+        self.assertEqual((release["minLength"], release["maxLength"]), (1, 64))
         self.assertEqual(
-            properties["release"]["allOf"],
-            [
-                {"not": {"enum": ["latest"]}},
-                {"not": {"pattern": r"\.\."}},
-            ],
+            release["pattern"],
+            r"^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9]+([.-][a-z0-9]+)*)?$",
+        )
+
+    def test_release_grammar_accepts_only_exact_immutable_versions(self) -> None:
+        release = self.schema["properties"]["release"]
+        pattern = re.compile(release["pattern"])
+
+        for value in (
+            "1.2.3",
+            "v1.2.3",
+            "2026.08.03",
+            "v1.2.3-rc.1",
+            "v0.0.0-metadata-test",
+            "1.2.3-" + ("a" * 58),
+        ):
+            self.assertLessEqual(len(value), release["maxLength"])
+            self.assertIsNotNone(pattern.fullmatch(value), value)
+
+        for value in (
+            "",
+            "latest",
+            "stable",
+            "current",
+            "main",
+            "nightly",
+            "v1",
+            "v1.2",
+            "v1..2",
+            "V1.2.3",
+            "v1.2.3-RC1",
+            "v1.2.3-rc..1",
+            "v1.2.3-rc_1",
+            "v1.2.3+build",
+            "../v1.2.3",
+            "v1.2.3/sshserver",
+            "1.2.3-" + ("a" * 59),
+        ):
+            accepted = (
+                release["minLength"] <= len(value) <= release["maxLength"]
+                and pattern.fullmatch(value) is not None
+            )
+            self.assertFalse(accepted, value)
+
+    def test_public_schema_and_runtime_share_one_release_pattern(self) -> None:
+        source = RELEASE_ID_PATH.read_text(encoding="utf-8")
+        match = re.search(r"\bPattern\s+=\s+`([^`]+)`", source)
+        self.assertIsNotNone(match)
+        self.assertEqual(
+            match.group(1), self.schema["properties"]["release"]["pattern"]
         )
 
     def test_schema_freezes_four_targets_in_canonical_order(self) -> None:
