@@ -1571,6 +1571,53 @@ func TestDeploymentPreviewRejectsMalformedInputsAndNoncanonicalOutput(t *testing
 	}
 }
 
+func TestDeploymentPreviewPreservesCanonicalPathfulDownloadOrigin(t *testing.T) {
+	fixture := newLifecycleFixture(t, false)
+	request, _ := fixture.release(t, "v1.2.3", "pathful-origin")
+	preview, err := fixture.lifecycle.Preview(
+		context.Background(),
+		requestForPreview(fixture.layout, request),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const hostOrigin = "https://downloads.example.test"
+	const projectOrigin = hostOrigin + "/sshserver"
+	preview.Inputs.Artifact.URL = strings.Replace(
+		preview.Inputs.Artifact.URL,
+		hostOrigin,
+		projectOrigin,
+		1,
+	)
+	preview.Inputs.License.URL = strings.Replace(
+		preview.Inputs.License.URL,
+		hostOrigin,
+		projectOrigin,
+		1,
+	)
+	preview.Inputs.Notice.URL = strings.Replace(
+		preview.Inputs.Notice.URL,
+		hostOrigin,
+		projectOrigin,
+		1,
+	)
+	if _, err := preview.CanonicalBytes(); err != nil {
+		t.Fatalf("canonical pathful download origin rejected: %v", err)
+	}
+
+	mismatched := preview
+	mismatched.Inputs.Notice.URL = strings.Replace(
+		mismatched.Inputs.Notice.URL,
+		projectOrigin,
+		hostOrigin+"/other",
+		1,
+	)
+	if _, err := mismatched.CanonicalBytes(); err == nil ||
+		!strings.Contains(err.Error(), "NOTICE URL") {
+		t.Fatalf("mismatched pathful download origin error=%v", err)
+	}
+}
+
 func requestForPreview(layout Layout, request ApplyRequest) PreviewRequest {
 	return PreviewRequest{
 		ManifestPath:    filepath.Join(layout.HomeDir, "verified-upload", "release-manifest.json"),
