@@ -14,7 +14,10 @@ import (
 	"github.com/kciceblue/sshserver/runtime/internal/releaseid"
 )
 
-const maxInstallerBytes = 128 * 1024
+// The verified installer is passed as one /bin/sh -c argument. Keep the
+// boundary comfortably below Linux's per-argument MAX_ARG_STRLEN as well as
+// the overall exec limits on every supported target.
+const maxInstallerBytes = 64 * 1024
 
 type installerPin struct {
 	URL    string
@@ -136,8 +139,9 @@ func installCommandWithOptions(installerURL string, installerPayload []byte, opt
 	if len(segments) != 3 || segments[0] != "releases" || !releaseid.Valid(segments[1]) || segments[2] != "install.sh" {
 		return nil, errors.New("installer URL must use the exact /releases/<release>/install.sh layout")
 	}
-	if len(installerPayload) == 0 || len(installerPayload) > maxInstallerBytes {
-		return nil, errors.New("installer payload exceeds its size boundary")
+	if len(installerPayload) == 0 || len(installerPayload) > maxInstallerBytes ||
+		!bytes.HasSuffix(installerPayload, []byte("\n")) || bytes.IndexByte(installerPayload, 0) >= 0 {
+		return nil, errors.New("installer payload must be NUL-free, newline-terminated, and within its shell-argument size boundary")
 	}
 	data := struct {
 		ToolPath       string
@@ -312,6 +316,21 @@ file_sha256() {
   printf '%s\n' "$1"
 }
 
+verify_exact_file() {
+  verification_path=$1
+  verification_bytes=$2
+  verification_sha256=$3
+  verification_label=$4
+  [ -f "$verification_path" ] && [ ! -L "$verification_path" ] || fail "$verification_label is not a regular file"
+  actual_bytes=$("$wc_tool" -c < "$verification_path") || fail "count $verification_label bytes"
+  set -- $actual_bytes
+  [ "$#" -eq 1 ] || fail "$verification_label byte count is invalid"
+  actual_bytes=$1
+  [ "$actual_bytes" = "$verification_bytes" ] || fail "$verification_label byte count mismatch"
+  actual_sha256=$(file_sha256 "$verification_path")
+  [ "$actual_sha256" = "$verification_sha256" ] || fail "$verification_label SHA-256 mismatch"
+}
+
 download_exact() {
   download_url=$1
   expected_bytes=$2
@@ -327,14 +346,7 @@ download_exact() {
     ulimit -f "$file_limit_blocks" 2>/dev/null || exit 97
     "$curl_tool" --disable --proto '=https' --tlsv1.2 --fail --silent --show-error --connect-timeout 15 --max-time 900 --max-filesize "$expected_bytes" --output "$destination" --url "$download_url"
   ) || fail "download failed or exceeded its independent file limit: $download_url"
-  [ -f "$destination" ] && [ ! -L "$destination" ] || fail 'download did not create a regular file'
-  actual_bytes=$("$wc_tool" -c < "$destination") || fail 'count downloaded bytes'
-  set -- $actual_bytes
-  [ "$#" -eq 1 ] || fail 'download byte count is invalid'
-  actual_bytes=$1
-  [ "$actual_bytes" = "$expected_bytes" ] || fail "download byte count mismatch: $download_url"
-  actual_sha256=$(file_sha256 "$destination")
-  [ "$actual_sha256" = "$expected_sha256" ] || fail "download SHA-256 mismatch: $download_url"
+  verify_exact_file "$destination" "$expected_bytes" "$expected_sha256" "download: $download_url"
   "$chmod_tool" "$destination_mode" "$destination" || fail 'protect verified download'
 }
 
@@ -380,9 +392,14 @@ cd "$work_dir" || fail 'enter installer workspace'
 [ "$(pwd -P)" = "$work_dir" ] || fail 'installer workspace identity changed before entry'
 "$chmod_tool" 700 . || fail 'protect pinned installer workspace'
 cleanup() {
+  cleanup_dir=$(pwd -P 2>/dev/null || true)
   "$rm_tool" -f ./release-manifest.json ./LICENSE ./NOTICE ./sshserver ./deployment-preview.json 2>/dev/null || :
+  if [ "$cleanup_dir" != "$work_dir" ]; then
+    "$rm_tool" -f "$work_dir/release-manifest.json" "$work_dir/LICENSE" "$work_dir/NOTICE" "$work_dir/sshserver" "$work_dir/deployment-preview.json" 2>/dev/null || :
+  fi
   cd / || :
-  "$rmdir_tool" "$work_dir" 2>/dev/null || :
+  [ -z "$cleanup_dir" ] || "$rmdir_tool" "$cleanup_dir" 2>/dev/null || :
+  [ "$cleanup_dir" = "$work_dir" ] || "$rmdir_tool" "$work_dir" 2>/dev/null || :
 }
 trap cleanup 0
 
@@ -400,6 +417,7 @@ run_clean() {
   "$env_tool" -i HOME="$HOME" XDG_DATA_HOME="$XDG_DATA_HOME" XDG_STATE_HOME="$XDG_STATE_HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" PATH="$PATH" LC_ALL=C "$@"
 }
 
+verify_exact_file ./sshserver "$artifact_bytes" "$artifact_sha256" 'artifact before deployment preview'
 run_clean ./sshserver deploy preview --manifest "$manifest_path" --manifest-sha256 {{quote .Manifest.SHA256}} --artifact "$artifact_path" --license "$license_path" --notice "$notice_path" > ./deployment-preview.json || fail 'verified deployment preview failed'
 preview_bytes=$("$wc_tool" -c < ./deployment-preview.json) || fail 'count deployment preview bytes'
 set -- $preview_bytes
@@ -420,7 +438,39 @@ IFS= read -r confirmation <&3 || fail 'read deployment confirmation'
 exec 3<&-
 exec 4>&-
 
+verify_exact_file ./sshserver "$artifact_bytes" "$artifact_sha256" 'artifact before deployment apply'
 run_clean ./sshserver deploy apply --manifest "$manifest_path" --manifest-sha256 {{quote .Manifest.SHA256}} --artifact "$artifact_path" --license "$license_path" --notice "$notice_path" --confirmed-preview-sha256 "$preview_sha256" --consume-inputs --supervise-foreground || fail 'verified deployment apply or supervised foreground server failed'
 `
 
-const installerBootstrapTemplate = `set -efu; umask 077; PATH={{quote .ToolPath}}; LC_ALL=C; export PATH LC_ALL; fail() { printf '%s\n' "sshserver installer bootstrap: $*" >&2; exit 1; }; tool_path() { bootstrap_tool=$(command -v "$1" 2>/dev/null || true); case "$bootstrap_tool" in /*) printf '%s\n' "$bootstrap_tool" ;; *) fail "required tool $1 is unavailable on the fixed system PATH" ;; esac; }; curl_tool=$(tool_path curl); mktemp_tool=$(tool_path mktemp); wc_tool=$(tool_path wc); chmod_tool=$(tool_path chmod); rm_tool=$(tool_path rm); rmdir_tool=$(tool_path rmdir); curl_version_output=$("$curl_tool" --disable --version) || fail 'query system curl version'; curl_version=${curl_version_output#curl }; curl_version=${curl_version%% *}; curl_version=${curl_version%%-*}; case "$curl_version" in ''|*[!0-9.]*|.*|*.|*..*) fail 'system curl returned an unsupported version string' ;; esac; saved_ifs=$IFS; IFS=.; set -- $curl_version; IFS=$saved_ifs; [ "$#" -eq 3 ] || fail 'system curl returned an unsupported version string'; curl_major=$1; curl_minor=$2; curl_patch=$3; case "$curl_major:$curl_minor:$curl_patch" in *[!0-9:]*) fail 'system curl returned an unsupported version string' ;; esac; if [ "$curl_major" -lt 7 ] || { [ "$curl_major" -eq 7 ] && [ "$curl_minor" -lt 58 ]; }; then fail 'curl 7.58.0 or newer is required for the pinned HTTPS installer'; fi; if checksum_tool=$(command -v sha256sum 2>/dev/null); then checksum_kind=sha256sum; elif checksum_tool=$(command -v shasum 2>/dev/null); then checksum_kind=shasum; else fail 'sha256sum or shasum is required'; fi; case "$checksum_tool" in /*) ;; *) fail 'checksum tool did not resolve to an absolute system path' ;; esac; cd /tmp || fail 'enter installer bootstrap root'; bootstrap_root=$(pwd -P) || fail 'resolve installer bootstrap root'; case "$bootstrap_root" in /*) ;; *) fail 'installer bootstrap root is not absolute' ;; esac; work_dir=$("$mktemp_tool" -d "$bootstrap_root/jat-sshserver-bootstrap.XXXXXXXX") || fail 'create installer bootstrap workspace'; case "$work_dir" in "$bootstrap_root"/jat-sshserver-bootstrap.*) ;; *) fail 'mktemp returned an unexpected workspace' ;; esac; [ -d "$work_dir" ] && [ ! -L "$work_dir" ] || fail 'installer bootstrap workspace is unsafe'; cd "$work_dir" || fail 'enter installer bootstrap workspace'; [ "$(pwd -P)" = "$work_dir" ] || fail 'installer bootstrap workspace identity changed before entry'; "$chmod_tool" 700 . || fail 'protect pinned installer bootstrap workspace'; cleanup() { "$rm_tool" -f ./install.sh 2>/dev/null || :; cd / || :; "$rmdir_tool" "$work_dir" 2>/dev/null || :; }; trap cleanup 0; installer_path=./install.sh; installer_file_limit_blocks=$(( ({{.InstallerBytes}} + 511) / 512 )); [ "$installer_file_limit_blocks" -gt 0 ] || fail 'installer file limit is invalid'; ( ulimit -c 0 2>/dev/null || exit 96; trap '' XFSZ; ulimit -f "$installer_file_limit_blocks" 2>/dev/null || exit 97; "$curl_tool" --disable --proto '=https' --tlsv1.2 --fail --silent --show-error --connect-timeout 15 --max-time 120 --max-filesize {{.InstallerBytes}} --output "$installer_path" --url {{quote .InstallerURL}} ) || fail 'download pinned installer or enforce its independent file limit'; [ -f "$installer_path" ] && [ ! -L "$installer_path" ] || fail 'installer download is not a regular file'; actual_bytes=$("$wc_tool" -c < "$installer_path") || fail 'count installer bytes'; set -- $actual_bytes; [ "$#" -eq 1 ] || fail 'installer byte count is invalid'; actual_bytes=$1; [ "$actual_bytes" = {{quote .InstallerBytes}} ] || fail 'installer byte count mismatch'; if [ "$checksum_kind" = sha256sum ]; then checksum_output=$("$checksum_tool" < "$installer_path") || fail 'sha256sum failed'; else checksum_output=$("$checksum_tool" -a 256 < "$installer_path") || fail 'shasum failed'; fi; set -- $checksum_output; [ "$#" -ge 1 ] || fail 'checksum tool returned no digest'; [ "$1" = {{quote .InstallerSHA}} ] || fail 'installer SHA-256 mismatch'; "$chmod_tool" 400 "$installer_path" || fail 'protect verified installer'; {{quote .ShellPath}} "$installer_path"`
+var installerBootstrapTemplate = strings.Join([]string{
+	`set -efu;`,
+	`umask 077;`,
+	`PATH={{quote .ToolPath}}; LC_ALL=C; export PATH LC_ALL;`,
+	`fail() { printf '%s\n' "sshserver installer bootstrap: $*" >&2; exit 1; };`,
+	`tool_path() { bootstrap_tool=$(command -v "$1" 2>/dev/null || true); case "$bootstrap_tool" in /*) printf '%s\n' "$bootstrap_tool" ;; *) fail "required tool $1 is unavailable on the fixed system PATH" ;; esac; };`,
+	`curl_tool=$(tool_path curl); mktemp_tool=$(tool_path mktemp); wc_tool=$(tool_path wc); chmod_tool=$(tool_path chmod); rm_tool=$(tool_path rm); rmdir_tool=$(tool_path rmdir); cat_tool=$(tool_path cat); env_tool=$(tool_path env);`,
+	`curl_version_output=$("$curl_tool" --disable --version) || fail 'query system curl version';`,
+	`curl_version=${curl_version_output#curl }; curl_version=${curl_version%% *}; curl_version=${curl_version%%-*};`,
+	`case "$curl_version" in ''|*[!0-9.]*|.*|*.|*..*) fail 'system curl returned an unsupported version string' ;; esac;`,
+	`saved_ifs=$IFS; IFS=.; set -- $curl_version; IFS=$saved_ifs; [ "$#" -eq 3 ] || fail 'system curl returned an unsupported version string';`,
+	`curl_major=$1; curl_minor=$2; curl_patch=$3; case "$curl_major:$curl_minor:$curl_patch" in *[!0-9:]*) fail 'system curl returned an unsupported version string' ;; esac;`,
+	`if [ "$curl_major" -lt 7 ] || { [ "$curl_major" -eq 7 ] && [ "$curl_minor" -lt 58 ]; }; then fail 'curl 7.58.0 or newer is required for the pinned HTTPS installer'; fi;`,
+	`if checksum_tool=$(command -v sha256sum 2>/dev/null); then checksum_kind=sha256sum; elif checksum_tool=$(command -v shasum 2>/dev/null); then checksum_kind=shasum; else fail 'sha256sum or shasum is required'; fi;`,
+	`case "$checksum_tool" in /*) ;; *) fail 'checksum tool did not resolve to an absolute system path' ;; esac;`,
+	`cd /tmp || fail 'enter installer bootstrap root'; bootstrap_root=$(pwd -P) || fail 'resolve installer bootstrap root'; case "$bootstrap_root" in /*) ;; *) fail 'installer bootstrap root is not absolute' ;; esac;`,
+	`work_dir=$("$mktemp_tool" -d "$bootstrap_root/jat-sshserver-bootstrap.XXXXXXXX") || fail 'create installer bootstrap workspace';`,
+	`case "$work_dir" in "$bootstrap_root"/jat-sshserver-bootstrap.*) ;; *) fail 'mktemp returned an unexpected workspace' ;; esac;`,
+	`[ -d "$work_dir" ] && [ ! -L "$work_dir" ] || fail 'installer bootstrap workspace is unsafe';`,
+	`cd "$work_dir" || fail 'enter installer bootstrap workspace'; [ "$(pwd -P)" = "$work_dir" ] || fail 'installer bootstrap workspace identity changed before entry'; "$chmod_tool" 700 . || fail 'protect pinned installer bootstrap workspace';`,
+	`cleanup() { cleanup_dir=$(pwd -P 2>/dev/null || true); "$rm_tool" -f ./install.sh "$work_dir/install.sh" 2>/dev/null || :; cd / || :; [ -z "$cleanup_dir" ] || "$rmdir_tool" "$cleanup_dir" 2>/dev/null || :; [ "$cleanup_dir" = "$work_dir" ] || "$rmdir_tool" "$work_dir" 2>/dev/null || :; }; trap cleanup 0;`,
+	`installer_path=./install.sh; installer_file_limit_blocks=$(( ({{.InstallerBytes}} + 511) / 512 )); [ "$installer_file_limit_blocks" -gt 0 ] || fail 'installer file limit is invalid';`,
+	`( ulimit -c 0 2>/dev/null || exit 96; trap '' XFSZ; ulimit -f "$installer_file_limit_blocks" 2>/dev/null || exit 97; "$curl_tool" --disable --proto '=https' --tlsv1.2 --fail --silent --show-error --connect-timeout 15 --max-time 120 --max-filesize {{.InstallerBytes}} --output "$installer_path" --url {{quote .InstallerURL}} ) || fail 'download pinned installer or enforce its independent file limit';`,
+	`[ -f "$installer_path" ] && [ ! -L "$installer_path" ] || fail 'installer download is not a regular file'; "$chmod_tool" 400 "$installer_path" || fail 'protect downloaded installer';`,
+	`command : 5<"$installer_path" || fail 'open downloaded installer'; exec 5<"$installer_path"; "$rm_tool" -f "$installer_path" || fail 'unlink downloaded installer';`,
+	`installer_sentinel=__JAT_INSTALLER_EOF_7f29a4a2__; installer_with_sentinel=$("$cat_tool" <&5 || exit 98; printf '%s' "$installer_sentinel") || fail 'read downloaded installer from retained descriptor'; exec 5<&-;`,
+	`case "$installer_with_sentinel" in *"$installer_sentinel") ;; *) fail 'installer sentinel is missing' ;; esac; installer_program=${installer_with_sentinel%"$installer_sentinel"}; unset installer_with_sentinel;`,
+	`actual_bytes=$(printf '%s' "$installer_program" | "$wc_tool" -c) || fail 'count retained installer bytes'; set -- $actual_bytes; [ "$#" -eq 1 ] || fail 'installer byte count is invalid'; actual_bytes=$1; [ "$actual_bytes" = {{quote .InstallerBytes}} ] || fail 'installer byte count mismatch';`,
+	`if [ "$checksum_kind" = sha256sum ]; then checksum_output=$(printf '%s' "$installer_program" | "$checksum_tool") || fail 'sha256sum failed'; else checksum_output=$(printf '%s' "$installer_program" | "$checksum_tool" -a 256) || fail 'shasum failed'; fi;`,
+	`set -- $checksum_output; [ "$#" -ge 1 ] || fail 'checksum tool returned no digest'; [ "$1" = {{quote .InstallerSHA}} ] || fail 'installer SHA-256 mismatch';`,
+	`"$env_tool" -i HOME="${HOME-}" XDG_DATA_HOME="${XDG_DATA_HOME-}" XDG_STATE_HOME="${XDG_STATE_HOME-}" XDG_CONFIG_HOME="${XDG_CONFIG_HOME-}" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR-}" PATH={{quote .ToolPath}} LC_ALL=C {{quote .ShellPath}} -c "$installer_program" install.sh --jat-installer-v1-sanitized`,
+}, " ")

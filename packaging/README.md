@@ -84,10 +84,12 @@ exact byte count, and lowercase SHA-256. It starts a clean `/bin/sh`, disables
 curl configuration, permits HTTPS only, refuses redirect following, applies
 finite connect and transfer timeouts plus both curl's expected-size check and an
 independent process file-size limit for unknown-length responses, downloads to
-a new owner-only temporary directory, and independently checks the final byte
-count and digest before invoking the installer file. Downloaded
-bytes are never piped into a shell, and a separately downloaded checksum file
-is never trusted.
+a new owner-only temporary directory, opens and retains the downloaded file,
+unlinks its pathname, and captures its bytes through that descriptor. It
+checks the exact captured byte count and digest before passing that same
+NUL-free, at-most-64-KiB string to `/bin/sh -c`; neither a later pathname
+replacement nor a separately downloaded checksum file can select the executed
+installer bytes. Unverified response bytes are never piped into a shell.
 
 The verified `install.sh` starts again with a sanitized environment. It retains
 only a validated absolute `HOME` and optional absolute XDG data, state,
@@ -95,10 +97,12 @@ configuration, and runtime directories; fixes `PATH` and `LC_ALL`; uses a new
 owner-only executable workspace beneath the physical home rather than `/tmp`;
 enters and reprotects that directory before writing it; and keeps every
 download, digest check, preview, and artifact execution relative to that pinned
-working-directory inode. Renaming or replacing its parent pathname therefore
-cannot substitute executable bytes. A symlink or automounted `HOME` remains
-supported because the deployment process receives the original `HOME` while
-the staging directory uses its physical location. The installer
+working-directory inode. Renaming or replacing the workspace's parent pathname
+therefore does not redirect those relative lookups. Immediately before both
+native launches it repeats the artifact's exact byte-count and SHA-256 checks.
+A symlink or automounted `HOME` remains supported because the deployment
+process receives the original `HOME` while the staging directory uses its
+physical location. The installer
 requires system curl 7.58.0 or newer plus either `sha256sum` or `shasum`. Both
 the bootstrap and verified installer preflight that curl floor before their
 first download, so an older or unparseable system curl fails with an explicit
@@ -116,11 +120,23 @@ This intentionally follows the architecture reported to the executing shell;
 an x86_64 shell under Rosetta installs the amd64 binary. Unknown and 32-bit
 targets fail before downloading or executing an artifact.
 
+The native launch rechecks are defense in depth, not an atomic inode-execution
+claim. Portable POSIX shell has no cross-platform retained-descriptor execution
+primitive for native Linux and macOS binaries; in particular, Darwin has no
+`fexecve`/`execveat` equivalent available to this bootstrap. A hostile
+concurrent process running as the selected Unix account is therefore outside
+the installer integrity boundary. Such a process can also replace the
+user-owned installed runtime or its state after installation, so it is treated
+as compromise of that account and requires restoration from a known-good host.
+The parent-namespace swap tests exercise accidental or externally induced path
+instability; they do not claim protection from an already-compromised account.
+
 The installer embeds the exact manifest, LICENSE, NOTICE, and all four artifact
 URLs, byte counts, and SHA-256 digests. It downloads and verifies the manifest,
 support files, and selected artifact before any artifact execution. The
-artifact then reopens and revalidates those same pinned files and its frozen Go
-attestation. A controlling `/dev/tty` is mandatory: the installer writes the
+installer repeats the artifact pin immediately before preview and apply; the
+artifact then reopens and revalidates those same pinned inputs and its frozen
+Go attestation. A controlling `/dev/tty` is mandatory: the installer writes the
 exact canonical read-only deployment preview there and proceeds only after the
 user types the literal word `yes`. The installer closes both terminal
 descriptors before apply, so neither the apply child nor a long-lived foreground

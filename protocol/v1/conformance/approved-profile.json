@@ -32,10 +32,10 @@
     "protocol/v1/schemas/wire.schema.json": "3e855e51672441700592526dfd6ef1bc08dc0a79cc98cfb64bf76bb53699c44a"
   },
   "post_approval_protocol_artifact_sha256": {
-    "DECISIONS.md": "c0af2937ffc09ed86d6cfb8bbd42ce787bc48760011a76db07231ebcbbf1c459",
+    "DECISIONS.md": "6fcb10fefbeabae8908bef0e9063377473e24bd6668a2e79a27df9f9164704e3",
     "README.md": "f6e94505b2704c15597c9e277e299f0cddd48833b27d04fa4251ddc45e6b2cd9",
     "SYNC-PROTOCOL.md": "2ae40328334c8de3dde18068b6c7b36dc61d546f6a9a69fdbf387b9c0b3773bf",
-    "docs/THREAT-MODEL.md": "8032ae2dedf9786aef931622ff29a0e1f08e52274e276aa4f12071f319cc5560",
+    "docs/THREAT-MODEL.md": "30b8c792cc05542573563e96197808c37d2c24bb6f78be09f0025bb141fabf1f",
     "protocol/v1/fixtures/api-and-recovery.json": "955e1cb6f10aed11547f0bbb3820ad566c2b57819f0cd3fa85187e7514892151",
     "protocol/v1/fixtures/device-lifecycle.json": "64ccdb8e7cdca4b48a06a186231f7c00bc1b4b19355c3cfbc616f30ded8601f7",
     "protocol/v1/fixtures/enrollment.json": "290a383ce99779fd32d4c00c3e3e3dfd9503418fc4a7f598552664a198770850",
@@ -54,7 +54,7 @@
     "protocol/v1/schemas/encrypted-payload.schema.json": "4320f4d49bb4ac58d55ebc13d57e8c7244b011031facb5b511c25c1ab249d4d3",
     "protocol/v1/schemas/wire.schema.json": "01f630225c09dd2b96f0762f6b03d864f11478137a67746b3bf8e6790d3695ab"
   },
-  "approved_text_transition_diff_sha256": "596299081247a245797dc3b49def42a2b37662b5de01ca06ec503665d5644b77",
+  "approved_text_transition_diff_sha256": "e219799201fcb0d6dffc22ee2a69309554bddbc188d61781000bd6babdeb5905",
   "immutable_crypto_input_sha256": "ca6ae94cb8fc8ca110f650fecddcb5764ba5636de61cd1a791499060a774c1f0",
   "profile_rule": "The approval commit hashes remain historical anchors. The post-approval transition changes only approval/evidence status and the reviewed crypto outputs; proposed_suite, inputs, proposed_argon2id, and every behavioral machine-readable value remain unchanged. Post-approval artifacts are then frozen by exact hash."
 }

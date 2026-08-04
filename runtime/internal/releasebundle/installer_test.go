@@ -89,12 +89,50 @@ func TestGeneratedInstallerAndOneLineCommandHavePinnedShellSyntax(t *testing.T) 
 		!strings.Contains(commandText, "XFSZ") || !strings.Contains(commandText, "ulimit -f") {
 		t.Fatalf("one-line command lacks independent file and core limits: %q", commandText)
 	}
+	for _, required := range []string{
+		`command : 5<"$installer_path"`,
+		`exec 5<"$installer_path"`,
+		`"$rm_tool" -f "$installer_path"`,
+		`"$cat_tool" <&5`,
+		`exec 5<&-`,
+		`"$checksum_tool")`,
+		`-c "$installer_program" install.sh --jat-installer-v1-sanitized`,
+	} {
+		if !strings.Contains(commandText, required) {
+			t.Fatalf("one-line bootstrap lacks retained-byte handoff %q", required)
+		}
+	}
+	for _, forbidden := range []string{`"$installer_path" install.sh`, `/dev/fd/5`, `/proc/self/fd/5`} {
+		if strings.Contains(commandText, forbidden) {
+			t.Fatalf("one-line bootstrap contains unsupported native descriptor execution %q", forbidden)
+		}
+	}
 
 	if _, err := InstallerScript(manifest, int64(len(manifestPayload)), strings.Repeat("0", 64)); err == nil {
 		t.Fatal("installer accepted the wrong manifest pin")
 	}
 	if _, err := InstallCommand("http://downloads.example.test/releases/v1.2.3/install.sh", installer); err == nil {
 		t.Fatal("installer command accepted a non-HTTPS URL")
+	}
+}
+
+func TestInstallCommandEnforcesRepresentableShellArgumentBoundary(t *testing.T) {
+	url := "https://downloads.example.test/releases/v1.2.3/install.sh"
+	maximum := append(bytes.Repeat([]byte{'#'}, maxInstallerBytes-1), '\n')
+	if _, err := InstallCommand(url, maximum); err != nil {
+		t.Fatalf("maximum representable installer rejected: %v", err)
+	}
+	for name, payload := range map[string][]byte{
+		"empty":              nil,
+		"oversize":           append(maximum, '\n'),
+		"missing final LF":   []byte("#!/bin/sh"),
+		"not shell-storable": []byte("#!/bin/sh\nprintf ok\000\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := InstallCommand(url, payload); err == nil {
+				t.Fatal("invalid installer payload accepted")
+			}
+		})
 	}
 }
 
@@ -162,8 +200,14 @@ func TestInstallerWorkspaceSwapCannotReplaceVerifiedExecutable(t *testing.T) {
 	if result.replacementExecuted != "" {
 		t.Fatalf("replacement artifact executed: %q", result.replacementExecuted)
 	}
-	if lines := nonemptyLines(result.executions); len(lines) != 2 || !strings.HasSuffix(nonemptyLines(result.executionDirs)[0], ".moved") {
+	directories := nonemptyLines(result.executionDirs)
+	if lines := nonemptyLines(result.executions); len(lines) != 2 || len(directories) != 2 || !strings.HasSuffix(directories[0], ".moved") {
 		t.Fatalf("verified artifact did not remain pinned after swap: executions=%q dirs=%q", result.executions, result.executionDirs)
+	}
+	for _, path := range []string{directories[0], strings.TrimSuffix(directories[0], ".moved")} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("installer workspace was not removed after parent swap: %s (%v)", path, err)
+		}
 	}
 }
 
@@ -223,6 +267,14 @@ func TestInstallerFailuresNeverReachUnverifiedArtifactOrUnconfirmedApply(t *test
 			wantError: "SHA-256 mismatch", wantExecCount: 0, wantCurlCount: 4,
 		},
 		{
+			name: "artifact leaf swap before final verification", configure: installerShellCase{kernel: "Linux", machine: "x86_64", confirmation: "yes\n", swapArtifactLeaf: true},
+			wantError: "artifact before deployment preview SHA-256 mismatch", wantExecCount: 0, wantCurlCount: 4,
+		},
+		{
+			name: "artifact leaf swap after preview", configure: installerShellCase{kernel: "Linux", machine: "x86_64", confirmation: "yes\n", swapArtifactAfterPreview: true},
+			wantError: "artifact before deployment apply SHA-256 mismatch", wantExecCount: 1, wantCurlCount: 4,
+		},
+		{
 			name: "declined", configure: installerShellCase{kernel: "Linux", machine: "x86_64", confirmation: "no\n"},
 			wantError: "installation declined", wantExecCount: 1, wantCurlCount: 4,
 		},
@@ -252,8 +304,11 @@ func TestOneLineBootstrapVerifiesExactInstallerBeforeShellExecution(t *testing.T
 		curlVersion   string
 		wantCurlCount int
 		swapWorkspace bool
+		swapLeaf      bool
+		extraFinalLFs int
 	}{
 		{name: "exact", wantSuccess: true, wantCurlCount: 1},
+		{name: "retains multiple final LFs", wantSuccess: true, wantCurlCount: 1, extraFinalLFs: 2},
 		{name: "truncated", mutation: "truncate", wantErrorText: "byte count mismatch", wantCurlCount: 1},
 		{name: "oversize", mutation: "oversize", wantErrorText: "byte count mismatch", wantCurlCount: 1},
 		{name: "unknown length flood", mutation: "flood", wantErrorText: "independent file limit", wantCurlCount: 1},
@@ -261,6 +316,7 @@ func TestOneLineBootstrapVerifiesExactInstallerBeforeShellExecution(t *testing.T
 		{name: "redirect refused by curl", curlFailure: true, wantErrorText: "download pinned installer", wantCurlCount: 1},
 		{name: "old system curl", curlVersion: "7.57.0", wantErrorText: "curl 7.58.0 or newer", wantCurlCount: 0},
 		{name: "workspace swap", wantSuccess: true, wantCurlCount: 1, swapWorkspace: true},
+		{name: "leaf swap after retained read", wantSuccess: true, wantCurlCount: 1, swapLeaf: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -272,8 +328,12 @@ func TestOneLineBootstrapVerifiesExactInstallerBeforeShellExecution(t *testing.T
 			replacementMarker := filepath.Join(root, "replacement-executed")
 			environmentLog := filepath.Join(root, "environments.log")
 			versionLog := filepath.Join(root, "curl-version.log")
+			bootstrapDirectoryLog := filepath.Join(root, "bootstrap-directory.log")
 			installer := []byte("#!/bin/sh\n" + installerEnvironmentLogScript(environmentLog) +
+				"[ \"$0\" = install.sh ] && [ \"$#\" -eq 1 ] && [ \"$1\" = --jat-installer-v1-sanitized ] || exit 76\n" +
+				"if /bin/sh -c ': <&5' 2>/dev/null; then exit 77; fi\n" +
 				"printf '%s\\n' executed > " + shellQuote(marker) + "\n")
+			installer = append(installer, bytes.Repeat([]byte{'\n'}, test.extraFinalLFs)...)
 			served := append([]byte(nil), installer...)
 			switch test.mutation {
 			case "":
@@ -313,7 +373,7 @@ func TestOneLineBootstrapVerifiesExactInstallerBeforeShellExecution(t *testing.T
 				"printf '%s\\n' \"$first $url\" >> "+shellQuote(curlLog)+"\n"+
 				"[ \"$first\" = --disable ] || exit 91\n"+failure+
 				"/bin/cp "+shellQuote(servedPath)+" \"$output\"\n"+swapScript)
-			writeInstallerTool(t, tools, "sha256sum", installerChecksumTool(t))
+			writeInstallerTool(t, tools, "sha256sum", installerBootstrapChecksumTool(t, bootstrapDirectoryLog, test.swapLeaf, replacementMarker))
 			options := installerRenderOptions{
 				ToolPath: tools + ":/usr/bin:/bin", TTYReadPath: "/dev/tty", TTYWritePath: "/dev/tty",
 				EnvPath: "/usr/bin/env", ShellPath: "/bin/sh",
@@ -343,6 +403,19 @@ func TestOneLineBootstrapVerifiesExactInstallerBeforeShellExecution(t *testing.T
 			}
 			if _, err := os.Lstat(replacementMarker); !os.IsNotExist(err) {
 				t.Fatalf("replacement installer executed: %v", err)
+			}
+			if directoryPayload, err := os.ReadFile(bootstrapDirectoryLog); err == nil {
+				bootstrapDirectory := strings.TrimSpace(string(directoryPayload))
+				for _, path := range []string{bootstrapDirectory, strings.TrimSuffix(bootstrapDirectory, ".moved")} {
+					if path == "" {
+						continue
+					}
+					if _, err := os.Lstat(path); !os.IsNotExist(err) {
+						t.Fatalf("bootstrap workspace was not removed: %s (%v)", path, err)
+					}
+				}
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
 			}
 			versionCalls, err := os.ReadFile(versionLog)
 			if err != nil {
@@ -380,15 +453,17 @@ func installerManifestPins(manifest deployment.ReleaseManifest) []string {
 }
 
 type installerShellCase struct {
-	kernel           string
-	machine          string
-	confirmation     string
-	missingTTY       bool
-	curlFailure      bool
-	artifactMutation string
-	curlVersion      string
-	swapWorkspace    bool
-	symlinkHome      bool
+	kernel                   string
+	machine                  string
+	confirmation             string
+	missingTTY               bool
+	curlFailure              bool
+	artifactMutation         string
+	curlVersion              string
+	swapWorkspace            bool
+	swapArtifactLeaf         bool
+	swapArtifactAfterPreview bool
+	symlinkHome              bool
 }
 
 type installerShellResult struct {
@@ -438,16 +513,27 @@ func runInstallerShellFixture(t *testing.T, test installerShellCase) installerSh
 	environmentLog := filepath.Join(root, "environments.log")
 	replacementMarker := filepath.Join(root, "replacement-executed")
 	curlLog := filepath.Join(root, "curl.log")
+	replacementArtifactSource := filepath.Join(sources, "replacement-artifact")
+	previewSwapScript := ""
+	if test.swapArtifactAfterPreview {
+		previewSwapScript = "/bin/chmod 700 ./sshserver || exit 78; /bin/cp " + shellQuote(replacementArtifactSource) + " ./sshserver || exit 79; /bin/chmod 500 ./sshserver || exit 80; "
+	}
 	fakeArtifact := []byte("#!/bin/sh\n" +
 		installerEnvironmentLogScript(environmentLog) +
 		"printf '%s\\n' \"$*\" >> " + shellQuote(executionLog) + "\n" +
 		"/bin/pwd -P >> " + shellQuote(executionDirLog) + "\n" +
 		"case \"${1-}/${2-}\" in\n" +
-		"  deploy/preview) printf '%s\\n' '{\"version\":\"1\",\"apply_allowed\":true}' ;;\n" +
+		"  deploy/preview) " + previewSwapScript + "printf '%s\\n' '{\"version\":\"1\",\"apply_allowed\":true}' ;;\n" +
 		"  deploy/apply) if /bin/sh -c ': <&3' 2>/dev/null || /bin/sh -c ': >&4' 2>/dev/null; then exit 75; fi; case \" $* \" in *' --consume-inputs --supervise-foreground '*) printf '%s\\n' '{\"status\":\"active\"}' ;; *) exit 73 ;; esac ;;\n" +
 		"  *) exit 74 ;;\n" +
 		"esac\n")
 	artifactSource := writeInstallerFixtureFile(t, sources, "artifact", fakeArtifact)
+	replacementArtifact := []byte("#!/bin/sh\nprintf replacement > " + shellQuote(replacementMarker) + "\nexit 79\n#")
+	if len(replacementArtifact) > len(fakeArtifact) {
+		t.Fatal("replacement artifact fixture exceeds the pinned artifact size")
+	}
+	replacementArtifact = append(replacementArtifact, bytes.Repeat([]byte{'x'}, len(fakeArtifact)-len(replacementArtifact))...)
+	writeInstallerFixtureFile(t, sources, "replacement-artifact", replacementArtifact)
 	mutatedArtifact := append([]byte(nil), fakeArtifact...)
 	switch test.artifactMutation {
 	case "":
@@ -503,7 +589,11 @@ func runInstallerShellFixture(t *testing.T, test installerShellCase) installerSh
 	manifestSource := writeInstallerFixtureFile(t, sources, "release-manifest.json", manifestPayload)
 
 	writeInstallerTool(t, tools, "uname", "#!/bin/sh\ncase \"${1-}\" in -s) printf '%s\\n' "+shellQuote(test.kernel)+" ;; -m) printf '%s\\n' "+shellQuote(test.machine)+" ;; *) exit 2 ;; esac\n")
-	writeInstallerTool(t, tools, "sha256sum", installerChecksumTool(t))
+	checksumScript := installerChecksumTool(t)
+	if test.swapArtifactLeaf {
+		checksumScript = installerArtifactSwapChecksumTool(t, filepath.Join(root, "checksum-count"), replacementArtifactSource)
+	}
+	writeInstallerTool(t, tools, "sha256sum", checksumScript)
 	curlFailure := ""
 	if test.curlFailure {
 		curlFailure = "exit 55\n"
@@ -619,19 +709,47 @@ func assertSanitizedFixtureEnvironments(t *testing.T, environments, home string)
 
 func installerChecksumTool(t *testing.T) string {
 	t.Helper()
+	return "#!/bin/sh\nexec " + installerChecksumCommand(t) + " \"$@\"\n"
+}
+
+func installerBootstrapChecksumTool(t *testing.T, directoryLog string, swapLeaf bool, replacementMarker string) string {
+	t.Helper()
+	swapScript := ""
+	if swapLeaf {
+		swapScript = "printf '%s\\n' '#!/bin/sh' 'printf replacement > " + shellQuote(replacementMarker) + "' > ./install.sh\n/bin/chmod 700 ./install.sh || exit 92\n"
+	}
+	return "#!/bin/sh\n" +
+		"/bin/pwd -P > " + shellQuote(directoryLog) + "\n" +
+		"checksum_output=$(" + installerChecksumCommand(t) + " \"$@\") || exit 91\n" +
+		swapScript +
+		"printf '%s\\n' \"$checksum_output\"\n"
+}
+
+func installerArtifactSwapChecksumTool(t *testing.T, countPath, replacementArtifact string) string {
+	t.Helper()
+	return "#!/bin/sh\n" +
+		"checksum_output=$(" + installerChecksumCommand(t) + " \"$@\") || exit 91\n" +
+		"checksum_count=0\n[ ! -f " + shellQuote(countPath) + " ] || IFS= read -r checksum_count < " + shellQuote(countPath) + "\n" +
+		"checksum_count=$((checksum_count + 1))\nprintf '%s\\n' \"$checksum_count\" > " + shellQuote(countPath) + "\n" +
+		"if [ \"$checksum_count\" -eq 4 ]; then /bin/cp " + shellQuote(replacementArtifact) + " ./sshserver || exit 92; /bin/chmod 500 ./sshserver || exit 93; fi\n" +
+		"printf '%s\\n' \"$checksum_output\"\n"
+}
+
+func installerChecksumCommand(t *testing.T) string {
+	t.Helper()
 	if path, err := exec.LookPath("sha256sum"); err == nil {
 		path, err = filepath.Abs(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return "#!/bin/sh\nexec " + shellQuote(path) + " \"$@\"\n"
+		return shellQuote(path)
 	}
 	if path, err := exec.LookPath("shasum"); err == nil {
 		path, err = filepath.Abs(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return "#!/bin/sh\nexec " + shellQuote(path) + " -a 256 \"$@\"\n"
+		return shellQuote(path) + " -a 256"
 	}
 	t.Skip("host has neither sha256sum nor shasum")
 	return ""
