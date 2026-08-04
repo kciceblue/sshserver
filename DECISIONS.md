@@ -128,6 +128,7 @@ non-secret metadata.
 - **Evidence:** Canonical decision D14, projected publicly by task 0.2; release and installation evidence closes at 2.1 and 2.5.
 - **Closing task:** 0.2 publishes the decision; platform artifacts close at 2.1 and installation closes at 2.5.
 - **Task 2.0 draft:** The public [scope and SSH bootstrap contract](SYNC-PROTOCOL.md#2-scope-and-non-goals) preserves single-user, user-selected-host deployment and never introduces software on ordinary targets. Packaging and platform execution remain tasks 2.1 and 2.5.
+- **Task 2.5 partial evidence:** The signed [copyable one-line installer slice](https://github.com/kciceblue/sshserver/pull/16) freezes the pinned two-stage download, exact-byte bootstrap handoff, four-target selection, literal preview confirmation, and user-scoped activation contract. The canonical [coordinator ledger follow-up](https://github.com/kciceblue/just-another-terminal/pull/59) records the same partial closure. This closes only D14's copyable one-line component; app-owned one-tap installation and the full native lifecycle matrix remain open, so neither D14's complete installation evidence nor Task 2.5 is closed.
 
 One server instance serves one individual Unix account. Version 1 supports
 Linux and macOS on amd64 and arm64. Installation is available through the app

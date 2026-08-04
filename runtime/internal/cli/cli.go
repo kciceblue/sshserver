@@ -15,8 +15,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
@@ -32,6 +34,7 @@ type Runner struct {
 	Stdout         io.Writer
 	Stderr         io.Writer
 	executablePath func() (string, error)
+	foregroundExec func(string, []string, []string) error
 }
 
 func (runner Runner) Run(ctx context.Context, args []string) int {
@@ -192,6 +195,7 @@ func (runner Runner) runDeployApply(ctx context.Context, operation string, args 
 	noticePath := ""
 	confirmedPreviewSHA256 := ""
 	consumeInputs := false
+	superviseForeground := false
 	flags.StringVar(&manifestPath, "manifest", manifestPath, "absolute owner-only release manifest path")
 	flags.StringVar(&manifestSHA256, "manifest-sha256", manifestSHA256, "pinned lowercase manifest SHA-256")
 	flags.StringVar(&artifactPath, "artifact", artifactPath, "absolute verified release artifact path")
@@ -199,11 +203,18 @@ func (runner Runner) runDeployApply(ctx context.Context, operation string, args 
 	flags.StringVar(&noticePath, "notice", noticePath, "absolute verified NOTICE path")
 	flags.StringVar(&confirmedPreviewSHA256, "confirmed-preview-sha256", confirmedPreviewSHA256, "SHA-256 of the exact canonical preview bytes shown to the user")
 	flags.BoolVar(&consumeInputs, "consume-inputs", consumeInputs, "remove verified manifest and artifact inputs after success")
+	flags.BoolVar(&superviseForeground, "supervise-foreground", superviseForeground, "replace this apply process with the exact installed foreground server when required")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("deploy %s accepts no positional arguments", operation)
+	}
+	if superviseForeground && operation != "apply" {
+		return errors.New("--supervise-foreground is supported only by deploy apply")
+	}
+	if superviseForeground && !consumeInputs {
+		return errors.New("--supervise-foreground requires --consume-inputs")
 	}
 	if manifestPath == "" || manifestSHA256 == "" || artifactPath == "" || licensePath == "" || noticePath == "" || confirmedPreviewSHA256 == "" {
 		return fmt.Errorf("deploy %s requires --manifest, --manifest-sha256, --artifact, --license, --notice, and --confirmed-preview-sha256", operation)
@@ -250,7 +261,63 @@ func (runner Runner) runDeployApply(ctx context.Context, operation string, args 
 			return err
 		}
 	}
-	return runner.writeApplyResult(result)
+	if !superviseForeground {
+		return runner.writeApplyResult(result)
+	}
+	return runner.writeAndSuperviseApplyResult(result)
+}
+
+func (runner Runner) writeAndSuperviseApplyResult(result deployment.ApplyResult) error {
+	command, err := supervisedForegroundCommand(result)
+	if err != nil {
+		return err
+	}
+	if err := runner.writeApplyResult(result); err != nil {
+		return err
+	}
+	if len(command) == 0 {
+		return nil
+	}
+	execForeground := runner.foregroundExec
+	if execForeground == nil {
+		execForeground = syscall.Exec
+	}
+	return execForeground(command[0], command, os.Environ())
+}
+
+func supervisedForegroundCommand(result deployment.ApplyResult) ([]string, error) {
+	locator := result.DeploymentLocator
+	layout, err := deployment.NewLayout(locator.HomeDir, locator.InstallRoot, locator.StateDir)
+	if err != nil {
+		return nil, fmt.Errorf("validate supervised deployment locator: %w", err)
+	}
+	if err := result.State.Validate(layout); err != nil {
+		return nil, fmt.Errorf("validate supervised deployment state: %w", err)
+	}
+	active := result.State.Active
+	if active == nil || locator.Version != "1" || locator.LifecycleBinaryPath != active.BinaryPath ||
+		locator.Release != active.Release || locator.OS != active.OS || locator.Architecture != active.Architecture ||
+		locator.ManifestSHA256 != active.ManifestSHA256 || locator.BinarySHA256 != active.BinarySHA256 ||
+		locator.BinaryBytes != active.BinaryBytes {
+		return nil, errors.New("supervised deployment locator does not match the committed active release")
+	}
+	if result.Status == "active" {
+		if result.State.Status != deployment.StatusActive || result.State.Manager == deployment.ManagerForeground || result.Foreground != nil {
+			return nil, errors.New("active supervised deployment result is inconsistent")
+		}
+		return nil, nil
+	}
+	if result.Status != "foreground_required" || result.State.Status != deployment.StatusForeground ||
+		result.State.Manager != deployment.ManagerForeground || result.Foreground == nil ||
+		!result.Foreground.Required || result.Foreground.Reason != "user_service_manager_unavailable" ||
+		!result.Foreground.Supervised {
+		return nil, errors.New("supervised deployment result is not an exact foreground requirement")
+	}
+	want := []string{locator.LifecycleBinaryPath, "serve", "--state-dir", locator.StateDir}
+	if !slices.Equal(result.Foreground.Command, want) {
+		return nil, errors.New("supervised deployment foreground command does not match the installed locator")
+	}
+	return want, nil
 }
 
 func wrapOptionalError(operation string, err error) error {

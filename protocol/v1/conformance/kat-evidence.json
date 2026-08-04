@@ -2,7 +2,7 @@
   "schema_version": 1,
   "status": "verified",
   "approved_profile_commit": "1a4951947efbef1827b1fcba4be89a7781405c5d",
-  "approved_profile_manifest_sha256": "9a97982aa35b414efeb42a8908260b8a83947621b333a8d64a3c5900ad3eb487",
+  "approved_profile_manifest_sha256": "96e1bb6823004be0a699261fae653821d975c51143de727d930941deeaa80ba0",
   "fixture": "protocol/v1/fixtures/crypto-review-vectors.json",
   "fixture_sha256": "dc21f9ce7f881784636bf2569240a247e89d914d317c10116183d715548847fa",
   "immutable_crypto_input_sha256": "ca6ae94cb8fc8ca110f650fecddcb5764ba5636de61cd1a791499060a774c1f0",
@@ -23,7 +23,7 @@
   },
   "evidence_checker": {
     "path": "scripts/check_crypto_kats.py",
-    "source_sha256": "6f83e1573873390cc5c20d9177bf2ccb0e583fc5f565969dc963a5c0bd26dc5d"
+    "source_sha256": "207eaa879b368968a4682784be2c27c337da9f46d89b60a7168e7144a29f2c86"
   },
   "go_dependency_file_sha256": {
     "go.mod": "fb39e4470fa5e4ad2bc61347a0a39e88d34d4651da7fc02728601504c27e6094",
