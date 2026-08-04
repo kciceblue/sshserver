@@ -123,13 +123,14 @@ jobs:
           cache-dependency-path: runtime/go.sum
       - name: Build and execute the native single-file runtime
         env:
-          RUNTIME_VERSION: ${{ needs.policy.outputs.validated_head_sha }}
+          RUNTIME_VERSION: v0.0.0-ci.${{ needs.policy.outputs.validated_head_sha }}
+          SOURCE_REVISION: ${{ needs.policy.outputs.validated_head_sha }}
         run: |
           make runtime-release-bundle-one \
             RUNTIME_GOOS=${{ matrix.goos }} \
             RUNTIME_GOARCH=${{ matrix.goarch }} \
             VERSION="$RUNTIME_VERSION" \
-            SOURCE_REVISION="$RUNTIME_VERSION"
+            SOURCE_REVISION="$SOURCE_REVISION"
           python3 scripts/check_runtime_release.py \
             --dist dist \
             --version "$RUNTIME_VERSION" \

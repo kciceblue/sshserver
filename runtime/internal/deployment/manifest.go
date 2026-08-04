@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/kciceblue/sshserver/runtime/internal/releaseid"
 )
 
 const (
@@ -26,7 +28,6 @@ const (
 )
 
 var (
-	releaseIDPattern      = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 	hexDigestPattern      = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	sourceRevisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	toolchainPattern      = regexp.MustCompile(`^go[1-9][0-9]*\.[0-9]+\.[0-9]+$`)
@@ -111,8 +112,7 @@ func (manifest ReleaseManifest) Validate() error {
 	if manifest.ManifestVersion != ManifestVersion {
 		return fmt.Errorf("unsupported release manifest version %d", manifest.ManifestVersion)
 	}
-	if !releaseIDPattern.MatchString(manifest.Release) || strings.Contains(manifest.Release, "..") ||
-		strings.EqualFold(manifest.Release, "latest") {
+	if !releaseid.Valid(manifest.Release) {
 		return errors.New("release identifier is not immutable and path-safe")
 	}
 	if !sourceRevisionPattern.MatchString(manifest.SourceRevision) {
@@ -247,7 +247,7 @@ func SHA256Hex(payload []byte) string {
 }
 
 func DeriveBuildIdentity(release, sourceRevision, buildToolchain string, target Target) (string, error) {
-	if !releaseIDPattern.MatchString(release) || strings.Contains(release, "..") || strings.EqualFold(release, "latest") {
+	if !releaseid.Valid(release) {
 		return "", errors.New("build identity release is invalid")
 	}
 	if !sourceRevisionPattern.MatchString(sourceRevision) {

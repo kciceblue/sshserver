@@ -167,6 +167,18 @@ func TestGenerateRejectsArtifactWithoutDeterministicIdentity(t *testing.T) {
 	}
 }
 
+func TestGenerateRejectsMovingReleaseBeforeFilesystemMutation(t *testing.T) {
+	options := testBundleOptions(t)
+	options.Release = "stable"
+	options.DistDir = filepath.Join(filepath.Dir(options.DistDir), "missing", "stable")
+	if _, err := generate(options, acceptTestMetadata); err == nil || !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("moving release error=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Dir(options.DistDir)); !os.IsNotExist(err) {
+		t.Fatalf("invalid release created distribution parent: %v", err)
+	}
+}
+
 func TestGenerateNeverOverwritesAnImmutablePublishedRelease(t *testing.T) {
 	options := testBundleOptions(t)
 	first, err := generate(options, acceptTestMetadata)

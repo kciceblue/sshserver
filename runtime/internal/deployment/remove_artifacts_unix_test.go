@@ -75,6 +75,27 @@ func TestRemoveInstalledArtifactsPreflightsBeforeDeleting(t *testing.T) {
 	}
 }
 
+func TestRemoveInstalledArtifactsRejectsMovingReleaseDirectoryBeforeDeleting(t *testing.T) {
+	layout := testLayout(t)
+	trusted, err := PrepareVersionDirectory(layout, "v1.2.3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustedBinary := filepath.Join(trusted, "sshserver-linux-amd64")
+	if err := os.WriteFile(trustedBinary, []byte("trusted"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(layout.VersionsDir, "stable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveInstalledArtifacts(layout); err == nil {
+		t.Fatal("moving release directory unexpectedly accepted")
+	}
+	if _, err := os.Lstat(trustedBinary); err != nil {
+		t.Fatalf("release-name preflight partially deleted trusted version: %v", err)
+	}
+}
+
 func TestRemoveInstalledArtifactsRejectsUnexpectedAndHardLinkedFiles(t *testing.T) {
 	for _, test := range []struct {
 		name  string

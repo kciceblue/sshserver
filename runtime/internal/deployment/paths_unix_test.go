@@ -63,11 +63,13 @@ func TestLayoutRejectsEscapesAndUnsupportedTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := layout.BinaryPath("v1", Target{OS: "freebsd", Architecture: "amd64"}); err == nil {
+	if _, err := layout.BinaryPath("v1.2.3", Target{OS: "freebsd", Architecture: "amd64"}); err == nil {
 		t.Fatal("unsupported target unexpectedly accepted")
 	}
-	if _, err := layout.VersionDir("latest"); err == nil {
-		t.Fatal("moving release unexpectedly accepted")
+	for _, release := range []string{"latest", "stable", "current", "main", "nightly", "v1", "v1.2.3+build"} {
+		if _, err := layout.VersionDir(release); err == nil {
+			t.Fatalf("non-immutable release %q unexpectedly accepted", release)
+		}
 	}
 }
 

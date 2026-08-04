@@ -14,6 +14,7 @@ import (
 
 	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
+	"github.com/kciceblue/sshserver/runtime/internal/releaseid"
 )
 
 const maxIdentityBytes = 4096
@@ -99,7 +100,7 @@ func ValidateReleaseIdentity(identity buildinfo.Identity, expected InstalledRele
 		identity.ProtocolVersion != expected.ProtocolVersion || identity.StorageSchema != expected.StorageSchema {
 		return errors.New("reported build identity does not match the pinned release artifact")
 	}
-	if !releaseIDPattern.MatchString(identity.Release) || !sourceRevisionPattern.MatchString(identity.SourceRevision) ||
+	if !releaseid.Valid(identity.Release) || !sourceRevisionPattern.MatchString(identity.SourceRevision) ||
 		!toolchainPattern.MatchString(identity.BuildToolchain) || !hexDigestPattern.MatchString(identity.BuildIdentity) ||
 		identity.ProtocolVersion != "1" || identity.StorageSchema != "1" {
 		return errors.New("reported build identity is not an exact V1 release identity")

@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/kciceblue/sshserver/runtime/internal/config"
+	"github.com/kciceblue/sshserver/runtime/internal/releaseid"
 	"github.com/kciceblue/sshserver/runtime/internal/store"
 )
 
@@ -1174,7 +1175,7 @@ func (preview DeploymentPreview) Validate() error {
 	if !isSupportedTarget(target) {
 		return errors.New("deployment preview target is unsupported")
 	}
-	if !releaseIDPattern.MatchString(preview.Release.Release) || !sourceRevisionPattern.MatchString(preview.Release.SourceRevision) ||
+	if !releaseid.Valid(preview.Release.Release) || !sourceRevisionPattern.MatchString(preview.Release.SourceRevision) ||
 		!toolchainPattern.MatchString(preview.Release.BuildToolchain) || !hexDigestPattern.MatchString(preview.Release.BuildIdentity) ||
 		preview.Release.ProtocolVersion != "1" || preview.Release.StorageSchema != "1" {
 		return errors.New("deployment preview release identity is invalid")

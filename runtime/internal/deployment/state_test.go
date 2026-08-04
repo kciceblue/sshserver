@@ -121,6 +121,7 @@ func TestDeploymentStateRejectsIncompatibleAndMismatchedRecords(t *testing.T) {
 		want   string
 	}{
 		{name: "generation", mutate: func(value *DeploymentState) { value.Generation = 0 }, want: "generation"},
+		{name: "moving release", mutate: func(value *DeploymentState) { value.Active.Release = "stable" }, want: "release identifier"},
 		{name: "wrong state", mutate: func(value *DeploymentState) { value.StateDir += "-other" }, want: "state directory"},
 		{name: "wrong binary", mutate: func(value *DeploymentState) { value.Active.BinaryPath += "-other" }, want: "binary path"},
 		{name: "schema", mutate: func(value *DeploymentState) { value.Active.StorageSchema = "2" }, want: "incompatible"},

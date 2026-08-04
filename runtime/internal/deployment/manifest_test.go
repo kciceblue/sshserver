@@ -79,6 +79,12 @@ func TestReleaseManifestRejectsMovingIncompleteAndUnsafeArtifacts(t *testing.T) 
 		want   string
 	}{
 		{name: "latest", mutate: func(value *ReleaseManifest) { value.Release = "latest" }, want: "immutable"},
+		{name: "stable", mutate: func(value *ReleaseManifest) { value.Release = "stable" }, want: "immutable"},
+		{name: "current", mutate: func(value *ReleaseManifest) { value.Release = "current" }, want: "immutable"},
+		{name: "main", mutate: func(value *ReleaseManifest) { value.Release = "main" }, want: "immutable"},
+		{name: "nightly", mutate: func(value *ReleaseManifest) { value.Release = "nightly" }, want: "immutable"},
+		{name: "incomplete release", mutate: func(value *ReleaseManifest) { value.Release = "v1.2" }, want: "immutable"},
+		{name: "build metadata release", mutate: func(value *ReleaseManifest) { value.Release = "v1.2.3+build" }, want: "immutable"},
 		{name: "path release", mutate: func(value *ReleaseManifest) { value.Release = "v1..2" }, want: "path-safe"},
 		{name: "uppercase release", mutate: func(value *ReleaseManifest) { value.Release = "V1.2.3" }, want: "path-safe"},
 		{name: "source revision", mutate: func(value *ReleaseManifest) { value.SourceRevision = strings.Repeat("a", 39) }, want: "source revision"},
