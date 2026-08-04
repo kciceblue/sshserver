@@ -1,0 +1,48 @@
+Just Another Terminal Sync Server
+Copyright 2026 Hengyu Xu
+
+This product is licensed under the Apache License, Version 2.0.
+
+The independent Go cryptographic conformance implementation uses
+golang.org/x/crypto v0.54.0 and golang.org/x/sys v0.47.0. Its complete Go
+module graph also inventories golang.org/x/net v0.56.0, golang.org/x/term
+v0.45.0, and golang.org/x/text v0.40.0. These modules are copyright The Go
+Authors and licensed under the BSD 3-Clause License; their complete license
+texts are in ThirdPartyLicenses/.
+
+External GitHub Actions used by CI are recorded in DEPENDENCIES.json and are
+not redistributed by this repository. Release publication uses
+`actions/upload-pages-artifact@v4` and `actions/deploy-pages@v4`; both are
+licensed under the MIT License.
+
+The independent Swift cryptographic KAT invokes an explicitly selected OpenSSL
+3.6.3 command-line tool (Apache-2.0) for Argon2id only.
+
+The protocol key-fixture tests separately invoke the PATH-resolved system
+OpenSSL 3 command-line tool inventoried as `system:openssl@3` to strictly parse,
+validate, canonically re-encode, and derive the public halves of
+software-identity and public-only Secure Enclave identity fixtures. The test
+loads that inventory entry and enforces its recorded OpenSSL 3 version pattern
+before accepting the provider.
+
+Neither OpenSSL test tool is linked into or redistributed by this repository.
+
+The Pure-Go user-scoped server runtime embeds SQLite 3.51.3 through a
+mechanically trimmed, otherwise unmodified source fork of
+`github.com/ncruces/go-sqlite3` v0.32.0. The exact upstream commit, module
+checksums, retained package boundary, and local replacement are recorded in
+`runtime/third_party/go-sqlite3/UPSTREAM.md`. Its complete selected Go module
+graph is:
+
+- `github.com/ncruces/go-sqlite3` v0.32.0 (MIT)
+- `github.com/ncruces/julianday` v1.0.0 (MIT)
+- `github.com/tetratelabs/wazero` v1.11.0 (Apache-2.0)
+- `golang.org/x/sys` v0.41.0 (BSD-3-Clause)
+
+The wazero attribution notice is:
+
+    wazero
+    Copyright 2020-2023 wazero authors
+
+Complete distributed license and notice texts for this graph are collected in
+`ThirdPartyLicenses/runtime-go-modules-LICENSES.txt`.
