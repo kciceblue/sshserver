@@ -403,15 +403,27 @@ cleanup() {
 }
 trap cleanup 0
 
-manifest_path=$work_dir/release-manifest.json
-license_path=$work_dir/LICENSE
-notice_path=$work_dir/NOTICE
-artifact_path=$work_dir/sshserver
-preview_path=$work_dir/deployment-preview.json
 download_exact {{quote .Manifest.URL}} {{.Manifest.Bytes}} {{quote .Manifest.SHA256}} ./release-manifest.json 400
 download_exact {{quote .License.URL}} {{.License.Bytes}} {{quote .License.SHA256}} ./LICENSE 400
 download_exact {{quote .Notice.URL}} {{.Notice.Bytes}} {{quote .Notice.SHA256}} ./NOTICE 400
 download_exact "$artifact_url" "$artifact_bytes" "$artifact_sha256" ./sshserver 500
+
+# A parent rename does not change this shell's current-directory inode, but it
+# does stale an earlier physical pathname. Rebind every absolute child input
+# after the download hooks and again after the unbounded confirmation wait.
+rebind_input_paths() {
+  pinned_work_dir=$(pwd -P) || fail 'resolve pinned installer workspace'
+  case "$pinned_work_dir" in
+    "$physical_home"/.jat-sshserver-install.*) ;;
+    *) fail 'installer workspace moved outside the physical home boundary' ;;
+  esac
+  [ -d "$pinned_work_dir" ] && [ ! -L "$pinned_work_dir" ] || fail 'pinned installer workspace is no longer addressable'
+  manifest_path=$pinned_work_dir/release-manifest.json
+  license_path=$pinned_work_dir/LICENSE
+  notice_path=$pinned_work_dir/NOTICE
+  artifact_path=$pinned_work_dir/sshserver
+}
+rebind_input_paths
 
 run_clean() {
   "$env_tool" -i HOME="$HOME" XDG_DATA_HOME="$XDG_DATA_HOME" XDG_STATE_HOME="$XDG_STATE_HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" PATH="$PATH" LC_ALL=C "$@"
@@ -438,6 +450,7 @@ IFS= read -r confirmation <&3 || fail 'read deployment confirmation'
 exec 3<&-
 exec 4>&-
 
+rebind_input_paths
 verify_exact_file ./sshserver "$artifact_bytes" "$artifact_sha256" 'artifact before deployment apply'
 run_clean ./sshserver deploy apply --manifest "$manifest_path" --manifest-sha256 {{quote .Manifest.SHA256}} --artifact "$artifact_path" --license "$license_path" --notice "$notice_path" --confirmed-preview-sha256 "$preview_sha256" --consume-inputs --supervise-foreground || fail 'verified deployment apply or supervised foreground server failed'
 `

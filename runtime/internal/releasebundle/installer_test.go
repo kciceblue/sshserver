@@ -209,6 +209,47 @@ func TestInstallerWorkspaceSwapCannotReplaceVerifiedExecutable(t *testing.T) {
 			t.Fatalf("installer workspace was not removed after parent swap: %s (%v)", path, err)
 		}
 	}
+	for _, name := range []string{"release-manifest.json", "sshserver", "LICENSE", "NOTICE"} {
+		if !strings.Contains(result.executions, filepath.Join(directories[0], name)) {
+			t.Fatalf("artifact input %s was not rebound to pinned workspace %s: %q", name, directories[0], result.executions)
+		}
+	}
+}
+
+func TestInstallerRebindsInputsAfterConfirmationWorkspaceSwap(t *testing.T) {
+	result := runInstallerShellFixture(t, installerShellCase{
+		kernel: "Linux", machine: "x86_64", confirmation: "yes\n", swapWorkspaceAfterPreview: true,
+	})
+	if result.err != nil || result.stdout != "{\"status\":\"active\"}\n" {
+		t.Fatalf("installer failed after confirmation-time workspace swap: %v stdout=%q stderr=%q", result.err, result.stdout, result.stderr)
+	}
+	if result.replacementExecuted != "" {
+		t.Fatalf("replacement artifact executed: %q", result.replacementExecuted)
+	}
+	executions := nonemptyLines(result.executions)
+	directories := nonemptyLines(result.executionDirs)
+	if len(executions) != 2 || len(directories) != 2 || directories[1] != directories[0]+".confirmed-moved" {
+		t.Fatalf("verified artifact did not remain pinned across confirmation: executions=%q dirs=%q", result.executions, result.executionDirs)
+	}
+	for _, path := range []string{directories[0], directories[1]} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("installer workspace was not removed after confirmation-time swap: %s (%v)", path, err)
+		}
+	}
+	for _, input := range []struct {
+		flag string
+		name string
+	}{
+		{flag: "--manifest", name: "release-manifest.json"},
+		{flag: "--artifact", name: "sshserver"},
+		{flag: "--license", name: "LICENSE"},
+		{flag: "--notice", name: "NOTICE"},
+	} {
+		want := input.flag + " " + filepath.Join(directories[1], input.name)
+		if !strings.Contains(executions[1], want) {
+			t.Fatalf("apply did not rebind %s to %s: %q", input.flag, want, executions[1])
+		}
+	}
 }
 
 func TestInstallerUsesPhysicalPinnedWorkspaceForSymlinkHome(t *testing.T) {
@@ -453,17 +494,18 @@ func installerManifestPins(manifest deployment.ReleaseManifest) []string {
 }
 
 type installerShellCase struct {
-	kernel                   string
-	machine                  string
-	confirmation             string
-	missingTTY               bool
-	curlFailure              bool
-	artifactMutation         string
-	curlVersion              string
-	swapWorkspace            bool
-	swapArtifactLeaf         bool
-	swapArtifactAfterPreview bool
-	symlinkHome              bool
+	kernel                    string
+	machine                   string
+	confirmation              string
+	missingTTY                bool
+	curlFailure               bool
+	artifactMutation          string
+	curlVersion               string
+	swapWorkspace             bool
+	swapWorkspaceAfterPreview bool
+	swapArtifactLeaf          bool
+	swapArtifactAfterPreview  bool
+	symlinkHome               bool
 }
 
 type installerShellResult struct {
@@ -518,8 +560,17 @@ func runInstallerShellFixture(t *testing.T, test installerShellCase) installerSh
 	if test.swapArtifactAfterPreview {
 		previewSwapScript = "/bin/chmod 700 ./sshserver || exit 78; /bin/cp " + shellQuote(replacementArtifactSource) + " ./sshserver || exit 79; /bin/chmod 500 ./sshserver || exit 80; "
 	}
+	if test.swapWorkspaceAfterPreview {
+		previewSwapScript += "current=$(/bin/pwd -P) || exit 83; moved=$current.confirmed-moved; /bin/mv \"$current\" \"$moved\" || exit 84; /bin/mkdir \"$current\" || exit 85; for name in release-manifest.json LICENSE NOTICE; do printf '%s\\n' replacement > \"$current/$name\" || exit 86; done; printf '%s\\n' '#!/bin/sh' 'printf replacement > " + shellQuote(replacementMarker) + "' > \"$current/sshserver\" || exit 87; /bin/chmod 700 \"$current/sshserver\" || exit 88; "
+	}
 	fakeArtifact := []byte("#!/bin/sh\n" +
 		installerEnvironmentLogScript(environmentLog) +
+		"fixture_work_dir=$(/bin/pwd -P) || exit 80\n" +
+		"require_flag_file() { required_flag=$1; expected_path=$2; shift 2; while [ \"$#\" -gt 1 ]; do if [ \"$1\" = \"$required_flag\" ]; then [ \"$2\" = \"$expected_path\" ] || exit 81; [ -f \"$2\" ] && [ ! -L \"$2\" ] || exit 82; file_bytes=$(/usr/bin/wc -c < \"$2\") || exit 83; [ \"$file_bytes\" -gt 0 ] 2>/dev/null || exit 84; return 0; fi; shift; done; exit 85; }\n" +
+		"require_flag_file --manifest \"$fixture_work_dir/release-manifest.json\" \"$@\"\n" +
+		"require_flag_file --artifact \"$fixture_work_dir/sshserver\" \"$@\"\n" +
+		"require_flag_file --license \"$fixture_work_dir/LICENSE\" \"$@\"\n" +
+		"require_flag_file --notice \"$fixture_work_dir/NOTICE\" \"$@\"\n" +
 		"printf '%s\\n' \"$*\" >> " + shellQuote(executionLog) + "\n" +
 		"/bin/pwd -P >> " + shellQuote(executionDirLog) + "\n" +
 		"case \"${1-}/${2-}\" in\n" +
