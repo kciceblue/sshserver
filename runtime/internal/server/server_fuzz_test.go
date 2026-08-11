@@ -64,8 +64,13 @@ func FuzzDecodeAdminRequest(f *testing.F) {
 }
 
 func FuzzHTTP1RequestHead(f *testing.F) {
+	const retainedRequestID = "123e4567-e89b-42d3-a456-426614174000"
 	f.Add([]byte("GET /v1/health HTTP/1.1\r\nHost: localhost\r\nJAT-Request-ID: 0123456789abcdef0123456789abcdef\r\n\r\n"))
 	f.Add(bytes.Repeat([]byte("A"), httpapi.MaxHeaderBytes+1))
+	oversizedWithRequestID := []byte("GET /v1/health HTTP/1.1\r\nHost: localhost\r\nJAT-Request-ID: " + retainedRequestID + "\r\nX-Fill: ")
+	oversizedWithRequestID = append(oversizedWithRequestID, bytes.Repeat([]byte("A"), httpapi.MaxHeaderBytes)...)
+	oversizedWithRequestID = append(oversizedWithRequestID, []byte("\r\n\r\n")...)
+	f.Add(oversizedWithRequestID)
 
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		if len(payload) > httpapi.MaxHeaderBytes+4096 {
@@ -105,6 +110,11 @@ func FuzzHTTP1RequestHead(f *testing.F) {
 			}
 			if _, err := uuidv4.Parse(limit.requestID); err != nil {
 				t.Fatal("limited request did not retain or generate a canonical request ID")
+			}
+			if len(firstIDs) == 1 {
+				if _, err := uuidv4.Parse(firstIDs[0]); err == nil && limit.requestID != firstIDs[0] {
+					t.Fatalf("limited request discarded canonical request ID: got %q want %q", limit.requestID, firstIDs[0])
+				}
 			}
 		}
 	})
