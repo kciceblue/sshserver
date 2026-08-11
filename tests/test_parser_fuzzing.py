@@ -9,9 +9,20 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
     def test_every_server_parser_target_has_a_checked_in_minimized_seed(self) -> None:
         targets = {
             "runtime/internal/store/models_fuzz_test.go": "FuzzDecodeStrictJSON",
+            "runtime/internal/store/scalar_fuzz_test.go#shapes": "FuzzStoredJSONShapes",
+            "runtime/internal/store/scalar_fuzz_test.go#scalars": "FuzzStoreScalarAndStoredParsers",
             "runtime/internal/deployment/parser_fuzz_test.go": "FuzzParsePinnedManifest",
             "runtime/internal/deployment/parser_fuzz_test.go#preview": "FuzzParseDeploymentPreview",
+            "runtime/internal/deployment/metadata_fuzz_test.go#metadata": "FuzzDecodeDeploymentMetadata",
+            "runtime/internal/deployment/metadata_fuzz_test.go#identity": "FuzzParseBuildIdentityJSON",
+            "runtime/internal/deployment/metadata_fuzz_test.go#scalars": "FuzzDeploymentScalarParsers",
             "runtime/internal/server/server_fuzz_test.go": "FuzzDecodeAdminRequest",
+            "runtime/internal/config/config_fuzz_test.go": "FuzzDecodeConfigJSON",
+            "runtime/internal/cli/response_fuzz_test.go": "FuzzDecodeCLIResponses",
+            "runtime/internal/buildinfo/buildinfo_fuzz_test.go": "FuzzParseAttestation",
+            "runtime/internal/uuidv4/uuid_fuzz_test.go": "FuzzParseUUIDv4",
+            "runtime/internal/releaseid/releaseid_fuzz_test.go": "FuzzReleaseIdentifier",
+            "runtime/internal/releasebundle/installer_fuzz_test.go": "FuzzInstallCommandInput",
         }
         for source_key, target in targets.items():
             source = ROOT / source_key.split("#", 1)[0]
@@ -31,12 +42,23 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
         deterministic_budget = (
             "-fuzztime=64x -fuzzminimizetime=64x -parallel=1"
         )
-        self.assertEqual(makefile.count(deterministic_budget), 4)
+        self.assertEqual(makefile.count(deterministic_budget), 15)
         for target in (
             "FuzzDecodeStrictJSON",
+            "FuzzStoredJSONShapes",
+            "FuzzStoreScalarAndStoredParsers",
             "FuzzParsePinnedManifest",
             "FuzzParseDeploymentPreview",
+            "FuzzDecodeDeploymentMetadata",
+            "FuzzParseBuildIdentityJSON",
+            "FuzzDeploymentScalarParsers",
             "FuzzDecodeAdminRequest",
+            "FuzzDecodeConfigJSON",
+            "FuzzDecodeCLIResponses",
+            "FuzzParseAttestation",
+            "FuzzParseUUIDv4",
+            "FuzzReleaseIdentifier",
+            "FuzzInstallCommandInput",
         ):
             self.assertEqual(makefile.count(f"-fuzz '^{target}$$'"), 1, target)
 

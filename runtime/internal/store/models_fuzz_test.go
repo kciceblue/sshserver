@@ -18,9 +18,29 @@ var strictJSONFuzzTargets = []struct {
 	newDestination func() any
 }{
 	{
+		name:           "enrollment request",
+		acceptedSeeds:  [][]byte{[]byte(`{"protocol_version":"1","enrollment_id":"00000000-0000-4000-8000-000000000004","device_id":"00000000-0000-4000-8000-000000000003","device_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","scopes":["devices:manage","devices:read","envelope:read","envelope:write","sync:read","sync:write"]}`)},
+		newDestination: func() any { return &enrollmentRequest{} },
+	},
+	{
+		name:           "put envelope request",
+		acceptedSeeds:  [][]byte{append([]byte(`{"expected_generation":"0","new_generation":"1","envelope":`), append(canonicalBaseVaultEnvelopeFuzzSeed, '}')...)},
+		newDestination: func() any { return &putEnvelopeRequest{} },
+	},
+	{
 		name:           "sync request",
 		acceptedSeeds:  [][]byte{[]byte(`{"protocol_version":"1","device_id":"00000000-0000-4000-8000-000000000003","request_id":"00000000-0000-4000-8000-000000000004","after_cursor":"0","ack_cursor":"0","mutations":[]}`)},
 		newDestination: func() any { return &syncRequest{} },
+	},
+	{
+		name:           "snapshot create request",
+		acceptedSeeds:  [][]byte{[]byte(`{"protocol_version":"1","device_id":"00000000-0000-4000-8000-000000000003","request_id":"00000000-0000-4000-8000-000000000004","required_capabilities":["snapshot-device-registry-v1","snapshot-collection-markers-v1"]}`)},
+		newDestination: func() any { return &snapshotCreateRequest{} },
+	},
+	{
+		name:           "snapshot page request",
+		acceptedSeeds:  [][]byte{[]byte(`{"protocol_version":"1","device_id":"00000000-0000-4000-8000-000000000003","page_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)},
+		newDestination: func() any { return &snapshotPageRequest{} },
 	},
 	{
 		name:           "record revision",
@@ -39,6 +59,11 @@ var strictJSONFuzzTargets = []struct {
 		name:           "revoke device request",
 		acceptedSeeds:  [][]byte{[]byte(`{"request_id":"00000000-0000-4000-8000-000000000004","allow_zero_active":false}`)},
 		newDestination: func() any { return &revokeDeviceRequest{} },
+	},
+	{
+		name:           "token rotation request",
+		acceptedSeeds:  [][]byte{[]byte(`{"rotation_id":"00000000-0000-4000-8000-000000000004","device_id":"00000000-0000-4000-8000-000000000003","new_device_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)},
+		newDestination: func() any { return &tokenRotationRequest{} },
 	},
 }
 

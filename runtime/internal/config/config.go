@@ -403,6 +403,16 @@ func readStrictJSON(path string, destination any) error {
 	if err != nil {
 		return err
 	}
+	return decodeStrictJSON(payload, destination)
+}
+
+// decodeStrictJSON is the pure byte boundary shared by protected settings and
+// install-marker files. Keeping the decoder independent of filesystem access
+// lets the checked-in fuzz corpus exercise the exact production grammar.
+func decodeStrictJSON(payload []byte, destination any) error {
+	if len(payload) == 0 || len(payload) > maxConfigBytes {
+		return errors.New("configuration JSON is outside its size boundary")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {

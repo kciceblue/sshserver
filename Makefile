@@ -44,9 +44,20 @@ runtime-go-check:
 
 runtime-fuzz-smoke:
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeStrictJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzStoredJSONShapes$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzStoreScalarAndStoredParsers$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParsePinnedManifest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseDeploymentPreview$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeDeploymentMetadata$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseBuildIdentityJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDeploymentScalarParsers$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeAdminRequest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/server
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeConfigJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/config
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeCLIResponses$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/cli
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseAttestation$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/buildinfo
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseUUIDv4$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/uuidv4
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzReleaseIdentifier$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releaseid
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzInstallCommandInput$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
 
 runtime-build-one:
 	test -n "$(RUNTIME_GOOS)"
