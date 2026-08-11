@@ -1026,7 +1026,7 @@ func (lifecycle *Lifecycle) Apply(ctx context.Context, request ApplyRequest) (re
 		return ApplyResult{}, errors.New("the active native user service manager is unavailable; refusing an implicit foreground transition")
 	}
 	if prior != nil && prior.Active != nil && *prior.Active == desired && prior.Manager == availability.Manager {
-		return lifecycle.validateIdempotentApply(ctx, *prior, availability, request, attestInstanceLease)
+		return lifecycle.validateIdempotentApply(ctx, *prior, request, attestInstanceLease)
 	}
 	transactionID, err := newTransactionID()
 	if err != nil {
@@ -1126,7 +1126,6 @@ func (lifecycle *Lifecycle) verifyRetainedRollbackReleaseForApply(ctx context.Co
 func (lifecycle *Lifecycle) validateIdempotentApply(
 	ctx context.Context,
 	state DeploymentState,
-	availability ManagerAvailability,
 	request ApplyRequest,
 	attest func() error,
 ) (ApplyResult, error) {
@@ -1172,7 +1171,16 @@ func (lifecycle *Lifecycle) validateIdempotentApply(
 			return ApplyResult{}, err
 		}
 	}
-	result, err := lifecycle.resultForState(state, availability.Foreground, "")
+	// Apply results describe the committed deployment, not a transient manager
+	// probe. Keep the foreground receipt canonical across the committing apply
+	// and an idempotent retry even when the manager executable is absent: the
+	// first transaction cannot persist the probe's more specific reason, and a
+	// changing receipt would make the pinned one-line installer non-idempotent.
+	result, err := lifecycle.resultForState(
+		state,
+		lifecycle.foregroundForRelease(state.Manager, state.Active),
+		"",
+	)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -1637,13 +1645,20 @@ func (lifecycle *Lifecycle) injectCrash(phase Phase) error {
 }
 
 func (lifecycle *Lifecycle) foregroundFor(journal *DeploymentJournal) *ForegroundFallback {
-	if journal.Manager != ManagerForeground || journal.Desired == nil {
+	if journal == nil {
+		return nil
+	}
+	return lifecycle.foregroundForRelease(journal.Manager, journal.Desired)
+}
+
+func (lifecycle *Lifecycle) foregroundForRelease(manager ManagerKind, desired *InstalledRelease) *ForegroundFallback {
+	if manager != ManagerForeground || desired == nil {
 		return nil
 	}
 	return &ForegroundFallback{
 		Required:   true,
 		Reason:     "user_service_manager_unavailable",
-		Command:    []string{journal.Desired.BinaryPath, "serve", "--state-dir", lifecycle.layout.StateDir},
+		Command:    []string{desired.BinaryPath, "serve", "--state-dir", lifecycle.layout.StateDir},
 		Supervised: true,
 	}
 }
