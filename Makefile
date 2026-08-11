@@ -11,11 +11,11 @@ DOWNLOAD_ORIGIN ?=
 RUNTIME_GOOS ?=
 RUNTIME_GOARCH ?=
 
-.PHONY: all check crypto-evidence-check crypto-go-check go-check kat license-check runtime-build-one runtime-go-check runtime-release runtime-release-bundle runtime-release-bundle-check runtime-release-bundle-one runtime-release-check runtime-release-source-check runtime-vendor-check test
+.PHONY: all check crypto-evidence-check crypto-go-check go-check kat license-check runtime-build-one runtime-fuzz-smoke runtime-go-check runtime-release runtime-release-bundle runtime-release-bundle-check runtime-release-bundle-one runtime-release-check runtime-release-source-check runtime-vendor-check test
 
 all: check
 
-check: license-check runtime-vendor-check crypto-evidence-check crypto-go-check go-check runtime-go-check runtime-release-check test
+check: license-check runtime-vendor-check crypto-evidence-check crypto-go-check go-check runtime-go-check runtime-fuzz-smoke runtime-release-check test
 
 crypto-evidence-check:
 	$(PYTHON) scripts/check_crypto_kats.py --verify-evidence
@@ -41,6 +41,12 @@ runtime-go-check:
 	cd runtime && $(GO) mod verify
 	cd runtime && $(GO) vet -mod=readonly ./...
 	cd runtime && $(GO) test -mod=readonly ./...
+
+runtime-fuzz-smoke:
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeStrictJSON$$' -fuzztime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParsePinnedManifest$$' -fuzztime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseDeploymentPreview$$' -fuzztime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeAdminRequest$$' -fuzztime=64x -parallel=1 ./internal/server
 
 runtime-build-one:
 	test -n "$(RUNTIME_GOOS)"
