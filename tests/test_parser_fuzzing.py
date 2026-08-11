@@ -23,6 +23,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "runtime/internal/uuidv4/uuid_fuzz_test.go": "FuzzParseUUIDv4",
             "runtime/internal/releaseid/releaseid_fuzz_test.go": "FuzzReleaseIdentifier",
             "runtime/internal/releasebundle/installer_fuzz_test.go": "FuzzInstallCommandInput",
+            "runtime/internal/httpapi/handler_fuzz_test.go": "FuzzHeaderContainsToken",
         }
         for source_key, target in targets.items():
             source = ROOT / source_key.split("#", 1)[0]
@@ -42,7 +43,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
         deterministic_budget = (
             "-fuzztime=64x -fuzzminimizetime=64x -parallel=1"
         )
-        self.assertEqual(makefile.count(deterministic_budget), 15)
+        self.assertEqual(makefile.count(deterministic_budget), 16)
         for target in (
             "FuzzDecodeStrictJSON",
             "FuzzStoredJSONShapes",
@@ -59,6 +60,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "FuzzParseUUIDv4",
             "FuzzReleaseIdentifier",
             "FuzzInstallCommandInput",
+            "FuzzHeaderContainsToken",
         ):
             self.assertEqual(makefile.count(f"-fuzz '^{target}$$'"), 1, target)
 

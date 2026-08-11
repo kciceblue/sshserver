@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -394,11 +393,10 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 	receipt.requestID = requestID.String
 	copy(receipt.fingerprint[:], fingerprint)
 	var responseDevice device
-	if json.Unmarshal(headersBody, &receipt.headers) != nil {
+	if decodeStoredCanonical(headersBody, &receipt.headers) != nil {
 		return nil, api.NewError("internal_error", true)
 	}
-	canonicalHeaders, headersErr := json.Marshal(receipt.headers)
-	if headersErr != nil || !bytes.Equal(canonicalHeaders, headersBody) || receipt.status != http.StatusOK ||
+	if receipt.status != http.StatusOK ||
 		!slices.Equal(receipt.headers, api.V1ResponseHeaders(receipt.requestID, len(body))) ||
 		decodeStoredCanonical(body, &responseDevice) != nil || validateDevice(responseDevice) != nil ||
 		responseDevice.DeviceID != matchedDeviceID || responseDevice.Status != "revoked" {

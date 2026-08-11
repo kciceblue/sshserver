@@ -44,7 +44,7 @@ var strictJSONFuzzTargets = []struct {
 	},
 	{
 		name:           "record revision",
-		acceptedSeeds:  [][]byte{[]byte(`{"record_id":"00000000-0000-4000-8000-000000000020","revision_id":"00000000-0000-4000-8000-000000000021","author_device_id":"00000000-0000-4000-8000-000000000003","author_counter":"1","version_vector":[{"device_id":"00000000-0000-4000-8000-000000000003","counter":"1"}],"collection_witness_authenticator":null,"payload_schema":"1","crypto_suite":"jat-xchacha-hkdf-argon2id-draft2","tombstone":false,"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA"}`)},
+		acceptedSeeds:  [][]byte{canonicalRecordRevisionFuzzSeed},
 		newDestination: func() any { return &recordRevision{} },
 	},
 	{

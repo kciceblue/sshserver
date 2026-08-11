@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = ROOT / "docs" / "SERVER_PARSER_INVENTORY.json"
 
 EXPECTED_SIGNALS = {
+    "header_token_parser": r"\bfunc\s+headerContainsToken\s*\(",
     "install_command_parser": r"\bfunc\s+InstallCommand\s*\(",
     "json_decoder_constructor": r"\bjson\.NewDecoder\s*\(",
     "json_unmarshal_call": r"\bjson\.Unmarshal\s*\(",
@@ -110,6 +111,51 @@ class ServerParserInventoryTests(unittest.TestCase):
         simulated[path]["json_decoder_constructor"] += 1
         self.assertNotEqual(
             simulated, self.inventory["sourceDerivation"]["sourceSignalCounts"]
+        )
+
+    def test_persisted_canonical_destination_inventory_is_exact(self) -> None:
+        source = (
+            ROOT / "runtime/internal/store/scalar_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        table = source[
+            source.index("var storedJSONShapeFuzzTargets") :
+            source.index("func FuzzStoredJSONShapes")
+        ]
+        destinations = set(
+            re.findall(
+                r"newDestination:\s*func\(\) any \{ return &([^{}]+)\{\} \}",
+                table,
+            )
+        )
+        self.assertEqual(
+            destinations,
+            {
+                "[]string",
+                "[]api.Header",
+                "vaultEnvelope",
+                "recordRevision",
+                "[]vectorEntry",
+                "collectionMarker",
+                "snapshotPageDescriptor",
+                "syncResponse",
+                "device",
+                "enrollmentResponse",
+                "snapshotCreateResponse",
+            },
+        )
+        devices = (ROOT / "runtime/internal/store/devices.go").read_text(
+            encoding="utf-8"
+        )
+        validation = (ROOT / "runtime/internal/store/validation.go").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "decodeStoredCanonical(headersBody, &receipt.headers)", devices
+        )
+        self.assertIn("decodeStoredCanonical(headersBody, &headers)", validation)
+        self.assertIn(
+            "TestFuzzStoredJSONShapesHasAcceptedSeedsForEveryDestination",
+            source,
         )
 
     def test_exclusions_remain_narrow_and_explicit(self) -> None:
