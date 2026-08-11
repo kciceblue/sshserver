@@ -71,6 +71,9 @@ func FuzzHTTP1RequestHead(f *testing.F) {
 	oversizedWithRequestID = append(oversizedWithRequestID, bytes.Repeat([]byte("A"), httpapi.MaxHeaderBytes)...)
 	oversizedWithRequestID = append(oversizedWithRequestID, []byte("\r\n\r\n")...)
 	f.Add(oversizedWithRequestID)
+	unseenRequestID := bytes.Repeat([]byte("A"), httpapi.MaxHeaderBytes+1)
+	unseenRequestID = append(unseenRequestID, []byte("\r\nJAT-Request-ID: "+retainedRequestID+"\r\n\r\n")...)
+	f.Add(unseenRequestID)
 
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		if len(payload) > httpapi.MaxHeaderBytes+4096 {
@@ -81,6 +84,11 @@ func FuzzHTTP1RequestHead(f *testing.F) {
 		if !reflect.DeepEqual(firstIDs, secondIDs) {
 			t.Fatal("request-ID header parsing changed across identical input")
 		}
+		bufferedPayload := payload
+		if len(bufferedPayload) > httpapi.MaxHeaderBytes+1 {
+			bufferedPayload = bufferedPayload[:httpapi.MaxHeaderBytes+1]
+		}
+		bufferedIDs := requestIDValues(bufferedPayload)
 
 		first := &headerLimitConn{
 			Conn:     &requestHeadFuzzConn{Reader: bytes.NewReader(payload)},
@@ -111,9 +119,9 @@ func FuzzHTTP1RequestHead(f *testing.F) {
 			if _, err := uuidv4.Parse(limit.requestID); err != nil {
 				t.Fatal("limited request did not retain or generate a canonical request ID")
 			}
-			if len(firstIDs) == 1 {
-				if _, err := uuidv4.Parse(firstIDs[0]); err == nil && limit.requestID != firstIDs[0] {
-					t.Fatalf("limited request discarded canonical request ID: got %q want %q", limit.requestID, firstIDs[0])
+			if len(bufferedIDs) == 1 {
+				if _, err := uuidv4.Parse(bufferedIDs[0]); err == nil && limit.requestID != bufferedIDs[0] {
+					t.Fatalf("limited request discarded canonical buffered request ID: got %q want %q", limit.requestID, bufferedIDs[0])
 				}
 			}
 		}
