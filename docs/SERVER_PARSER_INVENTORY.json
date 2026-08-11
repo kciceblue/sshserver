@@ -12,10 +12,11 @@
       "listener_validator": "\\bfunc\\s+ValidateListener\\s*\\(",
       "parser_function_declaration": "\\bfunc\\s+(?:(?:P|p)arse|decode)[A-Za-z0-9_]*\\s*\\(",
       "release_identifier_validator": "\\bfunc\\s+Valid\\s*\\(",
+      "route_identifier_parser": "\\bfunc\\s+pathIdentifier\\s*\\(",
       "url_parser_call": "\\burl\\.(?:Parse|ParseQuery)\\s*\\("
     },
     "sourceFileCount": 23,
-    "sourceSignalCount": 60,
+    "sourceSignalCount": 61,
     "sourceSignalCounts": {
       "runtime/internal/buildinfo/buildinfo.go": {
         "parser_function_declaration": 1
@@ -72,7 +73,8 @@
       },
       "runtime/internal/store/dataplane.go": {
         "json_unmarshal_call": 1,
-        "parser_function_declaration": 1
+        "parser_function_declaration": 1,
+        "route_identifier_parser": 1
       },
       "runtime/internal/store/devices.go": {
         "json_unmarshal_call": 1
@@ -189,6 +191,12 @@
       "testFile": "runtime/internal/store/scalar_fuzz_test.go",
       "testMethod": "FuzzStoreScalarAndStoredParsers"
     },
+    "store-route-identifiers": {
+      "corpus": "runtime/internal/store/testdata/fuzz/FuzzPathIdentifier",
+      "package": "./internal/store",
+      "testFile": "runtime/internal/store/dataplane_fuzz_test.go",
+      "testMethod": "FuzzPathIdentifier"
+    },
     "store-shapes": {
       "corpus": "runtime/internal/store/testdata/fuzz/FuzzStoredJSONShapes",
       "package": "./internal/store",
@@ -256,7 +264,7 @@
     },
     {
       "id": "sync-wire-and-persisted-json",
-      "coverageOwners": ["strict-wire-json", "store-shapes", "store-scalars-and-canonical", "uuid-v4"],
+      "coverageOwners": ["strict-wire-json", "store-shapes", "store-scalars-and-canonical", "store-route-identifiers", "uuid-v4"],
       "sourceFiles": ["runtime/internal/store/collection.go", "runtime/internal/store/dataplane.go", "runtime/internal/store/devices.go", "runtime/internal/store/envelope.go", "runtime/internal/store/models.go", "runtime/internal/store/snapshot.go", "runtime/internal/store/store.go", "runtime/internal/store/sync.go", "runtime/internal/store/validation.go"]
     },
     {

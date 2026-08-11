@@ -46,6 +46,7 @@ runtime-fuzz-smoke:
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeStrictJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzStoredJSONShapes$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzStoreScalarAndStoredParsers$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzPathIdentifier$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParsePinnedManifest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseDeploymentPreview$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeDeploymentMetadata$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment

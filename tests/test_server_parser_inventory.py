@@ -18,6 +18,7 @@ EXPECTED_SIGNALS = {
         r"\bfunc\s+(?:(?:P|p)arse|decode)[A-Za-z0-9_]*\s*\("
     ),
     "release_identifier_validator": r"\bfunc\s+Valid\s*\(",
+    "route_identifier_parser": r"\bfunc\s+pathIdentifier\s*\(",
     "url_parser_call": r"\burl\.(?:Parse|ParseQuery)\s*\(",
 }
 

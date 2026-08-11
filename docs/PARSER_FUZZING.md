@@ -3,10 +3,12 @@
 This repository keeps coverage-guided Go fuzz targets at every source-derived
 project-owned runtime parsing boundary. The fail-closed inventory in
 `SERVER_PARSER_INVENTORY.json` scans non-vendored production Go source and maps
-all 60 current parser signals in 23 files to one or more executable owners.
+all 61 current parser signals in 23 files to one or more executable owners.
 The targets cover:
 
 - strict sync requests plus every V1 request DTO (`FuzzDecodeStrictJSON`);
+- device-revocation and snapshot-page route identifiers
+  (`FuzzPathIdentifier`);
 - every persisted canonical response destination (response headers, envelope,
   sync, device, enrollment, snapshot-create, revision, and snapshot-page
   shapes), scalar/base64 fields, and authorization (`FuzzStoredJSONShapes`,
@@ -29,7 +31,7 @@ The targets cover:
   (`FuzzValidLocalMainVersion`); and
 - one-line installer URL/payload inputs (`FuzzInstallCommandInput`).
 
-All 17 targets have a checked-in minimized invalid seed under their package's
+All 18 targets have a checked-in minimized invalid seed under their package's
 `testdata/fuzz` directory and one or more canonical accepted seeds constructed
 by the test. Accepted structured inputs with a canonical encoding must
 re-encode and reparse without changing bytes or typed values. Go's ordinary
