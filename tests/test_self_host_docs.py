@@ -178,6 +178,7 @@ class SelfHostDocumentationTests(unittest.TestCase):
             "partial, invalid attempt; never reuse it as a backup",
             '"$JAT_BACKUP_DIR"/.[!.]*',
             'config != 1 || secret != 1 || database != 1 || state != 1',
+            'for name in .enrollment.sock server.db-wal server.db-shm',
         )
         for statement in required:
             with self.subTest(statement=statement):
@@ -328,6 +329,21 @@ class SelfHostDocumentationTests(unittest.TestCase):
             self.assertNotEqual(incomplete_result.returncode, 0)
             self.assertTrue(incomplete_backup.is_dir())
             self.assertEqual(list(incomplete_backup.iterdir()), [])
+
+            wal = source / "server.db-wal"
+            wal.write_bytes(b"uncheckpointed")
+            wal_backup = root / "wal-backup"
+            wal_result = subprocess.run(
+                ["/bin/sh"],
+                input=backup_block,
+                text=True,
+                capture_output=True,
+                env=environment | {"JAT_BACKUP_DIR": str(wal_backup)},
+                check=False,
+            )
+            self.assertNotEqual(wal_result.returncode, 0)
+            self.assertTrue(wal_backup.is_dir())
+            self.assertEqual(list(wal_backup.iterdir()), [])
 
     def test_human_and_native_acceptance_remain_nonclaims(self) -> None:
         self.assertIn("human under-15-minute\nwalkthrough", GUIDE)

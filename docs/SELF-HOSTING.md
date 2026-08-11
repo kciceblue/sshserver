@@ -271,6 +271,10 @@ guessing target and contains device token hashes and metadata.
        test -f "$JAT_STATE_DIR/$name"
        test ! -L "$JAT_STATE_DIR/$name"
      done
+     for name in .enrollment.sock server.db-wal server.db-shm; do
+       test ! -e "$JAT_STATE_DIR/$name"
+       test ! -L "$JAT_STATE_DIR/$name"
+     done
      cp -p \
        "$JAT_STATE_DIR/config.json" \
        "$JAT_STATE_DIR/instance-secret" \
