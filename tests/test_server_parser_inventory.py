@@ -178,7 +178,7 @@ class ServerParserInventoryTests(unittest.TestCase):
             source,
         )
 
-    def test_config_and_deployment_fuzzers_apply_production_semantics(self) -> None:
+    def test_json_fuzzers_apply_production_semantics(self) -> None:
         config_fuzzer = (
             ROOT / "runtime/internal/config/config_fuzz_test.go"
         ).read_text(encoding="utf-8")
@@ -192,6 +192,43 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertIn(
             "value.(*DeploymentJournal).Validate(layout)", deployment_fuzzer
         )
+
+        request_fuzzer = (
+            ROOT / "runtime/internal/store/models_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for validator in {
+            "validateEnrollmentRequest",
+            "validatePutEnvelopeRequestGenerations",
+            "validatePutEnvelopeRequestEnvelope",
+            "validateSyncRequest",
+            "validateSnapshotCreateRequest",
+            "validateSnapshotPageRequest",
+            "validateRevision",
+            "validateEnvelope",
+            "validateRevokeDeviceRequest",
+            "validateTokenRotationRequest",
+        }:
+            with self.subTest(request_validator=validator):
+                self.assertIn(validator, request_fuzzer)
+
+        stored_fuzzer = (
+            ROOT / "runtime/internal/store/scalar_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for validator in {
+            "auth.ValidateScopes",
+            "api.V1ResponseHeaders",
+            "validateEnvelope",
+            "validateRevision",
+            "validateVector",
+            "validateCollectionMarker",
+            "decodeStoredSnapshotPageDescriptor",
+            "validateSyncResponse",
+            "validateDevice",
+            "validateStoredEnrollmentResponse",
+            "validateStoredSnapshotCreateResponse",
+        }:
+            with self.subTest(stored_validator=validator):
+                self.assertIn(validator, stored_fuzzer)
 
     def test_exclusions_remain_narrow_and_explicit(self) -> None:
         exclusions = {entry["id"]: entry["reason"] for entry in self.inventory["exclusions"]}
