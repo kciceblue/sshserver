@@ -293,15 +293,49 @@ guessing target and contains device token hashes and metadata.
    continue until `.enrollment.sock` is gone and no `server.db-wal`,
    `server.db-shm`, or `server.db-journal` file remains.
 
-2. Set `JAT_BACKUP_DIR` to a path that does not exist. Copy the exact
-   closed-state set into that fresh owner-only directory on encrypted storage:
+2. Set `JAT_BACKUP_DIR` to an absolute path that does not exist under an
+   existing parent you own on encrypted storage. The block resolves that parent
+   to its physical path; the parent must not be writable by group or others.
+   Copy the exact closed-state set into the fresh owner-only directory:
 
    ```sh
    (
      set -eu
+     PATH=/usr/bin:/bin
+     LC_ALL=C
+     export PATH LC_ALL
      umask 077
-     test ! -e "$JAT_BACKUP_DIR"
-     mkdir -m 700 "$JAT_BACKUP_DIR"
+     case "$JAT_BACKUP_DIR" in
+       /*/*) ;;
+       *) exit 1 ;;
+     esac
+     JAT_BACKUP_NAME=${JAT_BACKUP_DIR##*/}
+     JAT_BACKUP_PARENT=${JAT_BACKUP_DIR%/*}
+     case "$JAT_BACKUP_NAME" in
+       ''|.|..) exit 1 ;;
+     esac
+     cd "$JAT_BACKUP_PARENT"
+     JAT_BACKUP_PARENT=$(pwd -P)
+     JAT_BACKUP_DIR="$JAT_BACKUP_PARENT/$JAT_BACKUP_NAME"
+     if JAT_BACKUP_PARENT_ID=$(stat -f '%u:%Lp' . 2>/dev/null); then
+       :
+     else
+       JAT_BACKUP_PARENT_ID=$(stat -c '%u:%a' .)
+     fi
+     test "${JAT_BACKUP_PARENT_ID%%:*}" = "$(id -u)"
+     JAT_BACKUP_PARENT_MODE=${JAT_BACKUP_PARENT_ID#*:}
+     case "$JAT_BACKUP_PARENT_MODE" in
+       [0-7][0-7][0-7]) ;;
+       *) exit 1 ;;
+     esac
+     case "$JAT_BACKUP_PARENT_MODE" in
+       [0-7][2367][0-7]|[0-7][0-7][2367]) exit 1 ;;
+     esac
+     test ! -e "$JAT_BACKUP_NAME"
+     test ! -L "$JAT_BACKUP_NAME"
+     mkdir -m 700 "$JAT_BACKUP_NAME"
+     cd "$JAT_BACKUP_NAME"
+     test "$(pwd -P)" = "$JAT_BACKUP_DIR"
      for name in config.json instance-secret server.db install-state.json; do
        test -f "$JAT_STATE_DIR/$name"
        test ! -L "$JAT_STATE_DIR/$name"
@@ -315,9 +349,8 @@ guessing target and contains device token hashes and metadata.
        "$JAT_STATE_DIR/instance-secret" \
        "$JAT_STATE_DIR/server.db" \
        "$JAT_STATE_DIR/install-state.json" \
-       "$JAT_BACKUP_DIR/"
-     chmod 600 "$JAT_BACKUP_DIR"/*
-     cd "$JAT_BACKUP_DIR"
+       .
+     chmod 600 ./*
      if command -v sha256sum >/dev/null 2>&1; then
        sha256sum config.json instance-secret server.db install-state.json \
          > SHA256SUMS
@@ -329,9 +362,12 @@ guessing target and contains device token hashes and metadata.
    )
    ```
 
-   The new-directory check prevents overwriting or mixing a prior backup. Keep
-   the five files together. If this block exits nonzero, any newly created
-   directory is a partial, invalid attempt; never reuse it as a backup. The
+   The canonical owner-controlled parent check prevents another local account
+   from replacing the destination, and changing into the new directory pins
+   the copy to that exact directory rather than reopening its pathname. The
+   new-directory check prevents overwriting or mixing a prior backup. Keep the
+   five files together. If this block exits nonzero, any newly created directory
+   is a partial, invalid attempt; never reuse it as a backup. The
    checksum manifest detects later omission,
    substitution, or accidental mixing relative to this stopped snapshot; it is
    not a signature and cannot prove that unrelated source files already came

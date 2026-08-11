@@ -239,7 +239,7 @@ class SelfHostDocumentationTests(unittest.TestCase):
             "recoverable sibling rather than overwriting",
             "do not repair the copy by deleting a file",
             "manifest-driven admin backup\nand atomic-restore CLI",
-            "test ! -e \"$JAT_BACKUP_DIR\"",
+            "test ! -e \"$JAT_BACKUP_NAME\"",
             "test ! -e \"$JAT_STATE_DIR\"",
             "SHA256SUMS",
             "regular non-symlink files",
@@ -250,6 +250,10 @@ class SelfHostDocumentationTests(unittest.TestCase):
             '"$JAT_BACKUP_DIR"/.[!.]*',
             'config != 1 || secret != 1 || database != 1 || state != 1',
             'for name in .enrollment.sock server.db-wal server.db-shm server.db-journal',
+            "JAT_BACKUP_PARENT_ID=$(stat -f '%u:%Lp' . 2>/dev/null)",
+            'JAT_BACKUP_DIR="$JAT_BACKUP_PARENT/$JAT_BACKUP_NAME"',
+            'cd "$JAT_BACKUP_NAME"',
+            'test "$(pwd -P)" = "$JAT_BACKUP_DIR"',
         )
         for statement in required:
             with self.subTest(statement=statement):
@@ -260,7 +264,7 @@ class SelfHostDocumentationTests(unittest.TestCase):
         backup_block = next(
             block
             for block in SHELL_BLOCKS
-            if 'mkdir -m 700 "$JAT_BACKUP_DIR"' in block
+            if 'mkdir -m 700 "$JAT_BACKUP_NAME"' in block
             and 'cp -p \\\n' in block
         )
         restore_block = next(
@@ -320,6 +324,21 @@ class SelfHostDocumentationTests(unittest.TestCase):
                 {entry.name: entry.read_bytes() for entry in backup.iterdir()},
                 original,
             )
+
+            unsafe_parent = root / "unsafe-parent"
+            unsafe_parent.mkdir(mode=0o777)
+            unsafe_parent.chmod(0o777)
+            unsafe_backup = unsafe_parent / "backup"
+            unsafe_result = subprocess.run(
+                ["/bin/sh"],
+                input=backup_block,
+                text=True,
+                capture_output=True,
+                env=environment | {"JAT_BACKUP_DIR": str(unsafe_backup)},
+                check=False,
+            )
+            self.assertNotEqual(unsafe_result.returncode, 0)
+            self.assertFalse(unsafe_backup.exists())
 
             restored = root / "restored"
             restore_environment = environment | {"JAT_STATE_DIR": str(restored)}
