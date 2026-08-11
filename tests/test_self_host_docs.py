@@ -340,6 +340,31 @@ class SelfHostDocumentationTests(unittest.TestCase):
             self.assertNotEqual(unsafe_result.returncode, 0)
             self.assertFalse(unsafe_backup.exists())
 
+            for mode in (0o2750, 0o1700):
+                with self.subTest(secure_special_parent_mode=oct(mode)):
+                    special_parent = root / f"special-parent-{mode:o}"
+                    special_parent.mkdir(mode=0o700)
+                    special_parent.chmod(mode)
+                    special_backup = special_parent / "backup"
+                    special_result = subprocess.run(
+                        ["/bin/sh"],
+                        input=backup_block,
+                        text=True,
+                        capture_output=True,
+                        env=environment
+                        | {"JAT_BACKUP_DIR": str(special_backup)},
+                        check=False,
+                    )
+                    self.assertEqual(
+                        special_result.returncode,
+                        0,
+                        special_result.stderr,
+                    )
+                    self.assertEqual(
+                        {entry.name for entry in special_backup.iterdir()},
+                        set(payloads) | {"SHA256SUMS"},
+                    )
+
             restored = root / "restored"
             restore_environment = environment | {"JAT_STATE_DIR": str(restored)}
             result = subprocess.run(

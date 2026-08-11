@@ -326,6 +326,9 @@ guessing target and contains device token hashes and metadata.
      JAT_BACKUP_PARENT_MODE=${JAT_BACKUP_PARENT_ID#*:}
      case "$JAT_BACKUP_PARENT_MODE" in
        [0-7][0-7][0-7]) ;;
+       [0-7][0-7][0-7][0-7])
+         JAT_BACKUP_PARENT_MODE=${JAT_BACKUP_PARENT_MODE#?}
+         ;;
        *) exit 1 ;;
      esac
      case "$JAT_BACKUP_PARENT_MODE" in
