@@ -1632,6 +1632,10 @@ func TestUpgradeHealthFailureRestoresExactPriorReleaseAndProtectedInstance(t *te
 	// The manager and health probe are injected lifecycle collaborators. Native
 	// process and service-manager behavior remain separate integration claims.
 	fixture := newLifecycleFixture(t, false)
+	rollbackRequest, rollback := fixture.release(t, "v1.2.2", "health-failure-rollback")
+	if _, err := applyConfirmed(t, fixture.lifecycle, rollbackRequest); err != nil {
+		t.Fatal(err)
+	}
 	firstRequest, first := fixture.release(t, "v1.2.3", "health-failure-prior")
 	if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
 		t.Fatal(err)
@@ -1639,6 +1643,9 @@ func TestUpgradeHealthFailureRestoresExactPriorReleaseAndProtectedInstance(t *te
 	priorState, err := LoadState(fixture.layout)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if priorState.Active == nil || *priorState.Active != first || priorState.Previous == nil || *priorState.Previous != rollback {
+		t.Fatalf("prior state lacks rollback history: %+v", priorState)
 	}
 	protectedBefore := captureProtectedInstance(t, fixture.layout.StateDir)
 
