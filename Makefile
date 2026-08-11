@@ -53,7 +53,9 @@ runtime-fuzz-smoke:
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeDeploymentMetadata$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseBuildIdentityJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDeploymentScalarParsers$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseArtifactGoBuildInfo$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeAdminRequest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/server
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzHTTP1RequestHead$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/server
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeConfigJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/config
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeCLIResponses$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/cli
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseAttestation$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/buildinfo
@@ -61,6 +63,7 @@ runtime-fuzz-smoke:
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzReleaseIdentifier$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releaseid
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzInstallCommandInput$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzValidLocalMainVersion$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseReleaseBundleGoBuildInfo$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzHeaderContainsToken$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/httpapi
 
 runtime-build-one:

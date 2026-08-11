@@ -5,6 +5,7 @@ package deployment
 import (
 	"encoding/json"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -147,6 +148,38 @@ func FuzzParseBuildIdentityJSON(f *testing.F) {
 			if err != nil || roundTrip != first {
 				t.Fatalf("build identity did not round trip: value=%+v parsed=%+v error=%v", first, roundTrip, err)
 			}
+		}
+	})
+}
+
+func FuzzParseArtifactGoBuildInfo(f *testing.F) {
+	executablePath, err := os.Executable()
+	if err != nil {
+		f.Fatal(err)
+	}
+	executable, err := os.ReadFile(executablePath)
+	if err != nil {
+		f.Fatal(err)
+	}
+	if len(executable) > maximumStagedArtifactBytes {
+		f.Fatal("current test executable exceeds the production artifact bound")
+	}
+	if _, err := parseArtifactGoBuildInfo(executable); err != nil {
+		f.Fatalf("current test executable must contain accepted Go build metadata: %v", err)
+	}
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		if len(payload) > maximumStagedArtifactBytes {
+			return
+		}
+		first, firstErr := parseArtifactGoBuildInfo(payload)
+		second, secondErr := parseArtifactGoBuildInfo(payload)
+		if (firstErr == nil) != (secondErr == nil) {
+			t.Fatal("Go build-metadata acceptance changed across identical input")
+		}
+		if firstErr == nil && !reflect.DeepEqual(first, second) {
+			t.Fatal("Go build-metadata output changed across identical input")
 		}
 	})
 }

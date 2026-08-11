@@ -3,7 +3,7 @@
 This repository keeps coverage-guided Go fuzz targets at every source-derived
 project-owned runtime parsing boundary. The fail-closed inventory in
 `SERVER_PARSER_INVENTORY.json` scans non-vendored production Go source and maps
-all 62 current parser signals in 23 files to one or more executable owners.
+all 68 current parser signals in 23 files to one or more executable owners.
 The targets cover:
 
 - strict sync requests plus every V1 request DTO (`FuzzDecodeStrictJSON`);
@@ -19,23 +19,28 @@ The targets cover:
   (`FuzzParsePinnedManifest`, `FuzzParseDeploymentPreview`);
 - canonical deployment state/journals, build-identity JSON, URLs, digests, and
   sizes (`FuzzDecodeDeploymentMetadata`, `FuzzParseBuildIdentityJSON`,
-  `FuzzDeploymentScalarParsers`);
+  `FuzzDeploymentScalarParsers`), plus Go executable build metadata through
+  the production artifact decoder (`FuzzParseArtifactGoBuildInfo`);
 - protected instance configuration and listener grammar
   (`FuzzDecodeConfigJSON`);
-- owner-only admin-socket requests and the CLI's strict loopback responses
-  (`FuzzDecodeAdminRequest`, `FuzzDecodeCLIResponses`);
+- owner-only admin-socket requests, raw HTTP/1 request-head limits and request
+  IDs, and the CLI's strict loopback responses (`FuzzDecodeAdminRequest`,
+  `FuzzHTTP1RequestHead`, `FuzzDecodeCLIResponses`);
 - comma-delimited HTTP `Connection` header tokens and their transport-level
   upgrade rejection (`FuzzHeaderContainsToken`);
 - build attestations, UUIDv4, and release identifiers
   (`FuzzParseAttestation`, `FuzzParseUUIDv4`,
   `FuzzReleaseIdentifier`);
 - local nested-module pseudo-version, source-revision, and VCS-time binding
-  (`FuzzValidLocalMainVersion`); and
+  (`FuzzValidLocalMainVersion`) plus release-bundle executable metadata through
+  its production decoder (`FuzzParseReleaseBundleGoBuildInfo`); and
 - one-line installer URL/payload inputs (`FuzzInstallCommandInput`).
 
-All 19 targets have a checked-in minimized invalid seed under their package's
-`testdata/fuzz` directory and one or more canonical accepted seeds constructed
-by the test. Accepted structured inputs with a canonical encoding must
+All 22 targets have a checked-in minimized invalid seed under their package's
+`testdata/fuzz` directory. Structured owners construct canonical accepted
+seeds; the executable-metadata owner separately validates the current bounded
+Go test executable through the exact production decoder before fuzz mutations.
+Accepted structured inputs with a canonical encoding must
 re-encode and reparse without changing bytes or typed values. Go's ordinary
 package test runs replay every seed. The
 repository gate also runs 64 coverage-guided mutations per target with one

@@ -9,7 +9,12 @@ INVENTORY_PATH = ROOT / "docs" / "SERVER_PARSER_INVENTORY.json"
 
 EXPECTED_SIGNALS = {
     "build_metadata_parser": r"\bfunc\s+validLocalMainVersion\s*\(",
+    "go_buildinfo_decoder_call": r"\bdebugbuildinfo\.Read\s*\(",
     "header_token_parser": r"\bfunc\s+headerContainsToken\s*\(",
+    "http_request_head_limit_parser": (
+        r"\bfunc\s+\(connection\s+\*headerLimitConn\)\s+Read\s*\("
+    ),
+    "http_request_id_header_parser": r"\bfunc\s+requestIDValues\s*\(",
     "install_command_parser": r"\bfunc\s+InstallCommand\s*\(",
     "json_decoder_constructor": r"\bjson\.NewDecoder\s*\(",
     "json_unmarshal_call": r"\bjson\.Unmarshal\s*\(",
@@ -237,6 +242,24 @@ class ServerParserInventoryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("validOperationReceiptKey", receipt_fuzzer)
         self.assertIn("validateStoredOperationResponse", receipt_fuzzer)
+
+        server_fuzzer = (
+            ROOT / "runtime/internal/server/server_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("requestIDValues(payload)", server_fuzzer)
+        self.assertIn("&headerLimitConn{", server_fuzzer)
+
+        deployment_fuzzer = (
+            ROOT / "runtime/internal/deployment/metadata_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("parseArtifactGoBuildInfo(payload)", deployment_fuzzer)
+        self.assertIn("parseArtifactGoBuildInfo(executable)", deployment_fuzzer)
+
+        release_fuzzer = (
+            ROOT / "runtime/internal/releasebundle/buildinfo_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("parseReleaseBundleGoBuildInfo(payload)", release_fuzzer)
+        self.assertIn("parseReleaseBundleGoBuildInfo(executable)", release_fuzzer)
 
     def test_exclusions_remain_narrow_and_explicit(self) -> None:
         exclusions = {entry["id"]: entry["reason"] for entry in self.inventory["exclusions"]}

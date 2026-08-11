@@ -18,7 +18,9 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "runtime/internal/deployment/metadata_fuzz_test.go#metadata": "FuzzDecodeDeploymentMetadata",
             "runtime/internal/deployment/metadata_fuzz_test.go#identity": "FuzzParseBuildIdentityJSON",
             "runtime/internal/deployment/metadata_fuzz_test.go#scalars": "FuzzDeploymentScalarParsers",
+            "runtime/internal/deployment/metadata_fuzz_test.go#go-buildinfo": "FuzzParseArtifactGoBuildInfo",
             "runtime/internal/server/server_fuzz_test.go": "FuzzDecodeAdminRequest",
+            "runtime/internal/server/server_fuzz_test.go#request-head": "FuzzHTTP1RequestHead",
             "runtime/internal/config/config_fuzz_test.go": "FuzzDecodeConfigJSON",
             "runtime/internal/cli/response_fuzz_test.go": "FuzzDecodeCLIResponses",
             "runtime/internal/buildinfo/buildinfo_fuzz_test.go": "FuzzParseAttestation",
@@ -26,6 +28,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "runtime/internal/releaseid/releaseid_fuzz_test.go": "FuzzReleaseIdentifier",
             "runtime/internal/releasebundle/installer_fuzz_test.go": "FuzzInstallCommandInput",
             "runtime/internal/releasebundle/bundle_fuzz_test.go": "FuzzValidLocalMainVersion",
+            "runtime/internal/releasebundle/buildinfo_fuzz_test.go": "FuzzParseReleaseBundleGoBuildInfo",
             "runtime/internal/httpapi/handler_fuzz_test.go": "FuzzHeaderContainsToken",
         }
         for source_key, target in targets.items():
@@ -46,7 +49,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
         deterministic_budget = (
             "-fuzztime=64x -fuzzminimizetime=64x -parallel=1"
         )
-        self.assertEqual(makefile.count(deterministic_budget), 19)
+        self.assertEqual(makefile.count(deterministic_budget), 22)
         for target in (
             "FuzzDecodeStrictJSON",
             "FuzzStoredJSONShapes",
@@ -58,7 +61,9 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "FuzzDecodeDeploymentMetadata",
             "FuzzParseBuildIdentityJSON",
             "FuzzDeploymentScalarParsers",
+            "FuzzParseArtifactGoBuildInfo",
             "FuzzDecodeAdminRequest",
+            "FuzzHTTP1RequestHead",
             "FuzzDecodeConfigJSON",
             "FuzzDecodeCLIResponses",
             "FuzzParseAttestation",
@@ -66,6 +71,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "FuzzReleaseIdentifier",
             "FuzzInstallCommandInput",
             "FuzzValidLocalMainVersion",
+            "FuzzParseReleaseBundleGoBuildInfo",
             "FuzzHeaderContainsToken",
         ):
             self.assertEqual(makefile.count(f"-fuzz '^{target}$$'"), 1, target)
