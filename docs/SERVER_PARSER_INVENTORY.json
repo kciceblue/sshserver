@@ -8,6 +8,7 @@
       "binary_integer_decoder_call": "\\bbinary\\.(?:BigEndian|LittleEndian)\\.Uint(?:16|32|64)\\s*\\(",
       "build_metadata_parser": "\\bfunc\\s+validLocalMainVersion\\s*\\(",
       "filesystem_path_grammar_call": "\\bfilepath\\.(?:Base|Clean|Dir|EvalSymlinks|IsAbs|Rel|ToSlash)\\s*\\(",
+      "fixed_scope_set_validator": "\\bfunc\\s+ValidateScopes\\s*\\(",
       "go_buildinfo_decoder_call": "\\bdebugbuildinfo\\.Read\\s*\\(",
       "header_token_parser": "\\bfunc\\s+headerContainsToken\\s*\\(",
       "hex_decoder_call": "\\bhex\\.(?:Decode|DecodeString)\\s*\\(",
@@ -38,9 +39,12 @@
       "utf8_text_validator_call": "\\butf8\\.ValidString\\s*\\(",
       "xml_text_escape_call": "\\bxml\\.EscapeText\\s*\\("
     },
-    "sourceFileCount": 31,
-    "sourceSignalCount": 272,
+    "sourceFileCount": 32,
+    "sourceSignalCount": 273,
     "sourceSignalCounts": {
+      "runtime/internal/auth/token.go": {
+        "fixed_scope_set_validator": 1
+      },
       "runtime/internal/buildinfo/buildinfo.go": {
         "parser_function_declaration": 1,
         "regexp_grammar_constructor": 3,
@@ -398,6 +402,11 @@
       "id": "release-attestation",
       "coverageOwners": ["build-attestation"],
       "sourceFiles": ["runtime/internal/buildinfo/buildinfo.go"]
+    },
+    {
+      "id": "fixed-authorization-scope-grammar",
+      "coverageOwners": ["store-shapes"],
+      "sourceFiles": ["runtime/internal/auth/token.go"]
     },
     {
       "id": "cli-loopback-responses",

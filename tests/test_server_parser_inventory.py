@@ -20,6 +20,7 @@ EXPECTED_SIGNALS = {
         r"\bfilepath\."
         r"(?:Base|Clean|Dir|EvalSymlinks|IsAbs|Rel|ToSlash)\s*\("
     ),
+    "fixed_scope_set_validator": r"\bfunc\s+ValidateScopes\s*\(",
     "go_buildinfo_decoder_call": r"\bdebugbuildinfo\.Read\s*\(",
     "header_token_parser": r"\bfunc\s+headerContainsToken\s*\(",
     "hex_decoder_call": r"\bhex\.(?:Decode|DecodeString)\s*\(",
@@ -260,6 +261,7 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertEqual(totals["string_split_parser_call"], 29)
         self.assertEqual(totals["strconv_parser_call"], 4)
         self.assertEqual(totals["filesystem_path_grammar_call"], 59)
+        self.assertEqual(totals["fixed_scope_set_validator"], 1)
         self.assertEqual(totals["slash_path_grammar_call"], 6)
         self.assertEqual(totals["network_address_parser_call"], 7)
         self.assertEqual(totals["time_parser_call"], 5)
@@ -553,6 +555,40 @@ class ServerParserInventoryTests(unittest.TestCase):
             '"Bearer " + base64Token + "="',
             '"Bearer +" + base64Token[1:]',
             'base64Token[:len(base64Token)-1] + "B"',
+        }:
+            with self.subTest(adversarial_seed=adversarial_seed):
+                self.assertIn(adversarial_seed, fuzzer)
+
+    def test_fixed_scope_validator_has_an_exact_independent_owner(self) -> None:
+        production = (
+            ROOT / "runtime/internal/auth/token.go"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            self.signal_counts(production)["fixed_scope_set_validator"], 1
+        )
+        fuzzer = (
+            ROOT / "runtime/internal/store/scalar_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for entrypoint in {
+            "auth.ValidateScopes(*destination.(*[]string))",
+            "exactFixedScopeSet(*destination.(*[]string))",
+            "(firstValidationErr == nil) != firstWant",
+        }:
+            with self.subTest(entrypoint=entrypoint):
+                self.assertIn(entrypoint, fuzzer)
+        oracle = fuzzer[
+            fuzzer.index("func exactFixedScopeSet") :
+            fuzzer.index("func FuzzStoreScalarAndStoredParsers")
+        ]
+        self.assertNotIn("auth.ValidateScopes", oracle)
+        self.assertNotIn("auth.FixedScopes", oracle)
+        self.assertNotIn("slices.Equal", oracle)
+        for adversarial_seed in {
+            '"devices:read","devices:manage"',
+            '"sync:write","sync:admin"',
+            '"sync:write","sync:write"',
+            '"envelope:write","sync:read"]`)',
+            '"Devices:manage"',
         }:
             with self.subTest(adversarial_seed=adversarial_seed):
                 self.assertIn(adversarial_seed, fuzzer)

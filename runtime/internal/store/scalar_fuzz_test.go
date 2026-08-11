@@ -18,6 +18,7 @@ type storedJSONShapeFuzzTarget struct {
 	acceptedSeeds  [][]byte
 	newDestination func() any
 	validate       func([]byte, any) error
+	exactAccept    func(any) bool
 }
 
 var (
@@ -56,6 +57,9 @@ var storedJSONShapeFuzzTargets = []storedJSONShapeFuzzTarget{
 		newDestination: func() any { return &[]string{} },
 		validate: func(_ []byte, destination any) error {
 			return auth.ValidateScopes(*destination.(*[]string))
+		},
+		exactAccept: func(destination any) bool {
+			return exactFixedScopeSet(*destination.(*[]string))
 		},
 	},
 	{
@@ -163,6 +167,15 @@ func FuzzStoredJSONShapes(f *testing.F) {
 			f.Add(seed)
 		}
 	}
+	for _, rejectedScopeSeed := range [][]byte{
+		[]byte(`["devices:read","devices:manage","envelope:read","envelope:write","sync:read","sync:write"]`),
+		[]byte(`["devices:manage","devices:read","envelope:read","envelope:write","sync:read","sync:write","sync:admin"]`),
+		[]byte(`["devices:manage","devices:read","envelope:read","envelope:write","sync:read","sync:write","sync:write"]`),
+		[]byte(`["devices:manage","devices:read","envelope:read","envelope:write","sync:read"]`),
+		[]byte(`["Devices:manage","devices:read","envelope:read","envelope:write","sync:read","sync:write"]`),
+	} {
+		f.Add(rejectedScopeSeed)
+	}
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		for _, target := range storedJSONShapeFuzzTargets {
 			first := target.newDestination()
@@ -182,6 +195,13 @@ func FuzzStoredJSONShapes(f *testing.F) {
 			secondValidationErr := target.validate(payload, second)
 			if (firstValidationErr == nil) != (secondValidationErr == nil) {
 				t.Fatalf("%s semantic acceptance changed across identical input: first=%v second=%v", target.name, firstValidationErr, secondValidationErr)
+			}
+			if target.exactAccept != nil {
+				firstWant := target.exactAccept(first)
+				secondWant := target.exactAccept(second)
+				if (firstValidationErr == nil) != firstWant || (secondValidationErr == nil) != secondWant || firstWant != secondWant {
+					t.Fatalf("%s production acceptance first=%v second=%v exact first=%v second=%v", target.name, firstValidationErr == nil, secondValidationErr == nil, firstWant, secondWant)
+				}
 			}
 			if firstValidationErr != nil {
 				continue
@@ -221,9 +241,32 @@ func TestFuzzStoredJSONShapesHasAcceptedSeedsForEveryDestination(t *testing.T) {
 				if err := target.validate(seed, destination); err != nil {
 					t.Fatalf("canonical seed %d failed production semantics: %v", seedIndex, err)
 				}
+				if target.exactAccept != nil && !target.exactAccept(destination) {
+					t.Fatalf("canonical seed %d failed its independent exact oracle", seedIndex)
+				}
 			}
 		})
 	}
+}
+
+func exactFixedScopeSet(scopes []string) bool {
+	expected := [...]string{
+		"devices:manage",
+		"devices:read",
+		"envelope:read",
+		"envelope:write",
+		"sync:read",
+		"sync:write",
+	}
+	if len(scopes) != len(expected) {
+		return false
+	}
+	for index := range expected {
+		if scopes[index] != expected[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func FuzzStoreScalarAndStoredParsers(f *testing.F) {

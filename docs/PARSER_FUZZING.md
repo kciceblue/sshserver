@@ -3,12 +3,13 @@
 This repository keeps coverage-guided Go fuzz targets at every source-derived
 project-owned runtime parsing boundary. The fail-closed inventory in
 `SERVER_PARSER_INVENTORY.json` scans non-vendored production Go source and maps
-all 272 current parser/grammar signals in 31 files to one or more executable
+all 273 current parser/grammar signals in 32 files to one or more executable
 owners. The derivation also includes a zero-count scanner-constructor signal,
 so introducing a scanner fails closed before the inventory can be updated.
 The targets cover:
 
 - strict sync requests plus every V1 request DTO (`FuzzDecodeStrictJSON`);
+- the exact ordered, complete V1 authorization scope set (`FuzzStoredJSONShapes`);
 - device-revocation and snapshot-page route identifiers
   (`FuzzPathIdentifier`);
 - persisted operation-receipt keys and their destination-specific response
