@@ -14,6 +14,7 @@ EXPECTED_SIGNALS = {
     "json_decoder_constructor": r"\bjson\.NewDecoder\s*\(",
     "json_unmarshal_call": r"\bjson\.Unmarshal\s*\(",
     "listener_validator": r"\bfunc\s+ValidateListener\s*\(",
+    "operation_receipt_key_parser": r"\bfunc\s+validOperationReceiptKey\s*\(",
     "parser_function_declaration": (
         r"\bfunc\s+(?:(?:P|p)arse|decode)[A-Za-z0-9_]*\s*\("
     ),
@@ -230,6 +231,12 @@ class ServerParserInventoryTests(unittest.TestCase):
         }:
             with self.subTest(stored_validator=validator):
                 self.assertIn(validator, stored_fuzzer)
+
+        receipt_fuzzer = (
+            ROOT / "runtime/internal/store/dataplane_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("validOperationReceiptKey", receipt_fuzzer)
+        self.assertIn("validateStoredOperationResponse", receipt_fuzzer)
 
     def test_exclusions_remain_narrow_and_explicit(self) -> None:
         exclusions = {entry["id"]: entry["reason"] for entry in self.inventory["exclusions"]}
