@@ -1594,6 +1594,33 @@ func TestApplyForegroundFallbackIsStructuredAndNeverClaimsActivation(t *testing.
 	}
 }
 
+func TestApplyNoManagerForegroundResultIsStableAcrossIdempotentRetry(t *testing.T) {
+	fixture := newLifecycleFixture(t, true)
+	fixture.manager.availability.Foreground.Reason = "user_service_manager_not_installed"
+	request, _ := fixture.release(t, "v1.2.3", "no-manager-idempotent")
+
+	first, err := applyConfirmed(t, fixture.lifecycle, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := applyConfirmed(t, fixture.lifecycle, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.TransactionID == "" || second.TransactionID != "" {
+		t.Fatalf("transaction identities first=%q second=%q", first.TransactionID, second.TransactionID)
+	}
+	for name, result := range map[string]ApplyResult{"first": first, "idempotent": second} {
+		if result.Foreground == nil || result.Foreground.Reason != "user_service_manager_unavailable" {
+			t.Fatalf("%s foreground result=%+v", name, result.Foreground)
+		}
+	}
+	first.TransactionID = ""
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("idempotent no-manager result changed outside transaction identity\n first=%+v\n second=%+v", first, second)
+	}
+}
+
 func TestApplyRefusesImplicitFallbackForActiveNativeService(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	first, _ := fixture.release(t, "v1.2.3", "1")

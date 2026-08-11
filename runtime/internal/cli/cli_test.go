@@ -543,6 +543,47 @@ func TestWriteAndSuperviseApplyResultWritesReceiptBeforeExactExec(t *testing.T) 
 	}
 }
 
+func TestWriteAndSuperviseApplyResultAcceptsFirstAndIdempotentNoManagerResults(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		transactionID string
+	}{
+		{name: "first", transactionID: strings.Repeat("a", 32)},
+		{name: "idempotent"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			result := supervisedApplyResult(t, true)
+			result.TransactionID = testCase.transactionID
+			var stdout bytes.Buffer
+			execCalls := 0
+			runner := Runner{
+				Stdout: &stdout,
+				foregroundExec: func(path string, argv, _ []string) error {
+					execCalls++
+					want := result.Foreground.Command
+					if path != want[0] || !reflect.DeepEqual(argv, want) {
+						t.Fatalf("foreground exec path=%q argv=%q want=%q", path, argv, want)
+					}
+					return nil
+				},
+			}
+			if err := runner.writeAndSuperviseApplyResult(result); err != nil {
+				t.Fatal(err)
+			}
+			if execCalls != 1 {
+				t.Fatalf("foreground exec calls=%d", execCalls)
+			}
+			var receipt deployment.ApplyResult
+			if err := json.Unmarshal(stdout.Bytes(), &receipt); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(receipt, result) {
+				t.Fatalf("receipt=%+v want=%+v", receipt, result)
+			}
+		})
+	}
+}
+
 func TestWriteAndSuperviseApplyResultActiveDoesNotExec(t *testing.T) {
 	result := supervisedApplyResult(t, false)
 	var stdout bytes.Buffer
