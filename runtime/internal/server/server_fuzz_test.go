@@ -124,6 +124,9 @@ func FuzzHTTP1RequestHead(f *testing.F) {
 					t.Fatalf("limited request discarded canonical buffered request ID: got %q want %q", limit.requestID, bufferedIDs[0])
 				}
 			}
+			if bytes.Equal(payload, unseenRequestID) && limit.requestID == retainedRequestID {
+				t.Fatal("limited request retained a canonical request ID beyond the buffered prefix")
+			}
 		}
 	})
 }
