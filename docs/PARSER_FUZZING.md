@@ -3,7 +3,7 @@
 This repository keeps coverage-guided Go fuzz targets at every source-derived
 project-owned runtime parsing boundary. The fail-closed inventory in
 `SERVER_PARSER_INVENTORY.json` scans non-vendored production Go source and maps
-all 68 current parser signals in 23 files to one or more executable owners.
+all 69 current parser signals in 24 files to one or more executable owners.
 The targets cover:
 
 - strict sync requests plus every V1 request DTO (`FuzzDecodeStrictJSON`);
@@ -20,7 +20,8 @@ The targets cover:
 - canonical deployment state/journals, build-identity JSON, URLs, digests, and
   sizes (`FuzzDecodeDeploymentMetadata`, `FuzzParseBuildIdentityJSON`,
   `FuzzDeploymentScalarParsers`), plus Go executable build metadata through
-  the production artifact decoder (`FuzzParseArtifactGoBuildInfo`);
+  the production artifact decoder (`FuzzParseArtifactGoBuildInfo`) and the
+  installed-artifact filename grammar (`FuzzValidateRemovableArtifactName`);
 - protected instance configuration and listener grammar
   (`FuzzDecodeConfigJSON`);
 - owner-only admin-socket requests, raw HTTP/1 request-head limits and request
@@ -36,10 +37,11 @@ The targets cover:
   its production decoder (`FuzzParseReleaseBundleGoBuildInfo`); and
 - one-line installer URL/payload inputs (`FuzzInstallCommandInput`).
 
-All 22 targets have a checked-in minimized invalid seed under their package's
+All 23 targets have a checked-in minimized invalid seed under their package's
 `testdata/fuzz` directory. Structured owners construct canonical accepted
-seeds; the executable-metadata owner separately validates the current bounded
-Go test executable through the exact production decoder before fuzz mutations.
+seeds; each executable-metadata owner mutates a bounded copy of the current Go
+test executable through the exact production decoder, so successful metadata
+paths remain in the coverage-guided corpus.
 Accepted structured inputs with a canonical encoding must
 re-encode and reparse without changing bytes or typed values. Go's ordinary
 package test runs replay every seed. The

@@ -10,6 +10,7 @@
       "http_request_head_limit_parser": "\\bfunc\\s+\\(connection\\s+\\*headerLimitConn\\)\\s+Read\\s*\\(",
       "http_request_id_header_parser": "\\bfunc\\s+requestIDValues\\s*\\(",
       "install_command_parser": "\\bfunc\\s+InstallCommand\\s*\\(",
+      "installed_artifact_filename_validator": "\\bfunc\\s+validateRemovableArtifact\\s*\\(",
       "json_decoder_constructor": "\\bjson\\.NewDecoder\\s*\\(",
       "json_unmarshal_call": "\\bjson\\.Unmarshal\\s*\\(",
       "listener_validator": "\\bfunc\\s+ValidateListener\\s*\\(",
@@ -19,8 +20,8 @@
       "route_identifier_parser": "\\bfunc\\s+pathIdentifier\\s*\\(",
       "url_parser_call": "\\burl\\.(?:Parse|ParseQuery)\\s*\\("
     },
-    "sourceFileCount": 23,
-    "sourceSignalCount": 68,
+    "sourceFileCount": 24,
+    "sourceSignalCount": 69,
     "sourceSignalCounts": {
       "runtime/internal/buildinfo/buildinfo.go": {
         "parser_function_declaration": 1
@@ -51,6 +52,9 @@
         "json_decoder_constructor": 1,
         "parser_function_declaration": 1,
         "url_parser_call": 1
+      },
+      "runtime/internal/deployment/remove_artifacts_unix.go": {
+        "installed_artifact_filename_validator": 1
       },
       "runtime/internal/deployment/state.go": {
         "json_decoder_constructor": 1,
@@ -128,6 +132,12 @@
       "package": "./internal/deployment",
       "testFile": "runtime/internal/deployment/metadata_fuzz_test.go",
       "testMethod": "FuzzParseArtifactGoBuildInfo"
+    },
+    "artifact-removal-filenames": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzValidateRemovableArtifactName",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/remove_artifacts_fuzz_test.go",
+      "testMethod": "FuzzValidateRemovableArtifactName"
     },
     "build-attestation": {
       "corpus": "runtime/internal/buildinfo/testdata/fuzz/FuzzParseAttestation",
@@ -268,8 +278,8 @@
     },
     {
       "id": "deployment-inputs-and-state",
-      "coverageOwners": ["deployment-manifest", "deployment-preview", "deployment-metadata", "deployment-identity-json", "deployment-scalars", "artifact-go-build-metadata", "release-identifier", "uuid-v4"],
-      "sourceFiles": ["runtime/internal/deployment/artifact.go", "runtime/internal/deployment/attestation.go", "runtime/internal/deployment/manifest.go", "runtime/internal/deployment/preview.go", "runtime/internal/deployment/state.go"]
+      "coverageOwners": ["deployment-manifest", "deployment-preview", "deployment-metadata", "deployment-identity-json", "deployment-scalars", "artifact-go-build-metadata", "artifact-removal-filenames", "release-identifier", "uuid-v4"],
+      "sourceFiles": ["runtime/internal/deployment/artifact.go", "runtime/internal/deployment/attestation.go", "runtime/internal/deployment/manifest.go", "runtime/internal/deployment/preview.go", "runtime/internal/deployment/remove_artifacts_unix.go", "runtime/internal/deployment/state.go"]
     },
     {
       "id": "installer-url-and-payload",

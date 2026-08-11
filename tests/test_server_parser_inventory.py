@@ -16,6 +16,9 @@ EXPECTED_SIGNALS = {
     ),
     "http_request_id_header_parser": r"\bfunc\s+requestIDValues\s*\(",
     "install_command_parser": r"\bfunc\s+InstallCommand\s*\(",
+    "installed_artifact_filename_validator": (
+        r"\bfunc\s+validateRemovableArtifact\s*\("
+    ),
     "json_decoder_constructor": r"\bjson\.NewDecoder\s*\(",
     "json_unmarshal_call": r"\bjson\.Unmarshal\s*\(",
     "listener_validator": r"\bfunc\s+ValidateListener\s*\(",
@@ -252,13 +255,24 @@ class ServerParserInventoryTests(unittest.TestCase):
         deployment_fuzzer = (
             ROOT / "runtime/internal/deployment/metadata_fuzz_test.go"
         ).read_text(encoding="utf-8")
-        self.assertIn("parseArtifactGoBuildInfo(payload)", deployment_fuzzer)
+        self.assertIn(
+            "mutateAcceptedArtifactExecutable(executable, mutation)",
+            deployment_fuzzer,
+        )
         self.assertIn("parseArtifactGoBuildInfo(executable)", deployment_fuzzer)
+
+        removal_fuzzer = (
+            ROOT / "runtime/internal/deployment/remove_artifacts_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("validateRemovableArtifact(name, stat)", removal_fuzzer)
 
         release_fuzzer = (
             ROOT / "runtime/internal/releasebundle/buildinfo_fuzz_test.go"
         ).read_text(encoding="utf-8")
-        self.assertIn("parseReleaseBundleGoBuildInfo(payload)", release_fuzzer)
+        self.assertIn(
+            "mutateAcceptedReleaseBundleExecutable(executable, mutation)",
+            release_fuzzer,
+        )
         self.assertIn("parseReleaseBundleGoBuildInfo(executable)", release_fuzzer)
 
     def test_exclusions_remain_narrow_and_explicit(self) -> None:
