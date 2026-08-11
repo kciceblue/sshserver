@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = ROOT / "docs" / "SERVER_PARSER_INVENTORY.json"
 
 EXPECTED_SIGNALS = {
+    "build_metadata_parser": r"\bfunc\s+validLocalMainVersion\s*\(",
     "header_token_parser": r"\bfunc\s+headerContainsToken\s*\(",
     "install_command_parser": r"\bfunc\s+InstallCommand\s*\(",
     "json_decoder_constructor": r"\bjson\.NewDecoder\s*\(",
@@ -21,10 +22,29 @@ EXPECTED_SIGNALS = {
 }
 
 
+def strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
 class ServerParserInventoryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.inventory = json.loads(INVENTORY_PATH.read_text(encoding="utf-8"))
+        cls.inventory = json.loads(
+            INVENTORY_PATH.read_text(encoding="utf-8"),
+            object_pairs_hook=strict_json_object,
+        )
+
+    def test_inventory_rejects_duplicate_json_keys(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate JSON key: id"):
+            json.loads(
+                '{"id":"first","id":"second"}',
+                object_pairs_hook=strict_json_object,
+            )
 
     @staticmethod
     def signal_counts(source: str) -> dict[str, int]:
@@ -156,6 +176,21 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertIn(
             "TestFuzzStoredJSONShapesHasAcceptedSeedsForEveryDestination",
             source,
+        )
+
+    def test_config_and_deployment_fuzzers_apply_production_semantics(self) -> None:
+        config_fuzzer = (
+            ROOT / "runtime/internal/config/config_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("value.(*Settings).Validate()", config_fuzzer)
+        self.assertIn("value.(*InstallMarker).Validate()", config_fuzzer)
+
+        deployment_fuzzer = (
+            ROOT / "runtime/internal/deployment/metadata_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("value.(*DeploymentState).Validate(layout)", deployment_fuzzer)
+        self.assertIn(
+            "value.(*DeploymentJournal).Validate(layout)", deployment_fuzzer
         )
 
     def test_exclusions_remain_narrow_and_explicit(self) -> None:

@@ -13,41 +13,109 @@ import (
 )
 
 func FuzzDecodeDeploymentMetadata(f *testing.F) {
-	stateSeed, err := canonicalDeploymentJSON(DeploymentState{})
+	layout, err := NewLayout(
+		"/home/jat-fuzz",
+		"/home/jat-fuzz/deployment",
+		"/home/jat-fuzz/state",
+	)
 	if err != nil {
 		f.Fatal(err)
 	}
-	journalSeed, err := canonicalDeploymentJSON(DeploymentJournal{})
+	binaryPath, err := layout.BinaryPath(
+		"v1.2.3",
+		Target{OS: "linux", Architecture: "amd64"},
+	)
 	if err != nil {
 		f.Fatal(err)
 	}
-	f.Add(stateSeed)
-	f.Add(journalSeed)
+	release := InstalledRelease{
+		Release: "v1.2.3", SourceRevision: strings.Repeat("a", 40),
+		BuildToolchain: "go1.25.0", BuildIdentity: strings.Repeat("b", 64),
+		ManifestSHA256: strings.Repeat("c", 64), ProtocolVersion: "1",
+		StorageSchema: "1", OS: "linux", Architecture: "amd64",
+		BinaryPath: binaryPath, BinaryBytes: 1,
+		BinarySHA256: strings.Repeat("d", 64), LicenseBytes: 1,
+		LicenseSHA256: strings.Repeat("e", 64), NoticeBytes: 1,
+		NoticeSHA256: strings.Repeat("f", 64),
+	}
+	state := DeploymentState{
+		StateVersion: DeploymentStateVersion, Generation: 1,
+		Status: StatusForeground, Manager: ManagerForeground,
+		StateDir: layout.StateDir, Active: &release,
+	}
+	journal := DeploymentJournal{
+		StateVersion:  DeploymentStateVersion,
+		TransactionID: strings.Repeat("1", 32),
+		Operation:     OperationApply, Phase: PhaseArtifactStaged,
+		Manager:           ManagerForeground,
+		SourcePath:        "/home/jat-fuzz/input/sshserver",
+		LicenseSourcePath: "/home/jat-fuzz/input/LICENSE",
+		NoticeSourcePath:  "/home/jat-fuzz/input/NOTICE",
+		Desired:           &release, PriorState: &state,
+	}
+	targets := []struct {
+		name           string
+		value          any
+		newDestination func() any
+		validate       func(any) error
+	}{
+		{
+			name: "deployment state", value: state,
+			newDestination: func() any { return &DeploymentState{} },
+			validate: func(value any) error {
+				return value.(*DeploymentState).Validate(layout)
+			},
+		},
+		{
+			name: "deployment journal", value: journal,
+			newDestination: func() any { return &DeploymentJournal{} },
+			validate: func(value any) error {
+				return value.(*DeploymentJournal).Validate(layout)
+			},
+		},
+	}
+	for _, target := range targets {
+		seed, err := canonicalDeploymentJSON(target.value)
+		if err != nil {
+			f.Fatal(err)
+		}
+		destination := target.newDestination()
+		if err := decodeCanonicalDeploymentJSON(seed, destination); err != nil {
+			f.Fatalf("decode %s seed: %v", target.name, err)
+		}
+		if err := target.validate(destination); err != nil {
+			f.Fatalf("validate %s seed: %v", target.name, err)
+		}
+		f.Add(seed)
+	}
 
 	f.Fuzz(func(t *testing.T, payload []byte) {
-		for _, newDestination := range []func() any{
-			func() any { return &DeploymentState{} },
-			func() any { return &DeploymentJournal{} },
-		} {
-			first := newDestination()
+		for _, target := range targets {
+			first := target.newDestination()
 			firstErr := decodeCanonicalDeploymentJSON(payload, first)
-			second := newDestination()
+			if firstErr == nil {
+				firstErr = target.validate(first)
+			}
+			second := target.newDestination()
 			secondErr := decodeCanonicalDeploymentJSON(payload, second)
+			if secondErr == nil {
+				secondErr = target.validate(second)
+			}
 			if (firstErr == nil) != (secondErr == nil) {
-				t.Fatal("deployment metadata acceptance changed across identical input")
+				t.Fatalf("%s acceptance changed across identical input", target.name)
 			}
 			if firstErr != nil {
 				continue
 			}
 			if !reflect.DeepEqual(first, second) {
-				t.Fatal("deployment metadata output changed across identical input")
+				t.Fatalf("%s output changed across identical input", target.name)
 			}
 			canonical, err := canonicalDeploymentJSON(first)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !reflect.DeepEqual(payload, canonical) {
-				t.Fatal("accepted deployment metadata was not canonical")
+				t.Fatalf("accepted %s was not canonical", target.name)
 			}
 		}
 	})

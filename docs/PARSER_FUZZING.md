@@ -3,7 +3,7 @@
 This repository keeps coverage-guided Go fuzz targets at every source-derived
 project-owned runtime parsing boundary. The fail-closed inventory in
 `SERVER_PARSER_INVENTORY.json` scans non-vendored production Go source and maps
-all 59 current parser signals in 22 files to one or more executable owners.
+all 60 current parser signals in 23 files to one or more executable owners.
 The targets cover:
 
 - strict sync requests plus every V1 request DTO (`FuzzDecodeStrictJSON`);
@@ -24,13 +24,16 @@ The targets cover:
   upgrade rejection (`FuzzHeaderContainsToken`);
 - build attestations, UUIDv4, and release identifiers
   (`FuzzParseAttestation`, `FuzzParseUUIDv4`,
-  `FuzzReleaseIdentifier`); and
+  `FuzzReleaseIdentifier`);
+- local nested-module pseudo-version, source-revision, and VCS-time binding
+  (`FuzzValidLocalMainVersion`); and
 - one-line installer URL/payload inputs (`FuzzInstallCommandInput`).
 
-All 16 targets have a checked-in minimized invalid seed under their package's
+All 17 targets have a checked-in minimized invalid seed under their package's
 `testdata/fuzz` directory and one or more canonical accepted seeds constructed
-by the test. Accepted inputs must re-encode and reparse without changing bytes
-or typed values. Go's ordinary package test runs replay every seed. The
+by the test. Accepted structured inputs with a canonical encoding must
+re-encode and reparse without changing bytes or typed values. Go's ordinary
+package test runs replay every seed. The
 repository gate also runs 64 coverage-guided mutations per target with one
 worker. If a mutation fails, Go's crasher minimization is separately capped at
 64 executions rather than its time-based default:

@@ -10,16 +10,23 @@ var configJSONFuzzTargets = []struct {
 	name           string
 	acceptedSeed   []byte
 	newDestination func() any
+	validate       func(any) error
 }{
 	{
 		name:           "settings",
 		acceptedSeed:   []byte(`{"config_version":1,"instance_id":"00000000-0000-4000-8000-000000000001","vault_id":"00000000-0000-4000-8000-000000000002","listeners":["127.0.0.1:37421","[::1]:37421"]}`),
 		newDestination: func() any { return &Settings{} },
+		validate: func(value any) error {
+			return value.(*Settings).Validate()
+		},
 	},
 	{
 		name:           "install marker",
 		acceptedSeed:   []byte(`{"generation":"1","phase":"ready","state":"complete"}`),
 		newDestination: func() any { return &InstallMarker{} },
+		validate: func(value any) error {
+			return value.(*InstallMarker).Validate()
+		},
 	},
 }
 
@@ -37,8 +44,14 @@ func FuzzDecodeConfigJSON(f *testing.F) {
 		for _, target := range configJSONFuzzTargets {
 			first := target.newDestination()
 			firstErr := decodeStrictJSON(payload, first)
+			if firstErr == nil {
+				firstErr = target.validate(first)
+			}
 			second := target.newDestination()
 			secondErr := decodeStrictJSON(payload, second)
+			if secondErr == nil {
+				secondErr = target.validate(second)
+			}
 			if (firstErr == nil) != (secondErr == nil) {
 				t.Fatalf("%s acceptance changed across identical input", target.name)
 			}
@@ -56,6 +69,9 @@ func FuzzDecodeConfigJSON(f *testing.F) {
 			if err := decodeStrictJSON(encoded, roundTrip); err != nil {
 				t.Fatalf("decode re-encoded %s: %v", target.name, err)
 			}
+			if err := target.validate(roundTrip); err != nil {
+				t.Fatalf("validate re-encoded %s: %v", target.name, err)
+			}
 			if !reflect.DeepEqual(first, roundTrip) {
 				t.Fatalf("%s changed across JSON round trip", target.name)
 			}
@@ -65,8 +81,12 @@ func FuzzDecodeConfigJSON(f *testing.F) {
 
 func TestFuzzDecodeConfigJSONAcceptedSeeds(t *testing.T) {
 	for _, target := range configJSONFuzzTargets {
-		if err := decodeStrictJSON(target.acceptedSeed, target.newDestination()); err != nil {
+		destination := target.newDestination()
+		if err := decodeStrictJSON(target.acceptedSeed, destination); err != nil {
 			t.Fatalf("%s seed rejected: %v", target.name, err)
+		}
+		if err := target.validate(destination); err != nil {
+			t.Fatalf("%s seed failed production semantics: %v", target.name, err)
 		}
 	}
 }

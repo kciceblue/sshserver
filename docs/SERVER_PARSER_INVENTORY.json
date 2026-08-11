@@ -4,6 +4,7 @@
   "sourceDerivation": {
     "description": "Exact signal counts are recomputed by tests/test_server_parser_inventory.py. Any new or changed signal-bearing runtime file fails closed until its parser boundary and fuzz owner are reviewed together.",
     "signals": {
+      "build_metadata_parser": "\\bfunc\\s+validLocalMainVersion\\s*\\(",
       "header_token_parser": "\\bfunc\\s+headerContainsToken\\s*\\(",
       "install_command_parser": "\\bfunc\\s+InstallCommand\\s*\\(",
       "json_decoder_constructor": "\\bjson\\.NewDecoder\\s*\\(",
@@ -13,8 +14,8 @@
       "release_identifier_validator": "\\bfunc\\s+Valid\\s*\\(",
       "url_parser_call": "\\burl\\.(?:Parse|ParseQuery)\\s*\\("
     },
-    "sourceFileCount": 22,
-    "sourceSignalCount": 59,
+    "sourceFileCount": 23,
+    "sourceSignalCount": 60,
     "sourceSignalCounts": {
       "runtime/internal/buildinfo/buildinfo.go": {
         "parser_function_declaration": 1
@@ -51,6 +52,9 @@
       },
       "runtime/internal/httpapi/handler.go": {
         "header_token_parser": 1
+      },
+      "runtime/internal/releasebundle/bundle.go": {
+        "build_metadata_parser": 1
       },
       "runtime/internal/releasebundle/installer.go": {
         "install_command_parser": 1,
@@ -161,6 +165,12 @@
       "testFile": "runtime/internal/releasebundle/installer_fuzz_test.go",
       "testMethod": "FuzzInstallCommandInput"
     },
+    "local-main-build-metadata": {
+      "corpus": "runtime/internal/releasebundle/testdata/fuzz/FuzzValidLocalMainVersion",
+      "package": "./internal/releasebundle",
+      "testFile": "runtime/internal/releasebundle/bundle_fuzz_test.go",
+      "testMethod": "FuzzValidLocalMainVersion"
+    },
     "http-header-tokens": {
       "corpus": "runtime/internal/httpapi/testdata/fuzz/FuzzHeaderContainsToken",
       "package": "./internal/httpapi",
@@ -223,6 +233,11 @@
       "id": "installer-url-and-payload",
       "coverageOwners": ["install-command", "release-identifier"],
       "sourceFiles": ["runtime/internal/releasebundle/installer.go"]
+    },
+    {
+      "id": "release-build-metadata",
+      "coverageOwners": ["local-main-build-metadata"],
+      "sourceFiles": ["runtime/internal/releasebundle/bundle.go"]
     },
     {
       "id": "http-transport-header-tokens",

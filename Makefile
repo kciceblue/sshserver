@@ -58,6 +58,7 @@ runtime-fuzz-smoke:
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseUUIDv4$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/uuidv4
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzReleaseIdentifier$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releaseid
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzInstallCommandInput$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzValidLocalMainVersion$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzHeaderContainsToken$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/httpapi
 
 runtime-build-one:
