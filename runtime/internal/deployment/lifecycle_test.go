@@ -1521,6 +1521,66 @@ func TestApplyTransactionResumesAfterEveryDurablePhase(t *testing.T) {
 	}
 }
 
+func TestUpgradeResumesAfterEveryDurablePhase(t *testing.T) {
+	// failAfterPhase models a lost process immediately after each durable
+	// checkpoint. It proves journal/state-machine convergence, not OS kill or
+	// filesystem power-loss behavior.
+	phases := []Phase{
+		PhasePlanned,
+		PhaseArtifactStaged,
+		PhaseInstanceReady,
+		PhasePriorServiceStopped,
+		PhaseDefinitionInstalled,
+		PhaseActivated,
+		PhaseHealthVerified,
+		PhaseCommitting,
+		PhaseStateSaved,
+	}
+	for _, phase := range phases {
+		t.Run(string(phase), func(t *testing.T) {
+			fixture := newLifecycleFixture(t, false)
+			firstRequest, first := fixture.release(t, "v1.2.3", "upgrade-resume-prior")
+			if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
+				t.Fatal(err)
+			}
+			protectedBefore := captureProtectedInstance(t, fixture.layout.StateDir)
+
+			upgradeRequest, desired := fixture.release(t, "v1.2.4", "upgrade-resume-desired")
+			fixture.lifecycle.failAfterPhase = phase
+			if _, err := applyConfirmed(t, fixture.lifecycle, upgradeRequest); !errors.Is(err, ErrInjectedDeploymentCrash) {
+				t.Fatalf("upgrade crash error = %v", err)
+			}
+			journal, err := LoadJournal(fixture.layout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if journal.Phase != phase || journal.Operation != OperationApply || journal.Desired == nil || *journal.Desired != desired ||
+				journal.PriorState == nil || journal.PriorState.Active == nil || *journal.PriorState.Active != first {
+				t.Fatalf("upgrade journal=%+v want phase=%s prior=%+v desired=%+v", journal, phase, first, desired)
+			}
+
+			fixture.lifecycle.failAfterPhase = ""
+			upgradeRequest.ArtifactPath = filepath.Join(fixture.layout.HomeDir, "download-upgrade-retry", "sshserver")
+			result, err := applyConfirmed(t, fixture.lifecycle, upgradeRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.State.Generation != 2 || result.State.Status != StatusActive || result.State.Active == nil || *result.State.Active != desired ||
+				result.State.Previous == nil || *result.State.Previous != first {
+				t.Fatalf("resumed upgrade result=%+v", result)
+			}
+			if !fixture.manager.active || fixture.manager.current != identityFor(desired) {
+				t.Fatalf("resumed upgrade runtime=%+v active=%t", fixture.manager.current, fixture.manager.active)
+			}
+			assertDeploymentLocator(t, result.DeploymentLocator, fixture.layout, desired)
+			if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+				t.Fatalf("resumed upgrade journal error=%v", err)
+			}
+			assertProtectedInstanceUnchanged(t, protectedBefore, captureProtectedInstance(t, fixture.layout.StateDir))
+		})
+	}
+}
+
 func TestApplyFailureRollsBackExactPriorReleaseAndPreservesInstance(t *testing.T) {
 	fixture := newLifecycleFixture(t, false)
 	firstRequest, firstRelease := fixture.release(t, "v1.2.3", "c")
@@ -1566,6 +1626,54 @@ func TestApplyFailureRollsBackExactPriorReleaseAndPreservesInstance(t *testing.T
 	if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
 		t.Fatalf("rollback journal error=%v", err)
 	}
+}
+
+func TestUpgradeHealthFailureRestoresExactPriorReleaseAndProtectedInstance(t *testing.T) {
+	// The manager and health probe are injected lifecycle collaborators. Native
+	// process and service-manager behavior remain separate integration claims.
+	fixture := newLifecycleFixture(t, false)
+	firstRequest, first := fixture.release(t, "v1.2.3", "health-failure-prior")
+	if _, err := applyConfirmed(t, fixture.lifecycle, firstRequest); err != nil {
+		t.Fatal(err)
+	}
+	priorState, err := LoadState(fixture.layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protectedBefore := captureProtectedInstance(t, fixture.layout.StateDir)
+
+	upgradeRequest, desired := fixture.release(t, "v1.2.4", "health-failure-desired")
+	healthError := errors.New("injected new-version health failure")
+	originalProbe := fixture.lifecycle.probeRunning
+	fixture.lifecycle.probeRunning = func(ctx context.Context, stateDir string) (buildinfo.Identity, error) {
+		if fixture.manager.current == identityFor(desired) {
+			fixture.probeCalls++
+			return buildinfo.Identity{}, healthError
+		}
+		return originalProbe(ctx, stateDir)
+	}
+
+	failed, err := applyConfirmed(t, fixture.lifecycle, upgradeRequest)
+	if !errors.Is(err, healthError) {
+		t.Fatalf("failed upgrade error=%v", err)
+	}
+	if failed != (ApplyResult{}) {
+		t.Fatalf("failed upgrade result=%+v", failed)
+	}
+	state, err := LoadState(fixture.layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(state, priorState) || state.Active == nil || *state.Active != first {
+		t.Fatalf("state after failed-health rollback=%+v want=%+v", state, priorState)
+	}
+	if !fixture.manager.active || fixture.manager.current != identityFor(first) {
+		t.Fatalf("runtime after failed-health rollback=%+v active=%t", fixture.manager.current, fixture.manager.active)
+	}
+	if _, err := LoadJournal(fixture.layout); !errors.Is(err, ErrNoDeploymentJournal) {
+		t.Fatalf("failed-health rollback journal error=%v", err)
+	}
+	assertProtectedInstanceUnchanged(t, protectedBefore, captureProtectedInstance(t, fixture.layout.StateDir))
 }
 
 func TestApplyForegroundFallbackIsStructuredAndNeverClaimsActivation(t *testing.T) {
@@ -2143,6 +2251,50 @@ func assertJSONHasNoDeploymentLocator(t *testing.T, value any) {
 	}
 	if _, ok := object["deployment_locator"]; ok {
 		t.Fatalf("unexpected deployment locator: %s", payload)
+	}
+}
+
+type protectedInstanceSnapshot struct {
+	settings       config.Settings
+	marker         config.InstallMarker
+	secretSHA256   string
+	databaseSHA256 string
+}
+
+func captureProtectedInstance(t *testing.T, stateDir string) protectedInstanceSnapshot {
+	t.Helper()
+	paths := config.ForStateDir(stateDir)
+	settings, err := instance.LoadCompletedSettings(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker, err := config.LoadMarker(paths.InstallMarker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := config.ReadSecret(paths.InstanceSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretSHA256 := SHA256Hex(secret)
+	clear(secret)
+	database, err := os.ReadFile(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return protectedInstanceSnapshot{
+		settings:       settings,
+		marker:         marker,
+		secretSHA256:   secretSHA256,
+		databaseSHA256: SHA256Hex(database),
+	}
+}
+
+func assertProtectedInstanceUnchanged(t *testing.T, before, after protectedInstanceSnapshot) {
+	t.Helper()
+	if !reflect.DeepEqual(after.settings, before.settings) || after.marker != before.marker ||
+		after.secretSHA256 != before.secretSHA256 || after.databaseSHA256 != before.databaseSHA256 {
+		t.Fatal("deployment lifecycle changed protected instance identity, secret, marker, or database bytes")
 	}
 }
 
