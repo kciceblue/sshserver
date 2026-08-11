@@ -228,9 +228,24 @@ func TestFuzzStoredJSONShapesHasAcceptedSeedsForEveryDestination(t *testing.T) {
 
 func FuzzStoreScalarAndStoredParsers(f *testing.F) {
 	base64Token := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	diverseBase64Token := "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
 	marker := []byte(`{"record_id":"00000000-0000-4000-8000-000000000020","witness_revision_id":"00000000-0000-4000-8000-000000000021","frontier":[{"device_id":"00000000-0000-4000-8000-000000000003","counter":"1"}],"collection_witness_authenticator":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","barrier_cursor":"1"}`)
 	descriptor := []byte(`{"revision_ids":[],"collection_markers":[],"source_devices":[],"next_page_token":null,"has_more":false}`)
-	f.Add("1", base64Token, "Bearer "+base64Token, marker, descriptor)
+	for _, authorization := range []string{
+		"Bearer " + base64Token,
+		"Bearer " + diverseBase64Token,
+		"JAT-Enrollment " + base64Token,
+		"JAT-Enrollment " + diverseBase64Token,
+		"bearer " + base64Token,
+		"Bearer  " + base64Token,
+		"Bearer\t" + base64Token,
+		"Bearer " + base64Token[:len(base64Token)-1],
+		"Bearer " + base64Token + "=",
+		"Bearer +" + base64Token[1:],
+		"Bearer " + base64Token[:len(base64Token)-1] + "B",
+	} {
+		f.Add("1", base64Token, authorization, marker, descriptor)
+	}
 	f.Fuzz(func(t *testing.T, numberText, base64Text, authorization string, markerBody, descriptorBody []byte) {
 		firstNumber, firstNumberErr := parseUint64(numberText)
 		secondNumber, secondNumberErr := parseUint64(numberText)
@@ -246,13 +261,20 @@ func FuzzStoreScalarAndStoredParsers(f *testing.F) {
 		clear(firstBase64)
 		clear(secondBase64)
 
-		firstAuthorization, firstAuthorizationErr := parseAuthorization(authorization, "Bearer")
-		secondAuthorization, secondAuthorizationErr := parseAuthorization(authorization, "Bearer")
-		if (firstAuthorizationErr == nil) != (secondAuthorizationErr == nil) || !bytes.Equal(firstAuthorization, secondAuthorization) {
-			t.Fatal("authorization parser changed across identical input")
+		for _, scheme := range []string{"Bearer", "JAT-Enrollment"} {
+			firstAuthorization, firstAuthorizationErr := parseAuthorization(authorization, scheme)
+			secondAuthorization, secondAuthorizationErr := parseAuthorization(authorization, scheme)
+			wantAuthorization, wantAuthorizationOK := exactAuthorization(authorization, scheme)
+			if (firstAuthorizationErr == nil) != wantAuthorizationOK || (secondAuthorizationErr == nil) != wantAuthorizationOK {
+				t.Fatalf("%s authorization acceptance first=%v second=%v want=%v", scheme, firstAuthorizationErr == nil, secondAuthorizationErr == nil, wantAuthorizationOK)
+			}
+			if wantAuthorizationOK && (!bytes.Equal(firstAuthorization, wantAuthorization) || !bytes.Equal(secondAuthorization, wantAuthorization)) {
+				t.Fatalf("%s authorization bytes differ from exact grammar", scheme)
+			}
+			clear(firstAuthorization)
+			clear(secondAuthorization)
+			clear(wantAuthorization)
 		}
-		clear(firstAuthorization)
-		clear(secondAuthorization)
 
 		firstMarker, firstMarkerErr := decodeStoredCollectionMarker(markerBody)
 		secondMarker, secondMarkerErr := decodeStoredCollectionMarker(markerBody)
@@ -278,4 +300,51 @@ func FuzzStoreScalarAndStoredParsers(f *testing.F) {
 			t.Fatal("stored token parser changed across identical input")
 		}
 	})
+}
+
+func exactAuthorization(value, scheme string) ([]byte, bool) {
+	prefix := scheme + " "
+	if len(value) != len(prefix)+43 || value[:len(prefix)] != prefix {
+		return nil, false
+	}
+	return exactRawURLToken32(value[len(prefix):])
+}
+
+func exactRawURLToken32(value string) ([]byte, bool) {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	if len(value) != 43 {
+		return nil, false
+	}
+	decoded := make([]byte, 0, 32)
+	var accumulator uint32
+	bits := 0
+	for index := 0; index < len(value); index++ {
+		sextet := -1
+		for alphabetIndex := 0; alphabetIndex < len(alphabet); alphabetIndex++ {
+			if value[index] == alphabet[alphabetIndex] {
+				sextet = alphabetIndex
+				break
+			}
+		}
+		if sextet < 0 {
+			clear(decoded)
+			return nil, false
+		}
+		accumulator = accumulator<<6 | uint32(sextet)
+		bits += 6
+		if bits >= 8 {
+			bits -= 8
+			decoded = append(decoded, byte(accumulator>>bits))
+			if bits == 0 {
+				accumulator = 0
+			} else {
+				accumulator &= 1<<bits - 1
+			}
+		}
+	}
+	if len(decoded) != 32 || bits != 2 || accumulator != 0 {
+		clear(decoded)
+		return nil, false
+	}
+	return decoded, true
 }

@@ -531,6 +531,32 @@ class ServerParserInventoryTests(unittest.TestCase):
         )
         self.assertIn("parseReleaseBundleGoBuildInfo(executable)", release_fuzzer)
 
+    def test_authorization_parser_has_an_exact_independent_oracle(self) -> None:
+        fuzzer = (
+            ROOT / "runtime/internal/store/scalar_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for entrypoint in {
+            'parseAuthorization(authorization, scheme)',
+            'exactAuthorization(authorization, scheme)',
+            'exactRawURLToken32(value[len(prefix):])',
+        }:
+            with self.subTest(entrypoint=entrypoint):
+                self.assertIn(entrypoint, fuzzer)
+        oracle = fuzzer[fuzzer.index("func exactAuthorization") :]
+        self.assertNotIn("parseAuthorization(", oracle)
+        self.assertNotIn("decodeBase64(", oracle)
+        self.assertNotIn("base64.", oracle)
+        for adversarial_seed in {
+            '"bearer " + base64Token',
+            '"Bearer  " + base64Token',
+            '"Bearer\\t" + base64Token',
+            '"Bearer " + base64Token + "="',
+            '"Bearer +" + base64Token[1:]',
+            'base64Token[:len(base64Token)-1] + "B"',
+        }:
+            with self.subTest(adversarial_seed=adversarial_seed):
+                self.assertIn(adversarial_seed, fuzzer)
+
     def test_exclusions_remain_narrow_and_explicit(self) -> None:
         exclusions = {entry["id"]: entry["reason"] for entry in self.inventory["exclusions"]}
         self.assertEqual(
