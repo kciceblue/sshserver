@@ -283,6 +283,24 @@ class ServerParserInventoryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("validOperationReceiptKey", receipt_fuzzer)
         self.assertIn("validateStoredOperationResponse", receipt_fuzzer)
+        self.assertIn("exactOperationReceiptKey(operation)", receipt_fuzzer)
+        operation_oracle = receipt_fuzzer[
+            receipt_fuzzer.index("func exactOperationReceiptKey") :
+            receipt_fuzzer.index("func FuzzPathIdentifier")
+        ]
+        self.assertNotIn("validOperationReceiptKey", operation_oracle)
+        self.assertNotIn("validateUUID", operation_oracle)
+        self.assertNotIn("uuidv4", operation_oracle)
+
+        request_fuzzer = (
+            ROOT / "runtime/internal/store/models_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("parserFuzzStoredEnvelopeGeneration uint64 = 0", request_fuzzer)
+        self.assertIn(
+            "validatePutEnvelopeRequestGenerations(request, parserFuzzStoredEnvelopeGeneration)",
+            request_fuzzer,
+        )
+        self.assertIn("f.Add(mismatchedPutEnvelopeGenerationFuzzSeed)", request_fuzzer)
 
         server_fuzzer = (
             ROOT / "runtime/internal/server/server_fuzz_test.go"

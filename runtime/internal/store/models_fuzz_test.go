@@ -10,8 +10,12 @@ import (
 var (
 	canonicalBaseVaultEnvelopeFuzzSeed       = []byte(`{"protocol_version":"1","crypto_suite":"jat-xchacha-hkdf-argon2id-draft2","instance_id":"00000000-0000-4000-8000-000000000001","vault_id":"00000000-0000-4000-8000-000000000002","envelope_generation":"1","instance_secret_generation":"1","mode":"base","hkdf_salt":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","argon2":null,"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","wrapped_vmk":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)
 	canonicalPassphraseVaultEnvelopeFuzzSeed = []byte(`{"protocol_version":"1","crypto_suite":"jat-xchacha-hkdf-argon2id-draft2","instance_id":"00000000-0000-4000-8000-000000000001","vault_id":"00000000-0000-4000-8000-000000000002","envelope_generation":"1","instance_secret_generation":"1","mode":"passphrase","hkdf_salt":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","argon2":{"version":19,"salt":"AAAAAAAAAAAAAAAAAAAAAA","memory_kib":65536,"iterations":3,"parallelism":1,"output_length":32},"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","wrapped_vmk":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)
+	canonicalPutEnvelopeRequestFuzzSeed      = bytes.Join([][]byte{[]byte(`{"expected_generation":"0","new_generation":"1","envelope":`), canonicalBaseVaultEnvelopeFuzzSeed, []byte(`}`)}, nil)
+	mismatchedPutEnvelopeGenerationFuzzSeed  = bytes.Replace(canonicalPutEnvelopeRequestFuzzSeed, []byte(`"expected_generation":"0"`), []byte(`"expected_generation":"1"`), 1)
 	parserFuzzIdentity                       = Identity{InstanceID: "00000000-0000-4000-8000-000000000001", VaultID: "00000000-0000-4000-8000-000000000002"}
 )
+
+const parserFuzzStoredEnvelopeGeneration uint64 = 0
 
 var strictJSONFuzzTargets = []struct {
 	name           string
@@ -31,15 +35,11 @@ var strictJSONFuzzTargets = []struct {
 	},
 	{
 		name:           "put envelope request",
-		acceptedSeeds:  [][]byte{append([]byte(`{"expected_generation":"0","new_generation":"1","envelope":`), append(canonicalBaseVaultEnvelopeFuzzSeed, '}')...)},
+		acceptedSeeds:  [][]byte{canonicalPutEnvelopeRequestFuzzSeed},
 		newDestination: func() any { return &putEnvelopeRequest{} },
 		validate: func(destination any) error {
 			request := *destination.(*putEnvelopeRequest)
-			expectedGeneration, err := parseUint64(request.ExpectedGeneration)
-			if err != nil {
-				return err
-			}
-			newGeneration, err := validatePutEnvelopeRequestGenerations(request, expectedGeneration)
+			newGeneration, err := validatePutEnvelopeRequestGenerations(request, parserFuzzStoredEnvelopeGeneration)
 			if err != nil {
 				return err
 			}
@@ -114,6 +114,7 @@ func FuzzDecodeStrictJSON(f *testing.F) {
 			f.Add(seed)
 		}
 	}
+	f.Add(mismatchedPutEnvelopeGenerationFuzzSeed)
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		for _, target := range strictJSONFuzzTargets {
 			first := target.newDestination()
@@ -161,6 +162,25 @@ func FuzzDecodeStrictJSON(f *testing.F) {
 			}
 		}
 	})
+}
+
+func TestPutEnvelopeFuzzValidationUsesFixedStoredGeneration(t *testing.T) {
+	var request putEnvelopeRequest
+	if err := decodeStrict(mismatchedPutEnvelopeGenerationFuzzSeed, &request); err != nil {
+		t.Fatalf("decode mismatched put-envelope generation seed: %v", err)
+	}
+	if _, err := validatePutEnvelopeRequestGenerations(request, parserFuzzStoredEnvelopeGeneration); err == nil {
+		t.Fatal("put-envelope fuzz validation accepted a request that mismatches fixed stored generation zero")
+	}
+	for _, target := range strictJSONFuzzTargets {
+		if target.name == "put envelope request" {
+			if err := target.validate(&request); err == nil {
+				t.Fatal("put-envelope semantic callback accepted the fixed-state mismatch seed")
+			}
+			return
+		}
+	}
+	t.Fatal("put-envelope strict JSON target is missing")
 }
 
 func TestFuzzDecodeStrictJSONHasAcceptedSeedsForEveryDestination(t *testing.T) {
