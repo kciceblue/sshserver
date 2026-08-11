@@ -359,11 +359,15 @@ func verifyGoBuildMetadata(payload []byte, target deployment.Target, release, so
 	if !bytes.Contains(payload, []byte(attestation)) {
 		return fmt.Errorf("%s release artifact does not contain its exact frozen build attestation", targetKey(target))
 	}
-	info, err := debugbuildinfo.Read(bytes.NewReader(payload))
+	info, err := parseReleaseBundleGoBuildInfo(payload)
 	if err != nil {
 		return fmt.Errorf("read Go build metadata for %s: %w", targetKey(target), err)
 	}
 	return validateGoBuildInfo(info, target, sourceRevision, toolchain)
+}
+
+func parseReleaseBundleGoBuildInfo(payload []byte) (*debugbuildinfo.BuildInfo, error) {
+	return debugbuildinfo.Read(bytes.NewReader(payload))
 }
 
 func validateGoBuildInfo(info *runtimedebug.BuildInfo, target deployment.Target, sourceRevision, toolchain string) error {

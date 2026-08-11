@@ -373,6 +373,16 @@ func loadCanonicalDeploymentJSON(path string, destination any) error {
 	if err != nil {
 		return err
 	}
+	return decodeCanonicalDeploymentJSON(payload, destination)
+}
+
+// decodeCanonicalDeploymentJSON is the pure parser shared by deployment state
+// and journal loading. Filesystem ownership checks stay in readDeploymentFile;
+// byte grammar and canonicalization stay fuzzable here.
+func decodeCanonicalDeploymentJSON(payload []byte, destination any) error {
+	if len(payload) == 0 || len(payload) > maxDeploymentFileBytes {
+		return errors.New("deployment metadata is outside its size boundary")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {

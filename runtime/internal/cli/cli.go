@@ -587,22 +587,35 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 	if err != nil || len(payload) == 0 || len(payload) > 4096 {
 		return errors.New("enrollment service returned an invalid response")
 	}
-	var response struct {
-		ProtocolVersion string `json:"protocol_version"`
-		InstanceID      string `json:"instance_id"`
-		VaultID         string `json:"vault_id"`
-		InstanceSecret  string `json:"instance_secret"`
-		EnrollmentGrant string `json:"enrollment_grant"`
-		ExpiresAt       string `json:"expires_at"`
-		LoopbackPort    int    `json:"loopback_port"`
+	response, err := decodeEnrollmentCreateResponse(payload)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(runner.Stdout).Encode(response)
+}
+
+type enrollmentCreateResponse struct {
+	ProtocolVersion string `json:"protocol_version"`
+	InstanceID      string `json:"instance_id"`
+	VaultID         string `json:"vault_id"`
+	InstanceSecret  string `json:"instance_secret"`
+	EnrollmentGrant string `json:"enrollment_grant"`
+	ExpiresAt       string `json:"expires_at"`
+	LoopbackPort    int    `json:"loopback_port"`
+}
+
+func decodeEnrollmentCreateResponse(payload []byte) (enrollmentCreateResponse, error) {
+	var response enrollmentCreateResponse
+	if len(payload) == 0 || len(payload) > 4096 {
+		return response, errors.New("enrollment service returned an invalid response")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&response); err != nil {
-		return errors.New("enrollment service returned an invalid response")
+		return enrollmentCreateResponse{}, errors.New("enrollment service returned an invalid response")
 	}
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return errors.New("enrollment service returned trailing data")
+		return enrollmentCreateResponse{}, errors.New("enrollment service returned trailing data")
 	}
 	secret, secretErr := base64.RawURLEncoding.Strict().DecodeString(response.InstanceSecret)
 	grant, grantErr := base64.RawURLEncoding.Strict().DecodeString(response.EnrollmentGrant)
@@ -612,19 +625,19 @@ func (runner Runner) runEnrollment(ctx context.Context, args []string) error {
 		base64.RawURLEncoding.EncodeToString(secret) != response.InstanceSecret ||
 		base64.RawURLEncoding.EncodeToString(grant) != response.EnrollmentGrant ||
 		response.LoopbackPort < 1 || response.LoopbackPort > 65535 {
-		return errors.New("enrollment service returned an invalid response")
+		return enrollmentCreateResponse{}, errors.New("enrollment service returned an invalid response")
 	}
 	if _, err := uuidv4.Parse(response.InstanceID); err != nil {
-		return errors.New("enrollment service returned an invalid response")
+		return enrollmentCreateResponse{}, errors.New("enrollment service returned an invalid response")
 	}
 	if _, err := uuidv4.Parse(response.VaultID); err != nil || response.VaultID == response.InstanceID {
-		return errors.New("enrollment service returned an invalid response")
+		return enrollmentCreateResponse{}, errors.New("enrollment service returned an invalid response")
 	}
 	parsedExpiry, err := time.Parse("2006-01-02T15:04:05.000Z", response.ExpiresAt)
 	if err != nil || parsedExpiry.Format("2006-01-02T15:04:05.000Z") != response.ExpiresAt {
-		return errors.New("enrollment service returned an invalid response")
+		return enrollmentCreateResponse{}, errors.New("enrollment service returned an invalid response")
 	}
-	return json.NewEncoder(runner.Stdout).Encode(response)
+	return response, nil
 }
 
 func (runner Runner) runEndpoint(args []string) error {
@@ -791,10 +804,23 @@ func (runner Runner) runHealth(ctx context.Context, args []string) error {
 	if len(payload) > 1024 {
 		return errors.New("health response exceeds 1024 bytes")
 	}
-	var body struct {
-		Status          string `json:"status"`
-		ProtocolVersion string `json:"protocol_version"`
+	if err := decodeHealthResponse(payload); err != nil {
+		return err
 	}
+	_, err = fmt.Fprintln(runner.Stdout, "ok")
+	return err
+}
+
+type healthResponse struct {
+	Status          string `json:"status"`
+	ProtocolVersion string `json:"protocol_version"`
+}
+
+func decodeHealthResponse(payload []byte) error {
+	if len(payload) > 1024 {
+		return errors.New("health response exceeds 1024 bytes")
+	}
+	var body healthResponse
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&body); err != nil {
@@ -807,8 +833,7 @@ func (runner Runner) runHealth(ctx context.Context, args []string) error {
 	if body.Status != "ok" || body.ProtocolVersion != config.ProtocolMajor {
 		return errors.New("health returned an invalid response")
 	}
-	_, err = fmt.Fprintln(runner.Stdout, "ok")
-	return err
+	return nil
 }
 
 func (runner Runner) runService(args []string) error {

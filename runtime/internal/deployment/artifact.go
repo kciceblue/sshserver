@@ -122,7 +122,7 @@ func VerifyArtifactSource(path string, expected InstalledRelease) error {
 	if !bytes.Contains(snapshot, []byte(attestation)) {
 		return errors.New("artifact does not contain its exact frozen release attestation")
 	}
-	metadata, err := debugbuildinfo.Read(bytes.NewReader(snapshot))
+	metadata, err := parseArtifactGoBuildInfo(snapshot)
 	if err != nil {
 		return fmt.Errorf("read artifact Go build metadata: %w", err)
 	}
@@ -130,6 +130,10 @@ func VerifyArtifactSource(path string, expected InstalledRelease) error {
 		return err
 	}
 	return nil
+}
+
+func parseArtifactGoBuildInfo(snapshot []byte) (*debugbuildinfo.BuildInfo, error) {
+	return debugbuildinfo.Read(bytes.NewReader(snapshot))
 }
 
 // VerifyReleaseFileSource applies the same immutable installer-input checks to
