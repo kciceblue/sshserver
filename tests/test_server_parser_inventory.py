@@ -15,6 +15,7 @@ EXPECTED_SIGNALS = {
         r"\bfunc\s+\(connection\s+\*headerLimitConn\)\s+Read\s*\("
     ),
     "http_request_id_header_parser": r"\bfunc\s+requestIDValues\s*\(",
+    "http_transport_validator": r"\bfunc\s+validateTransport\s*\(",
     "install_command_parser": r"\bfunc\s+InstallCommand\s*\(",
     "installed_artifact_filename_validator": (
         r"\bfunc\s+validateRemovableArtifact\s*\("
@@ -252,6 +253,13 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertIn("requestIDValues(payload)", server_fuzzer)
         self.assertIn("&headerLimitConn{", server_fuzzer)
 
+        http_fuzzer = (
+            ROOT / "runtime/internal/httpapi/handler_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("func FuzzValidateTransportRequest(", http_fuzzer)
+        self.assertIn("validateTransport(first)", http_fuzzer)
+        self.assertIn("transportRequestMutation(mutation)", http_fuzzer)
+
         deployment_fuzzer = (
             ROOT / "runtime/internal/deployment/metadata_fuzz_test.go"
         ).read_text(encoding="utf-8")
@@ -260,6 +268,7 @@ class ServerParserInventoryTests(unittest.TestCase):
             deployment_fuzzer,
         )
         self.assertIn("parseArtifactGoBuildInfo(executable)", deployment_fuzzer)
+        self.assertIn("ValidateReleaseIdentity(first, expected)", deployment_fuzzer)
 
         removal_fuzzer = (
             ROOT / "runtime/internal/deployment/remove_artifacts_fuzz_test.go"

@@ -66,6 +66,7 @@ runtime-fuzz-smoke:
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzValidLocalMainVersion$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseReleaseBundleGoBuildInfo$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzHeaderContainsToken$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/httpapi
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzValidateTransportRequest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/httpapi
 
 runtime-build-one:
 	test -n "$(RUNTIME_GOOS)"

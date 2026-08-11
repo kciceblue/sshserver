@@ -9,6 +9,7 @@
       "header_token_parser": "\\bfunc\\s+headerContainsToken\\s*\\(",
       "http_request_head_limit_parser": "\\bfunc\\s+\\(connection\\s+\\*headerLimitConn\\)\\s+Read\\s*\\(",
       "http_request_id_header_parser": "\\bfunc\\s+requestIDValues\\s*\\(",
+      "http_transport_validator": "\\bfunc\\s+validateTransport\\s*\\(",
       "install_command_parser": "\\bfunc\\s+InstallCommand\\s*\\(",
       "installed_artifact_filename_validator": "\\bfunc\\s+validateRemovableArtifact\\s*\\(",
       "json_decoder_constructor": "\\bjson\\.NewDecoder\\s*\\(",
@@ -21,7 +22,7 @@
       "url_parser_call": "\\burl\\.(?:Parse|ParseQuery)\\s*\\("
     },
     "sourceFileCount": 24,
-    "sourceSignalCount": 69,
+    "sourceSignalCount": 70,
     "sourceSignalCounts": {
       "runtime/internal/buildinfo/buildinfo.go": {
         "parser_function_declaration": 1
@@ -61,7 +62,8 @@
         "parser_function_declaration": 1
       },
       "runtime/internal/httpapi/handler.go": {
-        "header_token_parser": 1
+        "header_token_parser": 1,
+        "http_transport_validator": 1
       },
       "runtime/internal/releasebundle/bundle.go": {
         "build_metadata_parser": 1,
@@ -211,6 +213,12 @@
       "testFile": "runtime/internal/server/server_fuzz_test.go",
       "testMethod": "FuzzHTTP1RequestHead"
     },
+    "http-transport-request": {
+      "corpus": "runtime/internal/httpapi/testdata/fuzz/FuzzValidateTransportRequest",
+      "package": "./internal/httpapi",
+      "testFile": "runtime/internal/httpapi/handler_fuzz_test.go",
+      "testMethod": "FuzzValidateTransportRequest"
+    },
     "release-identifier": {
       "corpus": "runtime/internal/releaseid/testdata/fuzz/FuzzReleaseIdentifier",
       "package": "./internal/releaseid",
@@ -292,8 +300,8 @@
       "sourceFiles": ["runtime/internal/releasebundle/bundle.go"]
     },
     {
-      "id": "http-transport-header-tokens",
-      "coverageOwners": ["http-header-tokens"],
+      "id": "http-transport-grammar",
+      "coverageOwners": ["http-header-tokens", "http-transport-request"],
       "sourceFiles": ["runtime/internal/httpapi/handler.go"]
     },
     {

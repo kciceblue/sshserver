@@ -128,14 +128,31 @@ func FuzzParseBuildIdentityJSON(f *testing.F) {
 		BuildToolchain: "go1.25.0", BuildIdentity: strings.Repeat("b", 64),
 		ProtocolVersion: "1", StorageSchema: "1",
 	}
+	expected := InstalledRelease{
+		Release:         seedIdentity.Release,
+		SourceRevision:  seedIdentity.SourceRevision,
+		BuildToolchain:  seedIdentity.BuildToolchain,
+		BuildIdentity:   seedIdentity.BuildIdentity,
+		ProtocolVersion: seedIdentity.ProtocolVersion,
+		StorageSchema:   seedIdentity.StorageSchema,
+	}
 	seed, err := json.Marshal(seedIdentity)
 	if err != nil {
 		f.Fatal(err)
+	}
+	if err := ValidateReleaseIdentity(seedIdentity, expected); err != nil {
+		f.Fatalf("accepted identity seed must satisfy production validation: %v", err)
 	}
 	f.Add(seed)
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		first, firstErr := parseIdentity(payload)
 		second, secondErr := parseIdentity(payload)
+		if firstErr == nil {
+			firstErr = ValidateReleaseIdentity(first, expected)
+		}
+		if secondErr == nil {
+			secondErr = ValidateReleaseIdentity(second, expected)
+		}
 		if (firstErr == nil) != (secondErr == nil) || first != second {
 			t.Fatalf("build identity parser is nondeterministic: first=%+v/%v second=%+v/%v", first, firstErr, second, secondErr)
 		}
@@ -145,6 +162,9 @@ func FuzzParseBuildIdentityJSON(f *testing.F) {
 				t.Fatal(err)
 			}
 			roundTrip, err := parseIdentity(encoded)
+			if err == nil {
+				err = ValidateReleaseIdentity(roundTrip, expected)
+			}
 			if err != nil || roundTrip != first {
 				t.Fatalf("build identity did not round trip: value=%+v parsed=%+v error=%v", first, roundTrip, err)
 			}

@@ -3,7 +3,7 @@
 This repository keeps coverage-guided Go fuzz targets at every source-derived
 project-owned runtime parsing boundary. The fail-closed inventory in
 `SERVER_PARSER_INVENTORY.json` scans non-vendored production Go source and maps
-all 69 current parser signals in 24 files to one or more executable owners.
+all 70 current parser signals in 24 files to one or more executable owners.
 The targets cover:
 
 - strict sync requests plus every V1 request DTO (`FuzzDecodeStrictJSON`);
@@ -17,8 +17,9 @@ The targets cover:
   `FuzzStoreScalarAndStoredParsers`);
 - immutable release manifests and deployment previews
   (`FuzzParsePinnedManifest`, `FuzzParseDeploymentPreview`);
-- canonical deployment state/journals, build-identity JSON, URLs, digests, and
-  sizes (`FuzzDecodeDeploymentMetadata`, `FuzzParseBuildIdentityJSON`,
+- canonical deployment state/journals, production-validated build-identity
+  JSON, URLs, digests, and sizes (`FuzzDecodeDeploymentMetadata`,
+  `FuzzParseBuildIdentityJSON`,
   `FuzzDeploymentScalarParsers`), plus Go executable build metadata through
   the production artifact decoder (`FuzzParseArtifactGoBuildInfo`) and the
   installed-artifact filename grammar (`FuzzValidateRemovableArtifactName`);
@@ -27,8 +28,9 @@ The targets cover:
 - owner-only admin-socket requests, raw HTTP/1 request-head limits and request
   IDs, and the CLI's strict loopback responses (`FuzzDecodeAdminRequest`,
   `FuzzHTTP1RequestHead`, `FuzzDecodeCLIResponses`);
-- comma-delimited HTTP `Connection` header tokens and their transport-level
-  upgrade rejection (`FuzzHeaderContainsToken`);
+- the complete HTTP transport request grammar plus comma-delimited
+  `Connection` header tokens (`FuzzValidateTransportRequest`,
+  `FuzzHeaderContainsToken`);
 - build attestations, UUIDv4, and release identifiers
   (`FuzzParseAttestation`, `FuzzParseUUIDv4`,
   `FuzzReleaseIdentifier`);
@@ -37,7 +39,7 @@ The targets cover:
   its production decoder (`FuzzParseReleaseBundleGoBuildInfo`); and
 - one-line installer URL/payload inputs (`FuzzInstallCommandInput`).
 
-All 23 targets have a checked-in minimized invalid seed under their package's
+All 24 targets have a checked-in minimized invalid seed under their package's
 `testdata/fuzz` directory. Structured owners construct canonical accepted
 seeds; each executable-metadata owner mutates a bounded copy of the current Go
 test executable through the exact production decoder, so successful metadata
