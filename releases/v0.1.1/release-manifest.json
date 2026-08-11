@@ -1,0 +1,57 @@
+{
+  "manifest_version": 1,
+  "release": "v0.1.1",
+  "source_revision": "b0ffa6280a74ea4399843e2f80bd50b1fdc29155",
+  "build_toolchain": "go1.25.0",
+  "protocol_version": "1",
+  "storage_schema": "1",
+  "download_origin": "https://kciceblue.github.io/sshserver",
+  "artifacts": [
+    {
+      "os": "linux",
+      "architecture": "amd64",
+      "build_identity": "6d09862e33e1fc9dd8718cfa23ab7745fe95bd9d6f5d0e42dbeaacb10cf28af7",
+      "url": "https://kciceblue.github.io/sshserver/releases/v0.1.1/sshserver-linux-amd64",
+      "bytes": 17835514,
+      "sha256": "24339f58e5a5c003f2d0c21ca577fa870cae566ff87a3282ed18060fb67268cc"
+    },
+    {
+      "os": "linux",
+      "architecture": "arm64",
+      "build_identity": "7156fecc0c82ad880d3f6ccbf9b263dbdc720ae15dc94ab2e7eba7f52dbd4d4c",
+      "url": "https://kciceblue.github.io/sshserver/releases/v0.1.1/sshserver-linux-arm64",
+      "bytes": 16841320,
+      "sha256": "8bb08aca1010c82e21d81c72f0d147761d277853676f7954496f375c068a1ceb"
+    },
+    {
+      "os": "darwin",
+      "architecture": "amd64",
+      "build_identity": "51fefa6a6c854ce9503bc359c18c3e5836f7971840fe2d3d9de01b4d6c1b1764",
+      "url": "https://kciceblue.github.io/sshserver/releases/v0.1.1/sshserver-darwin-amd64",
+      "bytes": 17828272,
+      "sha256": "55b76591e779d02becfac2f2d28fdc25d1e742a2e97d416e485fe107346b2510"
+    },
+    {
+      "os": "darwin",
+      "architecture": "arm64",
+      "build_identity": "ee8cb28899357d661e1fea34f24b955e3aef428f69663a499afc68c76c8ee3be",
+      "url": "https://kciceblue.github.io/sshserver/releases/v0.1.1/sshserver-darwin-arm64",
+      "bytes": 17182722,
+      "sha256": "f0aec9ff440d7bcdeaa5bb6a851feac7ba1f14828c34b5077ce230ce45f3543f"
+    }
+  ],
+  "release_files": [
+    {
+      "name": "LICENSE",
+      "url": "https://kciceblue.github.io/sshserver/releases/v0.1.1/LICENSE",
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "name": "NOTICE",
+      "url": "https://kciceblue.github.io/sshserver/releases/v0.1.1/NOTICE",
+      "bytes": 2175,
+      "sha256": "d06400efad26daf67b6fa6dd97e8acce6d391070789ea60762f8b9d8c99a29ea"
+    }
+  ]
+}
