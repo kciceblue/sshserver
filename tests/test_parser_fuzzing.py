@@ -19,9 +19,11 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "runtime/internal/deployment/metadata_fuzz_test.go#metadata": "FuzzDecodeDeploymentMetadata",
             "runtime/internal/deployment/metadata_fuzz_test.go#identity": "FuzzParseBuildIdentityJSON",
             "runtime/internal/deployment/metadata_fuzz_test.go#scalars": "FuzzDeploymentScalarParsers",
+            "runtime/internal/deployment/path_fuzz_test.go": "FuzzDeploymentPathGrammar",
             "runtime/internal/deployment/metadata_fuzz_test.go#go-buildinfo": "FuzzParseArtifactGoBuildInfo",
             "runtime/internal/deployment/remove_artifacts_fuzz_test.go": "FuzzValidateRemovableArtifactName",
             "runtime/internal/deployment/manager_fuzz_test.go": "FuzzServiceManagerOutput",
+            "runtime/internal/service/service_fuzz_test.go": "FuzzServiceDefinitionPaths",
             "runtime/internal/server/server_fuzz_test.go": "FuzzDecodeAdminRequest",
             "runtime/internal/server/server_fuzz_test.go#request-head": "FuzzHTTP1RequestHead",
             "runtime/internal/config/config_fuzz_test.go": "FuzzDecodeConfigJSON",
@@ -53,7 +55,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
         deterministic_budget = (
             "-fuzztime=64x -fuzzminimizetime=64x -parallel=1"
         )
-        self.assertEqual(makefile.count(deterministic_budget), 26)
+        self.assertEqual(makefile.count(deterministic_budget), 28)
         for target in (
             "FuzzDecodeStrictJSON",
             "FuzzStoredJSONShapes",
@@ -66,9 +68,11 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "FuzzDecodeDeploymentMetadata",
             "FuzzParseBuildIdentityJSON",
             "FuzzDeploymentScalarParsers",
+            "FuzzDeploymentPathGrammar",
             "FuzzParseArtifactGoBuildInfo",
             "FuzzValidateRemovableArtifactName",
             "FuzzServiceManagerOutput",
+            "FuzzServiceDefinitionPaths",
             "FuzzDecodeAdminRequest",
             "FuzzHTTP1RequestHead",
             "FuzzDecodeConfigJSON",

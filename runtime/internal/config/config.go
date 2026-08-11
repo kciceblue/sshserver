@@ -94,7 +94,7 @@ func DefaultStateDir() (string, error) {
 		return filepath.Join(home, "Library", "Application Support", "JustAnotherTerminal", "sshserver"), nil
 	case "linux":
 		if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
-			if !filepath.IsAbs(xdg) {
+			if !validAbsolutePath(xdg) {
 				return "", errors.New("XDG_STATE_HOME must be absolute")
 			}
 			return filepath.Join(xdg, "jat", "sshserver"), nil
@@ -190,7 +190,7 @@ func ValidateListener(address string) error {
 }
 
 func EnsureStateDirectory(path string) error {
-	if path == "" || !filepath.IsAbs(path) {
+	if !validAbsolutePath(path) {
 		return errors.New("state directory must be an absolute path")
 	}
 	created := false
@@ -225,7 +225,7 @@ func EnsureStateDirectory(path string) error {
 // surfaces use it instead of EnsureStateDirectory so a discovery attempt can
 // never turn a missing or insecure path into initialized state.
 func ValidateStateDirectory(path string) error {
-	if path == "" || !filepath.IsAbs(path) {
+	if !validAbsolutePath(path) {
 		return errors.New("state directory must be an absolute path")
 	}
 	info, err := os.Lstat(path)
@@ -247,7 +247,7 @@ func ValidateStateDirectory(path string) error {
 // PrepareProtectedFile creates an empty owner-only regular file atomically or
 // validates an existing one. O_EXCL prevents following a pre-existing symlink.
 func PrepareProtectedFile(path string, mode os.FileMode) error {
-	if strings.ContainsRune(path, '\x00') || !filepath.IsAbs(path) {
+	if !validAbsolutePath(path) {
 		return errors.New("protected file path must be absolute and contain no NUL")
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, mode)
@@ -347,7 +347,7 @@ func WriteSecret(path string, value []byte) error {
 }
 
 func WriteFileAtomic(path string, value []byte, mode os.FileMode) error {
-	if strings.ContainsRune(path, '\x00') || !filepath.IsAbs(path) {
+	if !validAbsolutePath(path) {
 		return errors.New("path must be absolute and contain no NUL")
 	}
 	if err := ValidateProtectedFile(path, mode); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -386,6 +386,10 @@ func WriteFileAtomic(path string, value []byte, mode os.FileMode) error {
 		return err
 	}
 	return ValidateProtectedFile(path, mode)
+}
+
+func validAbsolutePath(path string) bool {
+	return path != "" && strings.IndexByte(path, 0) < 0 && filepath.IsAbs(path)
 }
 
 func SameListeners(left, right []string) bool {

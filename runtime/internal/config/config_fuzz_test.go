@@ -35,7 +35,16 @@ func FuzzDecodeConfigJSON(f *testing.F) {
 		f.Add(target.acceptedSeed)
 	}
 	f.Add([]byte("127.0.0.1:37421"))
+	f.Add([]byte("/tmp/jat-state"))
 	f.Fuzz(func(t *testing.T, payload []byte) {
+		if len(payload) > maxConfigBytes+1 {
+			return
+		}
+		path := string(payload)
+		wantPath := len(payload) > 0 && payload[0] == '/' && !containsZeroByte(payload)
+		if got := validAbsolutePath(path); got != wantPath {
+			t.Fatalf("absolute-path acceptance=%v want=%v for %q", got, wantPath, path)
+		}
 		firstListenerErr := ValidateListener(string(payload))
 		secondListenerErr := ValidateListener(string(payload))
 		if (firstListenerErr == nil) != (secondListenerErr == nil) {
@@ -77,6 +86,15 @@ func FuzzDecodeConfigJSON(f *testing.F) {
 			}
 		}
 	})
+}
+
+func containsZeroByte(value []byte) bool {
+	for _, item := range value {
+		if item == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func TestFuzzDecodeConfigJSONAcceptedSeeds(t *testing.T) {

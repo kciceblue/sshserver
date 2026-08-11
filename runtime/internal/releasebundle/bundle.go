@@ -77,15 +77,8 @@ func Generate(options Options) (Result, error) {
 }
 
 func generate(options Options, verifyMetadata metadataVerifier) (Result, error) {
-	for name, value := range map[string]string{
-		"artifact directory":     options.ArtifactDir,
-		"distribution directory": options.DistDir,
-		"license path":           options.LicensePath,
-		"notice path":            options.NoticePath,
-	} {
-		if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value || strings.ContainsRune(value, '\x00') {
-			return Result{}, fmt.Errorf("%s must be canonical and absolute", name)
-		}
+	if err := validateBundleInputPaths(options); err != nil {
+		return Result{}, err
 	}
 	if verifyMetadata == nil {
 		return Result{}, errors.New("release metadata verifier is required")
@@ -251,6 +244,20 @@ func generate(options Options, verifyMetadata metadataVerifier) (Result, error) 
 		}
 	}
 	return result, nil
+}
+
+func validateBundleInputPaths(options Options) error {
+	for name, value := range map[string]string{
+		"artifact directory":     options.ArtifactDir,
+		"distribution directory": options.DistDir,
+		"license path":           options.LicensePath,
+		"notice path":            options.NoticePath,
+	} {
+		if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value || strings.ContainsRune(value, '\x00') {
+			return fmt.Errorf("%s must be canonical and absolute", name)
+		}
+	}
+	return nil
 }
 
 // PreviewLine is the deterministic, shell-neutral SSH exec command for release

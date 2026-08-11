@@ -8,9 +8,21 @@ ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = ROOT / "docs" / "SERVER_PARSER_INVENTORY.json"
 
 EXPECTED_SIGNALS = {
+    "base64_decoder_call": (
+        r"\bbase64\.(?:RawURL|URL|RawStd|Std)Encoding"
+        r"(?:\.Strict\(\))?\.Decode(?:String)?\s*\("
+    ),
+    "binary_integer_decoder_call": (
+        r"\bbinary\.(?:BigEndian|LittleEndian)\.Uint(?:16|32|64)\s*\("
+    ),
     "build_metadata_parser": r"\bfunc\s+validLocalMainVersion\s*\(",
+    "filesystem_path_grammar_call": (
+        r"\bfilepath\."
+        r"(?:Base|Clean|Dir|EvalSymlinks|IsAbs|Rel|ToSlash)\s*\("
+    ),
     "go_buildinfo_decoder_call": r"\bdebugbuildinfo\.Read\s*\(",
     "header_token_parser": r"\bfunc\s+headerContainsToken\s*\(",
+    "hex_decoder_call": r"\bhex\.(?:Decode|DecodeString)\s*\(",
     "http_request_head_limit_parser": (
         r"\bfunc\s+\(connection\s+\*headerLimitConn\)\s+Read\s*\("
     ),
@@ -23,12 +35,25 @@ EXPECTED_SIGNALS = {
     "json_decoder_constructor": r"\bjson\.NewDecoder\s*\(",
     "json_unmarshal_call": r"\bjson\.Unmarshal\s*\(",
     "listener_validator": r"\bfunc\s+ValidateListener\s*\(",
+    "network_address_parser_call": (
+        r"\bnet\.(?:SplitHostPort|ParseIP|ParseCIDR)\s*\("
+    ),
     "operation_receipt_key_parser": r"\bfunc\s+validOperationReceiptKey\s*\(",
     "parser_function_declaration": (
-        r"\bfunc\s+(?:(?:P|p)arse|decode)[A-Za-z0-9_]*\s*\("
+        r"\bfunc\s+(?:[Pp]arse|[Dd]ecode)[A-Za-z0-9_]*\s*\("
+    ),
+    "regexp_grammar_constructor": r"\bregexp\.(?:MustCompile|Compile)\s*\(",
+    "regexp_match_call": (
+        r"\b[A-Za-z_][A-Za-z0-9_]*\."
+        r"(?:MatchString|FindStringSubmatch)\s*\("
     ),
     "release_identifier_validator": r"\bfunc\s+Valid\s*\(",
     "route_identifier_parser": r"\bfunc\s+pathIdentifier\s*\(",
+    "scanner_constructor": r"\bbufio\.NewScanner\s*\(",
+    "service_definition_grammar": (
+        r"\bfunc\s+(?:Render|validPathText|validateServicePath|"
+        r"quoteSystemd(?:ExecArgument|Path)?)\s*\("
+    ),
     "service_manager_output_parser": (
         r"(?:\bfunc\s+(?:(?:\(adapter\s+ServiceManagerAdapter\)\s+IsActive)|"
         r"(?:managerUnavailable|managerNotLoaded|systemdInactiveState))\s*\(|"
@@ -38,7 +63,19 @@ EXPECTED_SIGNALS = {
         r"\bfunc\s+(?:inspectSchemaState|validateSchemaState|readSchemaTables|"
         r"schemaTablesEqual)\s*\("
     ),
+    "strconv_parser_call": (
+        r"\bstrconv\.(?:Atoi|ParseBool|ParseFloat|ParseInt|ParseUint)\s*\("
+    ),
+    "slash_path_grammar_call": r"\b(?:path|pathpkg)\.(?:Base|Clean)\s*\(",
+    "string_split_parser_call": (
+        r"\b(?:bytes|strings)\."
+        r"(?:Split|SplitN|Fields|FieldsFunc|Cut|CutPrefix|"
+        r"Trim|TrimSpace|TrimPrefix|TrimSuffix)\s*\("
+    ),
+    "time_parser_call": r"\btime\.Parse\s*\(",
     "url_parser_call": r"\burl\.(?:Parse|ParseQuery)\s*\(",
+    "utf8_text_validator_call": r"\butf8\.ValidString\s*\(",
+    "xml_text_escape_call": r"\bxml\.EscapeText\s*\(",
 }
 
 
@@ -210,6 +247,112 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertIn("exactSchemaFuzzInspection", fuzzer)
         self.assertIn("maps.Equal(fixture.tables, candidate.tables)", fuzzer)
         self.assertIn('"unexpected", "CREATE TABLE unexpected (value TEXT)"', fuzzer)
+
+    def test_generic_grammar_entrypoints_are_fail_closed(self) -> None:
+        derived = self.derived_source_signal_counts()
+        totals = {
+            signal: sum(counts.get(signal, 0) for counts in derived.values())
+            for signal in EXPECTED_SIGNALS
+        }
+        self.assertEqual(totals["scanner_constructor"], 0)
+        self.assertEqual(totals["regexp_grammar_constructor"], 14)
+        self.assertEqual(totals["regexp_match_call"], 45)
+        self.assertEqual(totals["string_split_parser_call"], 29)
+        self.assertEqual(totals["strconv_parser_call"], 4)
+        self.assertEqual(totals["filesystem_path_grammar_call"], 59)
+        self.assertEqual(totals["slash_path_grammar_call"], 6)
+        self.assertEqual(totals["network_address_parser_call"], 7)
+        self.assertEqual(totals["time_parser_call"], 5)
+        self.assertEqual(totals["hex_decoder_call"], 3)
+        self.assertEqual(totals["base64_decoder_call"], 3)
+        self.assertEqual(totals["binary_integer_decoder_call"], 1)
+        self.assertEqual(totals["parser_function_declaration"], 25)
+        self.assertEqual(totals["utf8_text_validator_call"], 1)
+        self.assertEqual(totals["xml_text_escape_call"], 1)
+
+    def test_service_and_deployment_path_grammars_have_exact_owners(self) -> None:
+        service = (ROOT / "runtime/internal/service/service.go").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            self.signal_counts(service)["service_definition_grammar"], 6
+        )
+        service_fuzzer = (
+            ROOT / "runtime/internal/service/service_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for entrypoint in {
+            "validPathText(binary)",
+            "quoteSystemdExecArgument",
+            "quoteSystemdPath",
+            "quoteSystemd(value",
+            'validateServicePath("service output path", outputPath, false)',
+            "Render(platform, binary, stateDir)",
+        }:
+            with self.subTest(service_entrypoint=entrypoint):
+                self.assertIn(entrypoint, service_fuzzer)
+        for oracle in {
+            "exactServicePathText",
+            "exactServicePath",
+            "exactSystemdQuote",
+            "exactServiceDefinition",
+            "exactXMLEscape",
+        }:
+            with self.subTest(service_oracle=oracle):
+                self.assertIn(oracle, service_fuzzer)
+        oracle_source = service_fuzzer[
+            service_fuzzer.index("func exactServicePathText") :
+        ]
+        for production_helper in {
+            "validPathText(",
+            "validateServicePath(",
+            "quoteSystemd(",
+            "Render(",
+        }:
+            self.assertNotIn(production_helper, oracle_source)
+
+        deployment_fuzzer = (
+            ROOT / "runtime/internal/deployment/path_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for entrypoint in {
+            "validateAbsoluteCanonicalPath(candidate)",
+            "canonicalAbsolutePath(candidate)",
+            "requireStrictDescendant(homeDir, installRoot",
+            "NewLayout(homeDir, installRoot, stateDir)",
+        }:
+            with self.subTest(deployment_entrypoint=entrypoint):
+                self.assertIn(entrypoint, deployment_fuzzer)
+        self.assertIn("exactDeploymentCanonicalPath", deployment_fuzzer)
+        self.assertIn("exactStrictDescendant", deployment_fuzzer)
+
+        installer_fuzzer = (
+            ROOT / "runtime/internal/releasebundle/installer_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("validateInstallerRenderOptions(options)", installer_fuzzer)
+        self.assertIn("exactInstallerRenderOptions(options)", installer_fuzzer)
+
+        bundle_fuzzer = (
+            ROOT / "runtime/internal/releasebundle/bundle_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("validateBundleInputPaths(options)", bundle_fuzzer)
+        self.assertIn("exactBundleInputPaths(options)", bundle_fuzzer)
+
+        cli_fuzzer = (
+            ROOT / "runtime/internal/cli/response_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("discoverableIPv4LoopbackPort(listeners)", cli_fuzzer)
+        self.assertIn("exactEndpointPort(portText)", cli_fuzzer)
+        self.assertIn("filepathAbs(string(payload))", cli_fuzzer)
+
+        config_fuzzer = (
+            ROOT / "runtime/internal/config/config_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("validAbsolutePath(path)", config_fuzzer)
+        self.assertIn("containsZeroByte(payload)", config_fuzzer)
+
+        stored_fuzzer = (
+            ROOT / "runtime/internal/store/scalar_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("decodeUint64Error([]byte(numberText))", stored_fuzzer)
 
     def test_persisted_canonical_destination_inventory_is_exact(self) -> None:
         source = (
@@ -394,8 +537,10 @@ class ServerParserInventoryTests(unittest.TestCase):
             set(exclusions),
             {
                 "conformance-tool",
+                "scanner-entrypoints",
                 "stdlib-cli-flags-and-static-templates",
                 "tests-and-vendored-runtime",
+                "validated-derived-path-and-listener-consumers",
             },
         )
         for identifier, reason in exclusions.items():

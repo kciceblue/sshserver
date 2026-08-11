@@ -34,6 +34,7 @@ func FuzzValidLocalMainVersion(f *testing.F) {
 		}
 		f.Add(seed.version, seed.revision, seed.vcsTime)
 	}
+	f.Add("/tmp/artifacts", "/tmp/dist", "/tmp/LICENSE")
 	f.Fuzz(func(t *testing.T, version, sourceRevision, vcsTime string) {
 		if len(version) > 4096 || len(sourceRevision) > 4096 || len(vcsTime) > 4096 {
 			return
@@ -42,6 +43,18 @@ func FuzzValidLocalMainVersion(f *testing.F) {
 		second := validLocalMainVersion(version, sourceRevision, vcsTime)
 		if first != second {
 			t.Fatal("local-main build-metadata acceptance changed across identical input")
+		}
+		options := Options{
+			ArtifactDir: version,
+			DistDir:     sourceRevision,
+			LicensePath: vcsTime,
+			NoticePath:  version,
+		}
+		firstPathErr := validateBundleInputPaths(options)
+		secondPathErr := validateBundleInputPaths(options)
+		wantPaths := exactBundleInputPaths(options)
+		if (firstPathErr == nil) != wantPaths || (secondPathErr == nil) != wantPaths {
+			t.Fatalf("bundle input-path acceptance first=%v second=%v want=%v", firstPathErr == nil, secondPathErr == nil, wantPaths)
 		}
 		if !first || version == "" || version == "(devel)" {
 			return
@@ -61,4 +74,31 @@ func FuzzValidLocalMainVersion(f *testing.F) {
 			}
 		}
 	})
+}
+
+func exactBundleInputPaths(options Options) bool {
+	for _, candidate := range []string{options.ArtifactDir, options.DistDir, options.LicensePath, options.NoticePath} {
+		if !exactBundleCanonicalPath(candidate) {
+			return false
+		}
+	}
+	return true
+}
+
+func exactBundleCanonicalPath(value string) bool {
+	if value == "" || value[0] != '/' || strings.IndexByte(value, 0) >= 0 {
+		return false
+	}
+	if value == "/" {
+		return true
+	}
+	if strings.HasSuffix(value, "/") || strings.Contains(value, "//") {
+		return false
+	}
+	for _, component := range strings.Split(value[1:], "/") {
+		if component == "" || component == "." || component == ".." {
+			return false
+		}
+	}
+	return true
 }

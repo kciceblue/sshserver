@@ -126,7 +126,7 @@ func (lease *ManagedActiveLease) Close() error {
 }
 
 func locateDeploymentExecutable(executable string) (deploymentExecutableLocation, error) {
-	if executable == "" || !filepath.IsAbs(executable) || filepath.Clean(executable) != executable {
+	if err := validateAbsoluteCanonicalPath(executable); err != nil {
 		return deploymentExecutableLocation{}, ErrNotDeployedExecutable
 	}
 	resolvedExecutable, err := filepath.EvalSymlinks(executable)
