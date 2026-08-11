@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import os
 import re
 import subprocess
@@ -53,22 +54,26 @@ class SelfHostDocumentationTests(unittest.TestCase):
             "install-command.txt",
             GUIDE,
         )
-        self.assertIn("test \"$(wc -c", GUIDE)
+        self.assertIn("printf '%s' \"$JAT_INSTALL_PROGRAM\" | wc -c", GUIDE)
         self.assertIn("= 5779", GUIDE)
         self.assertIn(
             "485f80db51a14b1001ee58f5ed3174090d22fa6bf00d8e3324b8e94e87210be6",
             GUIDE,
         )
-        self.assertIn('/bin/sh "$JAT_INSTALL_COMMAND"', GUIDE)
+        self.assertIn('/bin/sh -c "$JAT_INSTALL_PROGRAM" install-command.txt', GUIDE)
+        self.assertNotIn('/bin/sh "$JAT_INSTALL_COMMAND"', GUIDE)
         for option in ("--disable", "--tlsv1.2", "--max-filesize 5779"):
             self.assertIn(option, GUIDE)
         self.assertIn("mktemp -d", GUIDE)
         self.assertIn("command -v sha256sum", GUIDE)
-        self.assertIn("shasum -a 256 -c -", GUIDE)
+        self.assertIn("shasum -a 256", GUIDE)
         self.assertIn("PATH=/usr/bin:/bin", GUIDE)
         self.assertIn("LC_ALL=C", GUIDE)
         self.assertIn('case "$JAT_INSTALL_COMMAND_DIR" in', GUIDE)
+        self.assertIn('exec 5< "$JAT_INSTALL_COMMAND"', GUIDE)
         self.assertIn('rm -f "$JAT_INSTALL_COMMAND"', GUIDE)
+        self.assertIn('/bin/cat <&5', GUIDE)
+        self.assertIn('JAT_INSTALL_PROGRAM=${JAT_INSTALL_WITH_SENTINEL%', GUIDE)
         self.assertIn('rmdir "$JAT_INSTALL_COMMAND_DIR"', GUIDE)
         shell_blocks = "\n".join(SHELL_BLOCKS)
         self.assertNotIn("rm -rf", shell_blocks)
@@ -79,6 +84,49 @@ class SelfHostDocumentationTests(unittest.TestCase):
             )
         )
         self.assertIn("Unverified response bytes are never piped into a shell", PACKAGING)
+
+    def test_verified_installer_execution_survives_path_replacement(self) -> None:
+        install_block = next(
+            block
+            for block in SHELL_BLOCKS
+            if "JAT_INSTALL_WITH_SENTINEL" in block
+        )
+        capture_start = install_block.index('exec 5< "$JAT_INSTALL_COMMAND"')
+        capture_end = install_block.index("unset JAT_INSTALL_PROGRAM")
+        capture = install_block[capture_start:capture_end]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = root / "install-command.txt"
+            result = root / "result"
+            trusted = f"printf '%s' trusted > {result}".encode()
+            malicious = f"printf '%s' malicious > {result}".encode()
+            command.write_bytes(trusted)
+            digest = hashlib.sha256(trusted).hexdigest()
+            capture = capture.replace("5779", str(len(trusted))).replace(
+                "485f80db51a14b1001ee58f5ed3174090d22fa6bf00d8e3324b8e94e87210be6",
+                digest,
+            )
+            capture = capture.replace(
+                'rm -f "$JAT_INSTALL_COMMAND"',
+                'rm -f "$JAT_INSTALL_COMMAND"\n'
+                f"printf '%s' {malicious.decode()!r} > \"$JAT_INSTALL_COMMAND\"",
+                1,
+            )
+            executed = subprocess.run(
+                ["/bin/sh"],
+                input=(
+                    "set -eu\n"
+                    "PATH=/usr/bin:/bin\n"
+                    f"JAT_INSTALL_COMMAND={command}\n"
+                    + capture
+                ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(executed.returncode, 0, executed.stderr)
+            self.assertEqual(result.read_text(encoding="utf-8"), "trusted")
 
     def test_every_shell_example_is_syntactically_valid(self) -> None:
         self.assertGreaterEqual(len(SHELL_BLOCKS), 9)
@@ -164,7 +212,7 @@ class SelfHostDocumentationTests(unittest.TestCase):
             "fail-fast copy while the server is stopped",
             "mode-0700 state directory",
             "with mode 0600",
-            "no `server.db-wal` or\n   `server.db-shm` file remains",
+            "no `server.db-wal`,\n   `server.db-shm`, or `server.db-journal` file remains",
             "recoverable sibling rather than overwriting",
             "do not repair the copy by deleting a file",
             "manifest-driven admin backup\nand atomic-restore CLI",
@@ -178,7 +226,7 @@ class SelfHostDocumentationTests(unittest.TestCase):
             "partial, invalid attempt; never reuse it as a backup",
             '"$JAT_BACKUP_DIR"/.[!.]*',
             'config != 1 || secret != 1 || database != 1 || state != 1',
-            'for name in .enrollment.sock server.db-wal server.db-shm',
+            'for name in .enrollment.sock server.db-wal server.db-shm server.db-journal',
         )
         for statement in required:
             with self.subTest(statement=statement):
@@ -344,6 +392,22 @@ class SelfHostDocumentationTests(unittest.TestCase):
             self.assertNotEqual(wal_result.returncode, 0)
             self.assertTrue(wal_backup.is_dir())
             self.assertEqual(list(wal_backup.iterdir()), [])
+            wal.unlink()
+
+            journal = source / "server.db-journal"
+            journal.write_bytes(b"pending rollback")
+            journal_backup = root / "journal-backup"
+            journal_result = subprocess.run(
+                ["/bin/sh"],
+                input=backup_block,
+                text=True,
+                capture_output=True,
+                env=environment | {"JAT_BACKUP_DIR": str(journal_backup)},
+                check=False,
+            )
+            self.assertNotEqual(journal_result.returncode, 0)
+            self.assertTrue(journal_backup.is_dir())
+            self.assertEqual(list(journal_backup.iterdir()), [])
 
     def test_human_and_native_acceptance_remain_nonclaims(self) -> None:
         self.assertIn("human under-15-minute\nwalkthrough", GUIDE)

@@ -83,30 +83,53 @@ export PATH LC_ALL
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy \
   NO_PROXY no_proxy CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR \
   PERL5OPT ENV BASH_ENV
-JAT_INSTALL_COMMAND_DIR="$(mktemp -d "${TMPDIR:-/tmp}/jat-install.XXXXXXXX")"
+umask 077
+JAT_INSTALL_COMMAND_DIR="$(mktemp -d "/tmp/jat-install.XXXXXXXX")"
 case "$JAT_INSTALL_COMMAND_DIR" in
-  "${TMPDIR:-/tmp}"/jat-install.*) ;;
+  /tmp/jat-install.*) ;;
   *) exit 1 ;;
 esac
-JAT_INSTALL_COMMAND="$JAT_INSTALL_COMMAND_DIR/install-command.txt"
-trap 'rm -f "$JAT_INSTALL_COMMAND"; rmdir "$JAT_INSTALL_COMMAND_DIR"' \
+test -d "$JAT_INSTALL_COMMAND_DIR"
+test ! -L "$JAT_INSTALL_COMMAND_DIR"
+chmod 700 "$JAT_INSTALL_COMMAND_DIR"
+cd "$JAT_INSTALL_COMMAND_DIR"
+test "$(pwd -P)" = "$JAT_INSTALL_COMMAND_DIR"
+JAT_INSTALL_COMMAND=./install-command.txt
+trap 'rm -f "$JAT_INSTALL_COMMAND"; cd /; rmdir "$JAT_INSTALL_COMMAND_DIR"' \
   EXIT HUP INT TERM
 /usr/bin/curl --disable --fail --silent --show-error --proto '=https' \
   --tlsv1.2 --connect-timeout 10 --max-time 30 --max-filesize 5779 \
   --output "$JAT_INSTALL_COMMAND" \
   https://kciceblue.github.io/sshserver/releases/v0.1.1/install-command.txt
-test "$(wc -c < "$JAT_INSTALL_COMMAND" | tr -d ' ')" = 5779
+test -f "$JAT_INSTALL_COMMAND"
+test ! -L "$JAT_INSTALL_COMMAND"
+chmod 400 "$JAT_INSTALL_COMMAND"
+exec 5< "$JAT_INSTALL_COMMAND"
+rm -f "$JAT_INSTALL_COMMAND"
+JAT_INSTALL_SENTINEL=__JAT_INSTALL_COMMAND_EOF_9f3c6a7b__
+JAT_INSTALL_WITH_SENTINEL="$(/bin/cat <&5; printf '%s' "$JAT_INSTALL_SENTINEL")"
+exec 5<&-
+case "$JAT_INSTALL_WITH_SENTINEL" in
+  *"$JAT_INSTALL_SENTINEL") ;;
+  *) exit 1 ;;
+esac
+JAT_INSTALL_PROGRAM=${JAT_INSTALL_WITH_SENTINEL%"$JAT_INSTALL_SENTINEL"}
+unset JAT_INSTALL_WITH_SENTINEL
+set -- $(printf '%s' "$JAT_INSTALL_PROGRAM" | wc -c)
+test "$#" = 1
+test "$1" = 5779
 if command -v sha256sum >/dev/null 2>&1; then
-  printf '%s  %s\n' \
-    485f80db51a14b1001ee58f5ed3174090d22fa6bf00d8e3324b8e94e87210be6 \
-    "$JAT_INSTALL_COMMAND" | sha256sum -c -
+  JAT_INSTALL_DIGEST="$(printf '%s' "$JAT_INSTALL_PROGRAM" | sha256sum)"
 else
-  printf '%s  %s\n' \
-    485f80db51a14b1001ee58f5ed3174090d22fa6bf00d8e3324b8e94e87210be6 \
-    "$JAT_INSTALL_COMMAND" | shasum -a 256 -c -
+  JAT_INSTALL_DIGEST="$(printf '%s' "$JAT_INSTALL_PROGRAM" | shasum -a 256)"
 fi
-/bin/cat "$JAT_INSTALL_COMMAND"
-/bin/sh "$JAT_INSTALL_COMMAND"
+set -- $JAT_INSTALL_DIGEST
+test "$#" -ge 1
+test "$1" = 485f80db51a14b1001ee58f5ed3174090d22fa6bf00d8e3324b8e94e87210be6
+unset JAT_INSTALL_DIGEST
+printf '%s' "$JAT_INSTALL_PROGRAM"
+/bin/sh -c "$JAT_INSTALL_PROGRAM" install-command.txt
+unset JAT_INSTALL_PROGRAM
 )
 ```
 
@@ -255,8 +278,8 @@ guessing target and contains device token hashes and metadata.
    ```
 
    For foreground mode, terminate and wait for the supervising process. Do not
-   continue until `.enrollment.sock` is gone and no `server.db-wal` or
-   `server.db-shm` file remains.
+   continue until `.enrollment.sock` is gone and no `server.db-wal`,
+   `server.db-shm`, or `server.db-journal` file remains.
 
 2. Set `JAT_BACKUP_DIR` to a path that does not exist. Copy the exact
    closed-state set into that fresh owner-only directory on encrypted storage:
@@ -271,7 +294,7 @@ guessing target and contains device token hashes and metadata.
        test -f "$JAT_STATE_DIR/$name"
        test ! -L "$JAT_STATE_DIR/$name"
      done
-     for name in .enrollment.sock server.db-wal server.db-shm; do
+     for name in .enrollment.sock server.db-wal server.db-shm server.db-journal; do
        test ! -e "$JAT_STATE_DIR/$name"
        test ! -L "$JAT_STATE_DIR/$name"
      done
