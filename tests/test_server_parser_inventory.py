@@ -252,6 +252,8 @@ class ServerParserInventoryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("requestIDValues(payload)", server_fuzzer)
         self.assertIn("&headerLimitConn{", server_fuzzer)
+        self.assertIn("splitRequestID", server_fuzzer)
+        self.assertIn("unterminated buffered header line", server_fuzzer)
 
         http_fuzzer = (
             ROOT / "runtime/internal/httpapi/handler_fuzz_test.go"

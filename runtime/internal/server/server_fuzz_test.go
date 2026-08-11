@@ -74,6 +74,18 @@ func FuzzHTTP1RequestHead(f *testing.F) {
 	unseenRequestID := bytes.Repeat([]byte("A"), httpapi.MaxHeaderBytes+1)
 	unseenRequestID = append(unseenRequestID, []byte("\r\nJAT-Request-ID: "+retainedRequestID+"\r\n\r\n")...)
 	f.Add(unseenRequestID)
+	splitRequestID := []byte("GET /v1/health HTTP/1.1\r\nX-Fill: ")
+	splitHeader := []byte("\r\nJAT-Request-ID: " + retainedRequestID)
+	splitRequestID = append(splitRequestID, bytes.Repeat(
+		[]byte("A"),
+		httpapi.MaxHeaderBytes+1-len(splitRequestID)-len(splitHeader),
+	)...)
+	splitRequestID = append(splitRequestID, splitHeader...)
+	if len(splitRequestID) != httpapi.MaxHeaderBytes+1 {
+		f.Fatal("split request-ID seed does not end at the buffered boundary")
+	}
+	splitRequestID = append(splitRequestID, []byte("x\r\n\r\n")...)
+	f.Add(splitRequestID)
 
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		if len(payload) > httpapi.MaxHeaderBytes+4096 {
@@ -126,6 +138,9 @@ func FuzzHTTP1RequestHead(f *testing.F) {
 			}
 			if bytes.Equal(payload, unseenRequestID) && limit.requestID == retainedRequestID {
 				t.Fatal("limited request retained a canonical request ID beyond the buffered prefix")
+			}
+			if bytes.Equal(payload, splitRequestID) && limit.requestID == retainedRequestID {
+				t.Fatal("limited request retained a request ID from an unterminated buffered header line")
 			}
 		}
 	})
