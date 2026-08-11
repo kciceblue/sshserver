@@ -84,9 +84,16 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy \
   NO_PROXY no_proxy CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR \
   PERL5OPT ENV BASH_ENV
 umask 077
-JAT_INSTALL_COMMAND_DIR="$(mktemp -d "/tmp/jat-install.XXXXXXXX")"
+cd /tmp
+JAT_INSTALL_BOOTSTRAP_ROOT="$(pwd -P)"
+case "$JAT_INSTALL_BOOTSTRAP_ROOT" in
+  /*) ;;
+  *) exit 1 ;;
+esac
+JAT_INSTALL_COMMAND_DIR="$(mktemp -d \
+  "$JAT_INSTALL_BOOTSTRAP_ROOT/jat-install.XXXXXXXX")"
 case "$JAT_INSTALL_COMMAND_DIR" in
-  /tmp/jat-install.*) ;;
+  "$JAT_INSTALL_BOOTSTRAP_ROOT"/jat-install.*) ;;
   *) exit 1 ;;
 esac
 test -d "$JAT_INSTALL_COMMAND_DIR"
@@ -97,10 +104,15 @@ test "$(pwd -P)" = "$JAT_INSTALL_COMMAND_DIR"
 JAT_INSTALL_COMMAND=./install-command.txt
 trap 'rm -f "$JAT_INSTALL_COMMAND"; cd /; rmdir "$JAT_INSTALL_COMMAND_DIR"' \
   EXIT HUP INT TERM
-/usr/bin/curl --disable --fail --silent --show-error --proto '=https' \
-  --tlsv1.2 --connect-timeout 10 --max-time 30 --max-filesize 5779 \
-  --output "$JAT_INSTALL_COMMAND" \
-  https://kciceblue.github.io/sshserver/releases/v0.1.1/install-command.txt
+(
+  ulimit -c 0 2>/dev/null || exit 96
+  trap '' XFSZ
+  ulimit -f 12 2>/dev/null || exit 97
+  /usr/bin/curl --disable --fail --silent --show-error --proto '=https' \
+    --tlsv1.2 --connect-timeout 10 --max-time 30 --max-filesize 5779 \
+    --output "$JAT_INSTALL_COMMAND" \
+    https://kciceblue.github.io/sshserver/releases/v0.1.1/install-command.txt
+)
 test -f "$JAT_INSTALL_COMMAND"
 test ! -L "$JAT_INSTALL_COMMAND"
 chmod 400 "$JAT_INSTALL_COMMAND"

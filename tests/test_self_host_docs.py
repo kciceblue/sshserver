@@ -69,7 +69,14 @@ class SelfHostDocumentationTests(unittest.TestCase):
         self.assertIn("shasum -a 256", GUIDE)
         self.assertIn("PATH=/usr/bin:/bin", GUIDE)
         self.assertIn("LC_ALL=C", GUIDE)
+        self.assertIn('JAT_INSTALL_BOOTSTRAP_ROOT="$(pwd -P)"', GUIDE)
+        self.assertIn(
+            '"$JAT_INSTALL_BOOTSTRAP_ROOT"/jat-install.*', GUIDE
+        )
         self.assertIn('case "$JAT_INSTALL_COMMAND_DIR" in', GUIDE)
+        self.assertIn("ulimit -c 0", GUIDE)
+        self.assertIn("trap '' XFSZ", GUIDE)
+        self.assertIn("ulimit -f 12", GUIDE)
         self.assertIn('exec 5< "$JAT_INSTALL_COMMAND"', GUIDE)
         self.assertIn('rm -f "$JAT_INSTALL_COMMAND"', GUIDE)
         self.assertIn('/bin/cat <&5', GUIDE)
@@ -84,6 +91,22 @@ class SelfHostDocumentationTests(unittest.TestCase):
             )
         )
         self.assertIn("Unverified response bytes are never piped into a shell", PACKAGING)
+
+    def test_installer_workspace_uses_the_physical_tmp_root(self) -> None:
+        install_block = next(
+            block
+            for block in SHELL_BLOCKS
+            if "JAT_INSTALL_WITH_SENTINEL" in block
+        )
+        prelude = install_block[: install_block.index("(\n  ulimit -c 0")]
+        result = subprocess.run(
+            ["/bin/sh"],
+            input=prelude + ")\n",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_verified_installer_execution_survives_path_replacement(self) -> None:
         install_block = next(
