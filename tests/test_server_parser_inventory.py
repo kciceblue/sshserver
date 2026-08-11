@@ -29,6 +29,11 @@ EXPECTED_SIGNALS = {
     ),
     "release_identifier_validator": r"\bfunc\s+Valid\s*\(",
     "route_identifier_parser": r"\bfunc\s+pathIdentifier\s*\(",
+    "service_manager_output_parser": (
+        r"(?:\bfunc\s+(?:(?:\(adapter\s+ServiceManagerAdapter\)\s+IsActive)|"
+        r"(?:managerUnavailable|managerNotLoaded|systemdInactiveState))\s*\(|"
+        r"\bresult\.(?:Stdout|Stderr)\b)"
+    ),
     "url_parser_call": r"\burl\.(?:Parse|ParseQuery)\s*\(",
 }
 
@@ -143,6 +148,38 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertNotEqual(
             simulated, self.inventory["sourceDerivation"]["sourceSignalCounts"]
         )
+
+    def test_service_manager_output_grammar_is_fail_closed_and_executed(self) -> None:
+        production = (
+            ROOT / "runtime/internal/deployment/manager.go"
+        ).read_text(encoding="utf-8")
+        counts = self.signal_counts(production)
+        self.assertEqual(counts["service_manager_output_parser"], 13)
+        self.assertNotEqual(
+            self.signal_counts(production + "\nvar extra = result.Stdout\n"),
+            counts,
+        )
+
+        fuzzer = (
+            ROOT / "runtime/internal/deployment/manager_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for production_entrypoint in {
+            "managerUnavailable(platform, result)",
+            "managerNotLoaded(platform, result)",
+            "adapter.IsActive(context.Background())",
+            "systemdInactiveState(strings.TrimSpace(stdout))",
+            "commandError(ManagerSystemd, \"fuzz status\", result, runErr)",
+        }:
+            with self.subTest(production_entrypoint=production_entrypoint):
+                self.assertIn(production_entrypoint, fuzzer)
+        for oracle in {
+            "exactManagerUnavailable",
+            "exactManagerNotLoaded",
+            "exactManagerIsActive",
+            "exactSystemdInactiveState",
+        }:
+            with self.subTest(oracle=oracle):
+                self.assertIn(oracle, fuzzer)
 
     def test_persisted_canonical_destination_inventory_is_exact(self) -> None:
         source = (
@@ -276,6 +313,23 @@ class ServerParserInventoryTests(unittest.TestCase):
             ROOT / "runtime/internal/deployment/remove_artifacts_fuzz_test.go"
         ).read_text(encoding="utf-8")
         self.assertIn("validateRemovableArtifact(name, stat)", removal_fuzzer)
+        self.assertIn("exactRemovableArtifactOracle(name, stat)", removal_fuzzer)
+        oracle = removal_fuzzer[
+            removal_fuzzer.index("func exactRemovableArtifactOracle") :
+            removal_fuzzer.index("func removableArtifactFuzzStat")
+        ]
+        self.assertNotIn("installedArtifactNamePattern", oracle)
+        self.assertNotIn("stagedArtifactTemporaryPattern", oracle)
+        for adversarial_seed in {
+            "sshserver-linux-amd64.backup",
+            "0123456789abcdef0123456789abcdeF",
+            "0o400 | 2<<9",
+            "0o400 | 1<<11",
+            "0o400 | 1<<12",
+            "0o400 | 1<<13",
+        }:
+            with self.subTest(adversarial_seed=adversarial_seed):
+                self.assertIn(adversarial_seed, removal_fuzzer)
 
         release_fuzzer = (
             ROOT / "runtime/internal/releasebundle/buildinfo_fuzz_test.go"

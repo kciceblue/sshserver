@@ -19,10 +19,11 @@
       "parser_function_declaration": "\\bfunc\\s+(?:(?:P|p)arse|decode)[A-Za-z0-9_]*\\s*\\(",
       "release_identifier_validator": "\\bfunc\\s+Valid\\s*\\(",
       "route_identifier_parser": "\\bfunc\\s+pathIdentifier\\s*\\(",
+      "service_manager_output_parser": "(?:\\bfunc\\s+(?:(?:\\(adapter\\s+ServiceManagerAdapter\\)\\s+IsActive)|(?:managerUnavailable|managerNotLoaded|systemdInactiveState))\\s*\\(|\\bresult\\.(?:Stdout|Stderr)\\b)",
       "url_parser_call": "\\burl\\.(?:Parse|ParseQuery)\\s*\\("
     },
-    "sourceFileCount": 24,
-    "sourceSignalCount": 70,
+    "sourceFileCount": 25,
+    "sourceSignalCount": 83,
     "sourceSignalCounts": {
       "runtime/internal/buildinfo/buildinfo.go": {
         "parser_function_declaration": 1
@@ -48,6 +49,9 @@
         "json_decoder_constructor": 1,
         "parser_function_declaration": 3,
         "url_parser_call": 2
+      },
+      "runtime/internal/deployment/manager.go": {
+        "service_manager_output_parser": 13
       },
       "runtime/internal/deployment/preview.go": {
         "json_decoder_constructor": 1,
@@ -231,6 +235,12 @@
       "testFile": "runtime/internal/releasebundle/buildinfo_fuzz_test.go",
       "testMethod": "FuzzParseReleaseBundleGoBuildInfo"
     },
+    "service-manager-output": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzServiceManagerOutput",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/manager_fuzz_test.go",
+      "testMethod": "FuzzServiceManagerOutput"
+    },
     "store-scalars-and-canonical": {
       "corpus": "runtime/internal/store/testdata/fuzz/FuzzStoreScalarAndStoredParsers",
       "package": "./internal/store",
@@ -288,6 +298,11 @@
       "id": "deployment-inputs-and-state",
       "coverageOwners": ["deployment-manifest", "deployment-preview", "deployment-metadata", "deployment-identity-json", "deployment-scalars", "artifact-go-build-metadata", "artifact-removal-filenames", "release-identifier", "uuid-v4"],
       "sourceFiles": ["runtime/internal/deployment/artifact.go", "runtime/internal/deployment/attestation.go", "runtime/internal/deployment/manifest.go", "runtime/internal/deployment/preview.go", "runtime/internal/deployment/remove_artifacts_unix.go", "runtime/internal/deployment/state.go"]
+    },
+    {
+      "id": "service-manager-output-grammar",
+      "coverageOwners": ["service-manager-output"],
+      "sourceFiles": ["runtime/internal/deployment/manager.go"]
     },
     {
       "id": "installer-url-and-payload",
