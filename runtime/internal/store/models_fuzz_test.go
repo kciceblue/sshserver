@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bytes"
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -26,6 +28,28 @@ func FuzzDecodeStrictJSON(f *testing.F) {
 			}
 			if firstErr == nil && !reflect.DeepEqual(first, second) {
 				t.Fatalf("strict decoder output changed across identical input: first=%+v second=%+v", first, second)
+			}
+			if firstErr != nil {
+				continue
+			}
+
+			encoded, err := json.Marshal(first)
+			if err != nil {
+				t.Fatalf("marshal accepted typed value: %v", err)
+			}
+			roundTripped := newDestination()
+			if err := decodeStrict(encoded, roundTripped); err != nil {
+				t.Fatalf("strict decoder rejected its typed value encoding: %v; encoded=%q", err, encoded)
+			}
+			if !reflect.DeepEqual(first, roundTripped) {
+				t.Fatalf("typed value changed across encode/decode: first=%+v round_tripped=%+v", first, roundTripped)
+			}
+			reencoded, err := json.Marshal(roundTripped)
+			if err != nil {
+				t.Fatalf("marshal round-tripped typed value: %v", err)
+			}
+			if !bytes.Equal(encoded, reencoded) {
+				t.Fatalf("encoding changed after round trip: first=%q second=%q", encoded, reencoded)
 			}
 		}
 	})

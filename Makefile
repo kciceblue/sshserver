@@ -43,10 +43,10 @@ runtime-go-check:
 	cd runtime && $(GO) test -mod=readonly ./...
 
 runtime-fuzz-smoke:
-	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeStrictJSON$$' -fuzztime=64x -parallel=1 ./internal/store
-	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParsePinnedManifest$$' -fuzztime=64x -parallel=1 ./internal/deployment
-	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseDeploymentPreview$$' -fuzztime=64x -parallel=1 ./internal/deployment
-	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeAdminRequest$$' -fuzztime=64x -parallel=1 ./internal/server
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeStrictJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParsePinnedManifest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseDeploymentPreview$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeAdminRequest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/server
 
 runtime-build-one:
 	test -n "$(RUNTIME_GOOS)"

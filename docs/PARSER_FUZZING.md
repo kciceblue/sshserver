@@ -13,7 +13,8 @@ Each target has a checked-in minimized invalid seed under its package's
 by the test. Accepted inputs must re-encode and reparse without changing bytes
 or typed values. Go's ordinary package test runs replay every seed. The
 repository gate also runs 64 coverage-guided mutations per target with one
-worker:
+worker. If a mutation fails, Go's crasher minimization is separately capped at
+64 executions rather than its time-based default:
 
 ```sh
 make runtime-fuzz-smoke

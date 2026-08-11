@@ -28,7 +28,10 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         check_line = next(line for line in makefile.splitlines() if line.startswith("check:"))
         self.assertIn("runtime-fuzz-smoke", check_line)
-        self.assertIn("-fuzztime=64x -parallel=1", makefile)
+        deterministic_budget = (
+            "-fuzztime=64x -fuzzminimizetime=64x -parallel=1"
+        )
+        self.assertEqual(makefile.count(deterministic_budget), 4)
         for target in (
             "FuzzDecodeStrictJSON",
             "FuzzParsePinnedManifest",
