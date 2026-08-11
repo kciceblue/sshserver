@@ -13,6 +13,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "runtime/internal/store/scalar_fuzz_test.go#scalars": "FuzzStoreScalarAndStoredParsers",
             "runtime/internal/store/dataplane_fuzz_test.go": "FuzzPathIdentifier",
             "runtime/internal/store/dataplane_fuzz_test.go#receipts": "FuzzOperationReceiptKey",
+            "runtime/internal/store/schema_fuzz_test.go": "FuzzSQLiteSchemaState",
             "runtime/internal/deployment/parser_fuzz_test.go": "FuzzParsePinnedManifest",
             "runtime/internal/deployment/parser_fuzz_test.go#preview": "FuzzParseDeploymentPreview",
             "runtime/internal/deployment/metadata_fuzz_test.go#metadata": "FuzzDecodeDeploymentMetadata",
@@ -52,13 +53,14 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
         deterministic_budget = (
             "-fuzztime=64x -fuzzminimizetime=64x -parallel=1"
         )
-        self.assertEqual(makefile.count(deterministic_budget), 25)
+        self.assertEqual(makefile.count(deterministic_budget), 26)
         for target in (
             "FuzzDecodeStrictJSON",
             "FuzzStoredJSONShapes",
             "FuzzStoreScalarAndStoredParsers",
             "FuzzPathIdentifier",
             "FuzzOperationReceiptKey",
+            "FuzzSQLiteSchemaState",
             "FuzzParsePinnedManifest",
             "FuzzParseDeploymentPreview",
             "FuzzDecodeDeploymentMetadata",

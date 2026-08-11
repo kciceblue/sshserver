@@ -34,6 +34,10 @@ EXPECTED_SIGNALS = {
         r"(?:managerUnavailable|managerNotLoaded|systemdInactiveState))\s*\(|"
         r"\bresult\.(?:Stdout|Stderr)\b)"
     ),
+    "sqlite_schema_state_parser": (
+        r"\bfunc\s+(?:inspectSchemaState|validateSchemaState|readSchemaTables|"
+        r"schemaTablesEqual)\s*\("
+    ),
     "url_parser_call": r"\burl\.(?:Parse|ParseQuery)\s*\(",
 }
 
@@ -180,6 +184,32 @@ class ServerParserInventoryTests(unittest.TestCase):
         }:
             with self.subTest(oracle=oracle):
                 self.assertIn(oracle, fuzzer)
+
+    def test_sqlite_schema_grammar_is_fail_closed_and_executed(self) -> None:
+        production = (
+            ROOT / "runtime/internal/store/schema.go"
+        ).read_text(encoding="utf-8")
+        counts = self.signal_counts(production)
+        self.assertEqual(counts["sqlite_schema_state_parser"], 4)
+        self.assertNotEqual(
+            self.signal_counts(production + "\nfunc inspectSchemaState() {}\n"),
+            counts,
+        )
+
+        fuzzer = (
+            ROOT / "runtime/internal/store/schema_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for production_entrypoint in {
+            "inspectSchemaState(ctx, database)",
+            "validateSchemaState(ctx, database)",
+            "readSchemaTables(ctx, database)",
+            "schemaTablesEqual(fixture.tables, expected)",
+        }:
+            with self.subTest(production_entrypoint=production_entrypoint):
+                self.assertIn(production_entrypoint, fuzzer)
+        self.assertIn("exactSchemaFuzzInspection", fuzzer)
+        self.assertIn("maps.Equal(fixture.tables, candidate.tables)", fuzzer)
+        self.assertIn('"unexpected", "CREATE TABLE unexpected (value TEXT)"', fuzzer)
 
     def test_persisted_canonical_destination_inventory_is_exact(self) -> None:
         source = (
