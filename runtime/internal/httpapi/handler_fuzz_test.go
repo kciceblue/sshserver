@@ -72,7 +72,9 @@ func FuzzHTTPBodyFraming(f *testing.F) {
 	f.Add("POST", contentType+"\n"+contentType, []byte(`{}`), int64(2), uint8(0))
 	f.Add("POST", contentType, []byte{}, int64(1), uint8(0))
 	f.Add("POST", contentType, []byte(`{}`), int64(0), uint8(0))
-	f.Add("POST", contentType, []byte("x"), int64(1), uint8(5))
+	f.Add("POST", contentType, []byte(`{}trailing`), int64(2), uint8(0))
+	f.Add("POST", contentType, []byte(`{}`), int64(3), uint8(0))
+	f.Add("POST", contentType, []byte("x"), int64(MaxBodyBytes+1), uint8(5))
 	f.Add("GET", "", []byte{}, int64(0), uint8(4))
 	f.Add("GET", "", []byte("x"), int64(0), uint8(0))
 
@@ -101,7 +103,7 @@ func FuzzHTTPBodyFraming(f *testing.F) {
 		secondEmptyRequest, secondPresent := httpBodyFuzzRequest(method, contentTypes, declaredLength, body, mode, true)
 		firstEmptyErr := requireEmptyBody(httptest.NewRecorder(), firstEmptyRequest)
 		secondEmptyErr := requireEmptyBody(httptest.NewRecorder(), secondEmptyRequest)
-		wantEmpty := exactEmptyBodyFraming(declaredLength, body, firstPresent)
+		wantEmpty := exactEmptyBodyFraming(declaredLength)
 		if firstPresent != secondPresent || (firstEmptyErr == nil) != wantEmpty || (secondEmptyErr == nil) != wantEmpty {
 			t.Fatalf("empty body framing first=%v second=%v want=%v", firstEmptyErr == nil, secondEmptyErr == nil, wantEmpty)
 		}
@@ -112,10 +114,15 @@ type httpBodyFuzzReadCloser struct {
 	body   []byte
 	offset int
 	chunk  int
+	short  bool
 }
 
 func (reader *httpBodyFuzzReadCloser) Read(destination []byte) (int, error) {
 	if reader.offset == len(reader.body) {
+		if reader.short {
+			reader.short = false
+			return 0, io.ErrUnexpectedEOF
+		}
 		return 0, io.EOF
 	}
 	count := len(reader.body) - reader.offset
@@ -140,7 +147,20 @@ func httpBodyFuzzRequest(method string, contentTypes []string, declaredLength in
 	}
 	bodyPresent := !allowNil || mode%8 != 4
 	if bodyPresent {
-		request.Body = &httpBodyFuzzReadCloser{body: body, chunk: 1 + int(mode%32)}
+		framedBody := append([]byte(nil), body...)
+		short := false
+		if declaredLength >= 0 {
+			if declaredLength <= int64(len(framedBody)) {
+				framedBody = framedBody[:int(declaredLength)]
+			} else {
+				short = true
+			}
+		}
+		request.Body = &httpBodyFuzzReadCloser{
+			body:  framedBody,
+			chunk: 1 + int(mode%32),
+			short: short,
+		}
 	}
 	if contentTypes != nil {
 		request.Header["Content-Type"] = append([]string(nil), contentTypes...)
@@ -184,17 +204,23 @@ func exactJSONBodyFraming(method string, contentTypes []string, declaredLength i
 	if (method != "POST" && method != "PUT") || len(contentTypes) != 1 || contentTypes[0] != "application/json; charset=utf-8" || declaredLength <= 0 {
 		return nil, "invalid_request"
 	}
-	if len(body) > MaxBodyBytes {
+	visibleLength := declaredLength
+	short := false
+	if declaredLength > int64(len(body)) {
+		visibleLength = int64(len(body))
+		short = true
+	}
+	if visibleLength > MaxBodyBytes {
 		return nil, "limit_exceeded"
 	}
-	if len(body) == 0 {
+	if short || visibleLength == 0 {
 		return nil, "invalid_request"
 	}
-	return append([]byte(nil), body...), ""
+	return append([]byte(nil), body[:int(visibleLength)]...), ""
 }
 
-func exactEmptyBodyFraming(declaredLength int64, body []byte, bodyPresent bool) bool {
-	return declaredLength == 0 && (!bodyPresent || len(body) == 0)
+func exactEmptyBodyFraming(declaredLength int64) bool {
+	return declaredLength == 0
 }
 
 func transportRequestMutation(mutation []byte) (*http.Request, bool) {

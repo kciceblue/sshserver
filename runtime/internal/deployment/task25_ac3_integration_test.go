@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kciceblue/sshserver/runtime/internal/auth"
 	"github.com/kciceblue/sshserver/runtime/internal/buildinfo"
 	"github.com/kciceblue/sshserver/runtime/internal/config"
 	"github.com/kciceblue/sshserver/runtime/internal/instance"
@@ -74,6 +75,7 @@ func TestRealNativeBinaryUpgradesRollsBackRunsAndUninstalls(t *testing.T) {
 	if _, err := instance.Initialize(context.Background(), layout.StateDir, []string{listenAddress}); err != nil {
 		t.Fatal(err)
 	}
+	durableRecord := seedTask25NativeDurableRecord(t, layout.StateDir)
 	protectedBefore := captureProtectedInstance(t, layout.StateDir)
 
 	manager := &fakeServiceManager{
@@ -89,7 +91,7 @@ func TestRealNativeBinaryUpgradesRollsBackRunsAndUninstalls(t *testing.T) {
 	}
 	assertTask25NativeForegroundResult(t, firstResult, layout, first.installed, 1, nil)
 	exerciseTask25NativeForeground(t, lifecycle, firstResult, first.installed)
-	assertTask25NativeProtectedIdentityUnchanged(t, protectedBefore, captureProtectedInstance(t, layout.StateDir), layout.StateDir)
+	assertTask25NativeProtectedIdentityUnchanged(t, protectedBefore, captureProtectedInstance(t, layout.StateDir), layout.StateDir, durableRecord)
 
 	secondResult, err := applyConfirmed(t, lifecycle, second.request)
 	if err != nil {
@@ -97,7 +99,7 @@ func TestRealNativeBinaryUpgradesRollsBackRunsAndUninstalls(t *testing.T) {
 	}
 	assertTask25NativeForegroundResult(t, secondResult, layout, second.installed, 2, &first.installed)
 	exerciseTask25NativeForeground(t, lifecycle, secondResult, second.installed)
-	assertTask25NativeProtectedIdentityUnchanged(t, protectedBefore, captureProtectedInstance(t, layout.StateDir), layout.StateDir)
+	assertTask25NativeProtectedIdentityUnchanged(t, protectedBefore, captureProtectedInstance(t, layout.StateDir), layout.StateDir, durableRecord)
 
 	rolledBack, err := lifecycle.Rollback(context.Background())
 	if err != nil {
@@ -105,7 +107,7 @@ func TestRealNativeBinaryUpgradesRollsBackRunsAndUninstalls(t *testing.T) {
 	}
 	assertTask25NativeForegroundResult(t, rolledBack, layout, first.installed, 3, &second.installed)
 	exerciseTask25NativeForeground(t, lifecycle, rolledBack, first.installed)
-	assertTask25NativeProtectedIdentityUnchanged(t, protectedBefore, captureProtectedInstance(t, layout.StateDir), layout.StateDir)
+	assertTask25NativeProtectedIdentityUnchanged(t, protectedBefore, captureProtectedInstance(t, layout.StateDir), layout.StateDir, durableRecord)
 
 	uninstalled, err := lifecycle.Uninstall(context.Background())
 	if err != nil {
@@ -132,7 +134,53 @@ func TestRealNativeBinaryUpgradesRollsBackRunsAndUninstalls(t *testing.T) {
 	if _, err := LoadJournal(layout); !errors.Is(err, ErrNoDeploymentJournal) {
 		t.Fatalf("native two-release uninstall journal error=%v", err)
 	}
-	assertTask25NativeProtectedIdentityUnchanged(t, protectedBefore, captureProtectedInstance(t, layout.StateDir), layout.StateDir)
+	assertTask25NativeProtectedIdentityUnchanged(t, protectedBefore, captureProtectedInstance(t, layout.StateDir), layout.StateDir, durableRecord)
+}
+
+type task25NativeDurableRecord struct {
+	deviceID  string
+	tokenHash [32]byte
+	scopes    []string
+}
+
+func seedTask25NativeDurableRecord(t *testing.T, stateDir string) task25NativeDurableRecord {
+	t.Helper()
+	ctx := context.Background()
+	opened, err := instance.Open(ctx, stateDir)
+	if err != nil {
+		t.Fatalf("open native instance to seed durable record: %v", err)
+	}
+	defer func() {
+		if err := opened.Close(); err != nil {
+			t.Fatalf("close native instance after seeding durable record: %v", err)
+		}
+	}()
+
+	deviceID := "00000000-0000-4000-8000-000000000025"
+	token := bytes.Repeat([]byte{0x25}, 32)
+	defer clear(token)
+	scopes := auth.FixedScopes()
+	if err := opened.Store.CreateDevice(
+		ctx,
+		deviceID,
+		token,
+		scopes,
+		time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC),
+	); err != nil {
+		t.Fatalf("seed native durable device record: %v", err)
+	}
+	tokenHash, storedScopes, err := opened.Store.DeviceCredential(ctx, deviceID)
+	if err != nil {
+		t.Fatalf("read seeded native durable device record: %v", err)
+	}
+	if !reflect.DeepEqual(storedScopes, scopes) {
+		t.Fatalf("seeded native durable scopes=%v want=%v", storedScopes, scopes)
+	}
+	return task25NativeDurableRecord{
+		deviceID:  deviceID,
+		tokenHash: tokenHash,
+		scopes:    append([]string(nil), storedScopes...),
+	}
 }
 
 type task25NativeRelease struct {
@@ -361,6 +409,7 @@ func assertTask25NativeProtectedIdentityUnchanged(
 	before protectedInstanceSnapshot,
 	after protectedInstanceSnapshot,
 	stateDir string,
+	durableRecord task25NativeDurableRecord,
 ) {
 	t.Helper()
 	// Opening the real runtime may legitimately update SQLite bookkeeping even
@@ -374,6 +423,21 @@ func assertTask25NativeProtectedIdentityUnchanged(
 	opened, err := instance.Open(context.Background(), stateDir)
 	if err != nil {
 		t.Fatalf("open protected instance after native lifecycle transition: %v", err)
+	}
+	tokenHash, scopes, err := opened.Store.DeviceCredential(context.Background(), durableRecord.deviceID)
+	if err != nil {
+		_ = opened.Close()
+		t.Fatalf("read durable record after native lifecycle transition: %v", err)
+	}
+	if tokenHash != durableRecord.tokenHash || !reflect.DeepEqual(scopes, durableRecord.scopes) {
+		_ = opened.Close()
+		t.Fatalf(
+			"native lifecycle changed durable device record: hash=%x scopes=%v want_hash=%x want_scopes=%v",
+			tokenHash,
+			scopes,
+			durableRecord.tokenHash,
+			durableRecord.scopes,
+		)
 	}
 	if err := opened.Close(); err != nil {
 		t.Fatal(err)
