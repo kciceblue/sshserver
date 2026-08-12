@@ -2,12 +2,31 @@ package server
 
 import (
 	"bytes"
+	"io"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kciceblue/sshserver/runtime/internal/deployment"
+	"github.com/kciceblue/sshserver/runtime/internal/httpapi"
+	"github.com/kciceblue/sshserver/runtime/internal/uuidv4"
 )
+
+type requestHeadFuzzConn struct {
+	*bytes.Reader
+}
+
+func (connection *requestHeadFuzzConn) Write(payload []byte) (int, error) {
+	return len(payload), nil
+}
+func (connection *requestHeadFuzzConn) Close() error                     { return nil }
+func (connection *requestHeadFuzzConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (connection *requestHeadFuzzConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (connection *requestHeadFuzzConn) SetDeadline(time.Time) error      { return nil }
+func (connection *requestHeadFuzzConn) SetReadDeadline(time.Time) error  { return nil }
+func (connection *requestHeadFuzzConn) SetWriteDeadline(time.Time) error { return nil }
 
 func FuzzDecodeAdminRequest(f *testing.F) {
 	direct, err := EncodeEnrollmentCreateRequest(nil)
@@ -40,6 +59,89 @@ func FuzzDecodeAdminRequest(f *testing.F) {
 		reparsed, err := decodeAdminRequest(canonical)
 		if err != nil || !reflect.DeepEqual(reparsed, parsed) {
 			t.Fatalf("accepted admin request does not round trip: parsed=%+v reparsed=%+v error=%v", parsed, reparsed, err)
+		}
+	})
+}
+
+func FuzzHTTP1RequestHead(f *testing.F) {
+	const retainedRequestID = "123e4567-e89b-42d3-a456-426614174000"
+	f.Add([]byte("GET /v1/health HTTP/1.1\r\nHost: localhost\r\nJAT-Request-ID: 0123456789abcdef0123456789abcdef\r\n\r\n"))
+	f.Add(bytes.Repeat([]byte("A"), httpapi.MaxHeaderBytes+1))
+	oversizedWithRequestID := []byte("GET /v1/health HTTP/1.1\r\nHost: localhost\r\nJAT-Request-ID: " + retainedRequestID + "\r\nX-Fill: ")
+	oversizedWithRequestID = append(oversizedWithRequestID, bytes.Repeat([]byte("A"), httpapi.MaxHeaderBytes)...)
+	oversizedWithRequestID = append(oversizedWithRequestID, []byte("\r\n\r\n")...)
+	f.Add(oversizedWithRequestID)
+	unseenRequestID := bytes.Repeat([]byte("A"), httpapi.MaxHeaderBytes+1)
+	unseenRequestID = append(unseenRequestID, []byte("\r\nJAT-Request-ID: "+retainedRequestID+"\r\n\r\n")...)
+	f.Add(unseenRequestID)
+	splitRequestID := []byte("GET /v1/health HTTP/1.1\r\nX-Fill: ")
+	splitHeader := []byte("\r\nJAT-Request-ID: " + retainedRequestID)
+	splitRequestID = append(splitRequestID, bytes.Repeat(
+		[]byte("A"),
+		httpapi.MaxHeaderBytes+1-len(splitRequestID)-len(splitHeader),
+	)...)
+	splitRequestID = append(splitRequestID, splitHeader...)
+	if len(splitRequestID) != httpapi.MaxHeaderBytes+1 {
+		f.Fatal("split request-ID seed does not end at the buffered boundary")
+	}
+	splitRequestID = append(splitRequestID, []byte("x\r\n\r\n")...)
+	f.Add(splitRequestID)
+
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		if len(payload) > httpapi.MaxHeaderBytes+4096 {
+			return
+		}
+		firstIDs := requestIDValues(payload)
+		secondIDs := requestIDValues(payload)
+		if !reflect.DeepEqual(firstIDs, secondIDs) {
+			t.Fatal("request-ID header parsing changed across identical input")
+		}
+		bufferedPayload := payload
+		if len(bufferedPayload) > httpapi.MaxHeaderBytes+1 {
+			bufferedPayload = bufferedPayload[:httpapi.MaxHeaderBytes+1]
+		}
+		bufferedIDs := requestIDValues(bufferedPayload)
+
+		first := &headerLimitConn{
+			Conn:     &requestHeadFuzzConn{Reader: bytes.NewReader(payload)},
+			maxBytes: httpapi.MaxHeaderBytes,
+		}
+		second := &headerLimitConn{
+			Conn:     &requestHeadFuzzConn{Reader: bytes.NewReader(payload)},
+			maxBytes: httpapi.MaxHeaderBytes,
+		}
+		firstOutput, firstErr := io.ReadAll(first)
+		secondOutput, secondErr := io.ReadAll(second)
+		if (firstErr == nil) != (secondErr == nil) {
+			t.Fatal("request-head limit acceptance changed across identical input")
+		}
+		if firstErr != nil && firstErr.Error() != secondErr.Error() {
+			t.Fatal("request-head limit error changed across identical input")
+		}
+		if !bytes.Equal(firstOutput, secondOutput) || first.limit.exceeded != second.limit.exceeded {
+			t.Fatal("request-head limit output changed across identical input")
+		}
+		for _, limit := range []headerLimitState{first.limit, second.limit} {
+			if !limit.exceeded {
+				if limit.requestID != "" {
+					t.Fatal("non-limited request unexpectedly retained a request ID")
+				}
+				continue
+			}
+			if _, err := uuidv4.Parse(limit.requestID); err != nil {
+				t.Fatal("limited request did not retain or generate a canonical request ID")
+			}
+			if len(bufferedIDs) == 1 {
+				if _, err := uuidv4.Parse(bufferedIDs[0]); err == nil && limit.requestID != bufferedIDs[0] {
+					t.Fatalf("limited request discarded canonical buffered request ID: got %q want %q", limit.requestID, bufferedIDs[0])
+				}
+			}
+			if bytes.Equal(payload, unseenRequestID) && limit.requestID == retainedRequestID {
+				t.Fatal("limited request retained a canonical request ID beyond the buffered prefix")
+			}
+			if bytes.Equal(payload, splitRequestID) && limit.requestID == retainedRequestID {
+				t.Fatal("limited request retained a request ID from an unterminated buffered header line")
+			}
 		}
 	})
 }

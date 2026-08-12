@@ -24,21 +24,31 @@ type pendingRevision struct {
 	isNew         bool
 }
 
-func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Response, *api.Error) {
-	var request syncRequest
-	if err := decodeStrict(call.Body, &request); err != nil || request.ProtocolVersion != "1" ||
-		validateUUID(request.DeviceID) != nil || validateUUID(request.RequestID) != nil || request.RequestID != call.RequestID ||
+func validateSyncRequest(request syncRequest) (uint64, uint64, error) {
+	if request.ProtocolVersion != "1" || validateUUID(request.DeviceID) != nil || validateUUID(request.RequestID) != nil ||
 		len(request.Mutations) > maxMutations {
-		return api.Response{}, api.NewError("invalid_request", false)
+		return 0, 0, errors.New("sync request profile is invalid")
 	}
 	if protocolErr := validateMutationShapes(request.DeviceID, request.Mutations); protocolErr != nil {
-		return api.Response{}, protocolErr
+		return 0, 0, protocolErr
 	}
 	afterCursor, err := parseUint64(request.AfterCursor)
 	if err != nil {
-		return api.Response{}, api.NewError("invalid_request", false)
+		return 0, 0, err
 	}
 	ackCursor, err := parseUint64(request.AckCursor)
+	if err != nil {
+		return 0, 0, err
+	}
+	return afterCursor, ackCursor, nil
+}
+
+func (store *Store) handleSync(ctx context.Context, call api.Request) (api.Response, *api.Error) {
+	var request syncRequest
+	if err := decodeStrict(call.Body, &request); err != nil || request.RequestID != call.RequestID {
+		return api.Response{}, api.NewError("invalid_request", false)
+	}
+	afterCursor, ackCursor, err := validateSyncRequest(request)
 	if err != nil {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}

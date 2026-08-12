@@ -44,9 +44,35 @@ runtime-go-check:
 
 runtime-fuzz-smoke:
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeStrictJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzStoredJSONShapes$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzStoreScalarAndStoredParsers$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzPathIdentifier$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzOperationReceiptKey$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzSQLiteSchemaState$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/store
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParsePinnedManifest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseDeploymentPreview$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeDeploymentMetadata$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseBuildIdentityJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDeploymentScalarParsers$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDeploymentPathGrammar$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzLocateDeploymentExecutable$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseArtifactGoBuildInfo$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzValidateRemovableArtifactName$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzServiceManagerOutput$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzServiceDefinitionPaths$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/service
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeAdminRequest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/server
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzHTTP1RequestHead$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/server
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeConfigJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/config
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDecodeCLIResponses$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/cli
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseAttestation$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/buildinfo
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseUUIDv4$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/uuidv4
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzReleaseIdentifier$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releaseid
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzInstallCommandInput$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzValidLocalMainVersion$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseReleaseBundleGoBuildInfo$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/releasebundle
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzHeaderContainsToken$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/httpapi
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzValidateTransportRequest$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/httpapi
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzHTTPBodyFraming$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/httpapi
 
 runtime-build-one:
 	test -n "$(RUNTIME_GOOS)"

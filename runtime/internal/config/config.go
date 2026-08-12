@@ -48,6 +48,22 @@ type InstallMarker struct {
 	State      string `json:"state"`
 }
 
+func (marker InstallMarker) Validate() error {
+	if marker.Generation != "1" {
+		return errors.New("unsupported install-marker generation")
+	}
+	if marker.Phase != "initializing" && marker.Phase != "ready" {
+		return errors.New("invalid install-marker phase")
+	}
+	if marker.State != "resume" && marker.State != "complete" {
+		return errors.New("invalid install-marker state")
+	}
+	if (marker.Phase == "ready") != (marker.State == "complete") {
+		return errors.New("inconsistent install marker")
+	}
+	return nil
+}
+
 type Paths struct {
 	StateDir       string
 	Config         string
@@ -78,7 +94,7 @@ func DefaultStateDir() (string, error) {
 		return filepath.Join(home, "Library", "Application Support", "JustAnotherTerminal", "sshserver"), nil
 	case "linux":
 		if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
-			if !filepath.IsAbs(xdg) {
+			if !validAbsolutePath(xdg) {
 				return "", errors.New("XDG_STATE_HOME must be absolute")
 			}
 			return filepath.Join(xdg, "jat", "sshserver"), nil
@@ -174,7 +190,7 @@ func ValidateListener(address string) error {
 }
 
 func EnsureStateDirectory(path string) error {
-	if path == "" || !filepath.IsAbs(path) {
+	if !validAbsolutePath(path) {
 		return errors.New("state directory must be an absolute path")
 	}
 	created := false
@@ -209,7 +225,7 @@ func EnsureStateDirectory(path string) error {
 // surfaces use it instead of EnsureStateDirectory so a discovery attempt can
 // never turn a missing or insecure path into initialized state.
 func ValidateStateDirectory(path string) error {
-	if path == "" || !filepath.IsAbs(path) {
+	if !validAbsolutePath(path) {
 		return errors.New("state directory must be an absolute path")
 	}
 	info, err := os.Lstat(path)
@@ -231,7 +247,7 @@ func ValidateStateDirectory(path string) error {
 // PrepareProtectedFile creates an empty owner-only regular file atomically or
 // validates an existing one. O_EXCL prevents following a pre-existing symlink.
 func PrepareProtectedFile(path string, mode os.FileMode) error {
-	if strings.ContainsRune(path, '\x00') || !filepath.IsAbs(path) {
+	if !validAbsolutePath(path) {
 		return errors.New("protected file path must be absolute and contain no NUL")
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, mode)
@@ -298,22 +314,16 @@ func LoadMarker(path string) (InstallMarker, error) {
 	if err := readStrictJSON(path, &marker); err != nil {
 		return InstallMarker{}, err
 	}
-	if marker.Generation != "1" {
-		return InstallMarker{}, errors.New("unsupported install-marker generation")
-	}
-	if marker.Phase != "initializing" && marker.Phase != "ready" {
-		return InstallMarker{}, errors.New("invalid install-marker phase")
-	}
-	if marker.State != "resume" && marker.State != "complete" {
-		return InstallMarker{}, errors.New("invalid install-marker state")
-	}
-	if (marker.Phase == "ready") != (marker.State == "complete") {
-		return InstallMarker{}, errors.New("inconsistent install marker")
+	if err := marker.Validate(); err != nil {
+		return InstallMarker{}, err
 	}
 	return marker, nil
 }
 
 func SaveMarker(path string, marker InstallMarker) error {
+	if err := marker.Validate(); err != nil {
+		return err
+	}
 	return writeJSONAtomic(path, marker, secretFileMode)
 }
 
@@ -337,7 +347,7 @@ func WriteSecret(path string, value []byte) error {
 }
 
 func WriteFileAtomic(path string, value []byte, mode os.FileMode) error {
-	if strings.ContainsRune(path, '\x00') || !filepath.IsAbs(path) {
+	if !validAbsolutePath(path) {
 		return errors.New("path must be absolute and contain no NUL")
 	}
 	if err := ValidateProtectedFile(path, mode); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -378,6 +388,10 @@ func WriteFileAtomic(path string, value []byte, mode os.FileMode) error {
 	return ValidateProtectedFile(path, mode)
 }
 
+func validAbsolutePath(path string) bool {
+	return path != "" && strings.IndexByte(path, 0) < 0 && filepath.IsAbs(path)
+}
+
 func SameListeners(left, right []string) bool {
 	if len(left) != len(right) {
 		return false
@@ -402,6 +416,16 @@ func readStrictJSON(path string, destination any) error {
 	payload, err := readProtectedFile(path, secretFileMode, maxConfigBytes)
 	if err != nil {
 		return err
+	}
+	return decodeStrictJSON(payload, destination)
+}
+
+// decodeStrictJSON is the pure byte boundary shared by protected settings and
+// install-marker files. Keeping the decoder independent of filesystem access
+// lets the checked-in fuzz corpus exercise the exact production grammar.
+func decodeStrictJSON(payload []byte, destination any) error {
+	if len(payload) == 0 || len(payload) > maxConfigBytes {
+		return errors.New("configuration JSON is outside its size boundary")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()

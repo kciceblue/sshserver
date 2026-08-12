@@ -10,22 +10,73 @@ import (
 var (
 	canonicalBaseVaultEnvelopeFuzzSeed       = []byte(`{"protocol_version":"1","crypto_suite":"jat-xchacha-hkdf-argon2id-draft2","instance_id":"00000000-0000-4000-8000-000000000001","vault_id":"00000000-0000-4000-8000-000000000002","envelope_generation":"1","instance_secret_generation":"1","mode":"base","hkdf_salt":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","argon2":null,"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","wrapped_vmk":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)
 	canonicalPassphraseVaultEnvelopeFuzzSeed = []byte(`{"protocol_version":"1","crypto_suite":"jat-xchacha-hkdf-argon2id-draft2","instance_id":"00000000-0000-4000-8000-000000000001","vault_id":"00000000-0000-4000-8000-000000000002","envelope_generation":"1","instance_secret_generation":"1","mode":"passphrase","hkdf_salt":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","argon2":{"version":19,"salt":"AAAAAAAAAAAAAAAAAAAAAA","memory_kib":65536,"iterations":3,"parallelism":1,"output_length":32},"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","wrapped_vmk":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)
+	canonicalPutEnvelopeRequestFuzzSeed      = bytes.Join([][]byte{[]byte(`{"expected_generation":"0","new_generation":"1","envelope":`), canonicalBaseVaultEnvelopeFuzzSeed, []byte(`}`)}, nil)
+	mismatchedPutEnvelopeGenerationFuzzSeed  = bytes.Replace(canonicalPutEnvelopeRequestFuzzSeed, []byte(`"expected_generation":"0"`), []byte(`"expected_generation":"1"`), 1)
+	parserFuzzIdentity                       = Identity{InstanceID: "00000000-0000-4000-8000-000000000001", VaultID: "00000000-0000-4000-8000-000000000002"}
 )
+
+const parserFuzzStoredEnvelopeGeneration uint64 = 0
 
 var strictJSONFuzzTargets = []struct {
 	name           string
 	acceptedSeeds  [][]byte
 	newDestination func() any
+	validate       func(any) error
 }{
+	{
+		name:           "enrollment request",
+		acceptedSeeds:  [][]byte{[]byte(`{"protocol_version":"1","enrollment_id":"00000000-0000-4000-8000-000000000004","device_id":"00000000-0000-4000-8000-000000000003","device_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","scopes":["devices:manage","devices:read","envelope:read","envelope:write","sync:read","sync:write"]}`)},
+		newDestination: func() any { return &enrollmentRequest{} },
+		validate: func(destination any) error {
+			token, err := validateEnrollmentRequest(*destination.(*enrollmentRequest))
+			clear(token)
+			return err
+		},
+	},
+	{
+		name:           "put envelope request",
+		acceptedSeeds:  [][]byte{canonicalPutEnvelopeRequestFuzzSeed},
+		newDestination: func() any { return &putEnvelopeRequest{} },
+		validate: func(destination any) error {
+			request := *destination.(*putEnvelopeRequest)
+			newGeneration, err := validatePutEnvelopeRequestGenerations(request, parserFuzzStoredEnvelopeGeneration)
+			if err != nil {
+				return err
+			}
+			return validatePutEnvelopeRequestEnvelope(request, parserFuzzIdentity, newGeneration, 1)
+		},
+	},
 	{
 		name:           "sync request",
 		acceptedSeeds:  [][]byte{[]byte(`{"protocol_version":"1","device_id":"00000000-0000-4000-8000-000000000003","request_id":"00000000-0000-4000-8000-000000000004","after_cursor":"0","ack_cursor":"0","mutations":[]}`)},
 		newDestination: func() any { return &syncRequest{} },
+		validate: func(destination any) error {
+			_, _, err := validateSyncRequest(*destination.(*syncRequest))
+			return err
+		},
+	},
+	{
+		name:           "snapshot create request",
+		acceptedSeeds:  [][]byte{[]byte(`{"protocol_version":"1","device_id":"00000000-0000-4000-8000-000000000003","request_id":"00000000-0000-4000-8000-000000000004","required_capabilities":["authenticated-collection-frontiers-v2","snapshot-collection-markers-v1","snapshot-device-registry-v1","snapshot-read-v1"]}`)},
+		newDestination: func() any { return &snapshotCreateRequest{} },
+		validate: func(destination any) error {
+			return validateSnapshotCreateRequest(*destination.(*snapshotCreateRequest))
+		},
+	},
+	{
+		name:           "snapshot page request",
+		acceptedSeeds:  [][]byte{[]byte(`{"protocol_version":"1","device_id":"00000000-0000-4000-8000-000000000003","page_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)},
+		newDestination: func() any { return &snapshotPageRequest{} },
+		validate:       func(destination any) error { return validateSnapshotPageRequest(*destination.(*snapshotPageRequest)) },
 	},
 	{
 		name:           "record revision",
-		acceptedSeeds:  [][]byte{[]byte(`{"record_id":"00000000-0000-4000-8000-000000000020","revision_id":"00000000-0000-4000-8000-000000000021","author_device_id":"00000000-0000-4000-8000-000000000003","author_counter":"1","version_vector":[{"device_id":"00000000-0000-4000-8000-000000000003","counter":"1"}],"collection_witness_authenticator":null,"payload_schema":"1","crypto_suite":"jat-xchacha-hkdf-argon2id-draft2","tombstone":false,"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA"}`)},
+		acceptedSeeds:  [][]byte{canonicalRecordRevisionFuzzSeed},
 		newDestination: func() any { return &recordRevision{} },
+		validate: func(destination any) error {
+			_, _, err := validateRevision(*destination.(*recordRevision))
+			return err
+		},
 	},
 	{
 		name: "vault envelope",
@@ -34,11 +85,26 @@ var strictJSONFuzzTargets = []struct {
 			canonicalPassphraseVaultEnvelopeFuzzSeed,
 		},
 		newDestination: func() any { return &vaultEnvelope{} },
+		validate: func(destination any) error {
+			_, _, err := validateEnvelope(*destination.(*vaultEnvelope), parserFuzzIdentity)
+			return err
+		},
 	},
 	{
 		name:           "revoke device request",
 		acceptedSeeds:  [][]byte{[]byte(`{"request_id":"00000000-0000-4000-8000-000000000004","allow_zero_active":false}`)},
 		newDestination: func() any { return &revokeDeviceRequest{} },
+		validate:       func(destination any) error { return validateRevokeDeviceRequest(*destination.(*revokeDeviceRequest)) },
+	},
+	{
+		name:           "token rotation request",
+		acceptedSeeds:  [][]byte{[]byte(`{"rotation_id":"00000000-0000-4000-8000-000000000004","device_id":"00000000-0000-4000-8000-000000000003","new_device_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)},
+		newDestination: func() any { return &tokenRotationRequest{} },
+		validate: func(destination any) error {
+			token, err := validateTokenRotationRequest(*destination.(*tokenRotationRequest))
+			clear(token)
+			return err
+		},
 	},
 }
 
@@ -48,6 +114,7 @@ func FuzzDecodeStrictJSON(f *testing.F) {
 			f.Add(seed)
 		}
 	}
+	f.Add(mismatchedPutEnvelopeGenerationFuzzSeed)
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		for _, target := range strictJSONFuzzTargets {
 			first := target.newDestination()
@@ -63,6 +130,14 @@ func FuzzDecodeStrictJSON(f *testing.F) {
 			if firstErr != nil {
 				continue
 			}
+			firstValidationErr := target.validate(first)
+			secondValidationErr := target.validate(second)
+			if (firstValidationErr == nil) != (secondValidationErr == nil) {
+				t.Fatalf("%s semantic acceptance changed across identical input: first=%v second=%v", target.name, firstValidationErr, secondValidationErr)
+			}
+			if firstValidationErr != nil {
+				continue
+			}
 
 			encoded, err := json.Marshal(first)
 			if err != nil {
@@ -71,6 +146,9 @@ func FuzzDecodeStrictJSON(f *testing.F) {
 			roundTripped := target.newDestination()
 			if err := decodeStrict(encoded, roundTripped); err != nil {
 				t.Fatalf("strict decoder rejected its typed value encoding: %v; encoded=%q", err, encoded)
+			}
+			if err := target.validate(roundTripped); err != nil {
+				t.Fatalf("%s semantic validator rejected its round-tripped typed value: %v", target.name, err)
 			}
 			if !reflect.DeepEqual(first, roundTripped) {
 				t.Fatalf("typed value changed across encode/decode: first=%+v round_tripped=%+v", first, roundTripped)
@@ -86,15 +164,41 @@ func FuzzDecodeStrictJSON(f *testing.F) {
 	})
 }
 
+func TestPutEnvelopeFuzzValidationUsesFixedStoredGeneration(t *testing.T) {
+	var request putEnvelopeRequest
+	if err := decodeStrict(mismatchedPutEnvelopeGenerationFuzzSeed, &request); err != nil {
+		t.Fatalf("decode mismatched put-envelope generation seed: %v", err)
+	}
+	if _, err := validatePutEnvelopeRequestGenerations(request, parserFuzzStoredEnvelopeGeneration); err == nil {
+		t.Fatal("put-envelope fuzz validation accepted a request that mismatches fixed stored generation zero")
+	}
+	for _, target := range strictJSONFuzzTargets {
+		if target.name == "put envelope request" {
+			if err := target.validate(&request); err == nil {
+				t.Fatal("put-envelope semantic callback accepted the fixed-state mismatch seed")
+			}
+			return
+		}
+	}
+	t.Fatal("put-envelope strict JSON target is missing")
+}
+
 func TestFuzzDecodeStrictJSONHasAcceptedSeedsForEveryDestination(t *testing.T) {
 	for _, target := range strictJSONFuzzTargets {
 		t.Run(target.name, func(t *testing.T) {
 			if len(target.acceptedSeeds) == 0 {
 				t.Fatal("strict destination has no canonical accepted seed")
 			}
+			if target.validate == nil {
+				t.Fatal("strict destination has no production semantic validator")
+			}
 			for seedIndex, seed := range target.acceptedSeeds {
-				if err := decodeStrict(seed, target.newDestination()); err != nil {
+				destination := target.newDestination()
+				if err := decodeStrict(seed, destination); err != nil {
 					t.Fatalf("canonical fuzz seed %d was rejected: %v", seedIndex, err)
+				}
+				if err := target.validate(destination); err != nil {
+					t.Fatalf("canonical fuzz seed %d failed production semantics: %v", seedIndex, err)
 				}
 			}
 		})
