@@ -234,6 +234,11 @@ func mutateAcceptedArtifactExecutable(executable, mutation []byte) []byte {
 
 func FuzzDeploymentScalarParsers(f *testing.F) {
 	f.Add("https://downloads.example.test", "https://downloads.example.test/releases/v1.2.3/sshserver-linux-amd64", "v1.2.3", strings.Repeat("a", 64), int64(1))
+	f.Add("", "", "", strings.Repeat("A", 64), int64(1))
+	f.Add("", "", "", strings.Repeat("a", 63), int64(1))
+	f.Add("", "", "", strings.Repeat("a", 63)+"g", int64(1))
+	f.Add("", "", "", strings.Repeat("a", 64), int64(0))
+	f.Add("", "", "", strings.Repeat("a", 64), int64(maximumStagedArtifactBytes+1))
 	f.Fuzz(func(t *testing.T, originText, releaseURLText, release, digest string, expectedBytes int64) {
 		// Keep integer mutations within the production bound before exercising
 		// the size parser; arbitrary fuzz integers otherwise add no grammar
@@ -261,8 +266,39 @@ func FuzzDeploymentScalarParsers(f *testing.F) {
 		}
 		firstArtifact, firstArtifactErr := parseArtifactExpectation(expectedBytes, digest)
 		secondArtifact, secondArtifactErr := parseArtifactExpectation(expectedBytes, digest)
-		if (firstArtifactErr == nil) != (secondArtifactErr == nil) || firstArtifact != secondArtifact {
-			t.Fatal("artifact expectation parser changed across identical input")
+		wantArtifact, wantArtifactOK := exactArtifactExpectation(expectedBytes, digest)
+		if (firstArtifactErr == nil) != wantArtifactOK || (secondArtifactErr == nil) != wantArtifactOK {
+			t.Fatalf("artifact expectation acceptance first=%v second=%v want=%v", firstArtifactErr == nil, secondArtifactErr == nil, wantArtifactOK)
+		}
+		if wantArtifactOK && (firstArtifact != wantArtifact || secondArtifact != wantArtifact) {
+			t.Fatal("artifact expectation differs from exact grammar")
 		}
 	})
+}
+
+func exactArtifactExpectation(expectedBytes int64, digest string) (artifactExpectation, bool) {
+	var result artifactExpectation
+	if expectedBytes <= 0 || expectedBytes > maximumStagedArtifactBytes || len(digest) != 64 {
+		return result, false
+	}
+	for index := range result.digest {
+		high, highOK := exactLowerHexNibble(digest[index*2])
+		low, lowOK := exactLowerHexNibble(digest[index*2+1])
+		if !highOK || !lowOK {
+			return artifactExpectation{}, false
+		}
+		result.digest[index] = high<<4 | low
+	}
+	result.bytes = expectedBytes
+	return result, true
+}
+
+func exactLowerHexNibble(value byte) (byte, bool) {
+	if value >= '0' && value <= '9' {
+		return value - '0', true
+	}
+	if value >= 'a' && value <= 'f' {
+		return value - 'a' + 10, true
+	}
+	return 0, false
 }

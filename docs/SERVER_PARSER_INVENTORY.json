@@ -4,9 +4,12 @@
   "sourceDerivation": {
     "description": "Exact signal counts are recomputed by tests/test_server_parser_inventory.py. Any new or changed signal-bearing runtime file fails closed until its parser boundary and fuzz owner are reviewed together.",
     "signals": {
+      "artifact_expectation_parser": "\\bfunc\\s+parseArtifactExpectation\\s*\\(",
+      "artifact_name_validator": "\\bfunc\\s+validateArtifactName\\s*\\(",
       "base64_decoder_call": "\\bbase64\\.(?:RawURL|URL|RawStd|Std)Encoding(?:\\.Strict\\(\\))?\\.Decode(?:String)?\\s*\\(",
       "binary_integer_decoder_call": "\\bbinary\\.(?:BigEndian|LittleEndian)\\.Uint(?:16|32|64)\\s*\\(",
       "build_metadata_parser": "\\bfunc\\s+validLocalMainVersion\\s*\\(",
+      "bundle_output_grammar": "\\bfunc\\s+validateBundleOutput\\s*\\(",
       "filesystem_path_grammar_call": "\\bfilepath\\.(?:Base|Clean|Dir|EvalSymlinks|IsAbs|Rel|ToSlash)\\s*\\(",
       "fixed_scope_set_validator": "\\bfunc\\s+ValidateScopes\\s*\\(",
       "go_buildinfo_decoder_call": "\\bdebugbuildinfo\\.Read\\s*\\(",
@@ -40,7 +43,7 @@
       "xml_text_escape_call": "\\bxml\\.EscapeText\\s*\\("
     },
     "sourceFileCount": 32,
-    "sourceSignalCount": 273,
+    "sourceSignalCount": 277,
     "sourceSignalCounts": {
       "runtime/internal/auth/token.go": {
         "fixed_scope_set_validator": 1
@@ -70,6 +73,8 @@
         "strconv_parser_call": 1
       },
       "runtime/internal/deployment/artifact.go": {
+        "artifact_expectation_parser": 1,
+        "artifact_name_validator": 1,
         "filesystem_path_grammar_call": 9,
         "go_buildinfo_decoder_call": 1,
         "hex_decoder_call": 1,
@@ -139,7 +144,8 @@
       },
       "runtime/internal/releasebundle/bundle.go": {
         "build_metadata_parser": 1,
-        "filesystem_path_grammar_call": 5,
+        "bundle_output_grammar": 1,
+        "filesystem_path_grammar_call": 6,
         "go_buildinfo_decoder_call": 1,
         "parser_function_declaration": 1,
         "regexp_grammar_constructor": 1,

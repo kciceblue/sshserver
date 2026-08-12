@@ -490,8 +490,8 @@ func validateBundleDirectory(path string) error {
 }
 
 func writeNewBundleFile(directory string, output bundleOutput) error {
-	if output.name == "" || filepath.Base(output.name) != output.name || output.mode != 0o400 && output.mode != 0o500 || len(output.payload) == 0 {
-		return errors.New("release bundle output is invalid")
+	if err := validateBundleOutput(output); err != nil {
+		return err
 	}
 	path := filepath.Join(directory, output.name)
 	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, uint32(output.mode.Perm()))
@@ -515,6 +515,15 @@ func writeNewBundleFile(directory string, output bundleOutput) error {
 	}
 	if err := file.Close(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateBundleOutput(output bundleOutput) error {
+	if output.name == "" || output.name == "." || output.name == ".." || len(output.name) > 128 ||
+		strings.ContainsRune(output.name, 0) || strings.ContainsRune(output.name, filepath.Separator) || filepath.Base(output.name) != output.name || filepath.Clean(output.name) != output.name ||
+		output.mode != 0o400 && output.mode != 0o500 || len(output.payload) == 0 {
+		return errors.New("release bundle output is invalid")
 	}
 	return nil
 }

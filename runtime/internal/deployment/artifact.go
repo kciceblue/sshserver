@@ -276,7 +276,7 @@ func parseArtifactExpectation(expectedBytes int64, expectedSHA256 string) (artif
 }
 
 func validateArtifactName(name string) error {
-	if name == "" || name == "." || name == ".." || len(name) > 128 || strings.ContainsRune(name, 0) ||
+	if name == "" || name == "." || name == ".." || len(name) > 128 || strings.ContainsRune(name, 0) || strings.ContainsRune(name, filepath.Separator) ||
 		filepath.Base(name) != name || filepath.Clean(name) != name {
 		return errors.New("staged artifact name must be a safe single path component")
 	}

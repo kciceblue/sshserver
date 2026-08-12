@@ -8,6 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = ROOT / "docs" / "SERVER_PARSER_INVENTORY.json"
 
 EXPECTED_SIGNALS = {
+    "artifact_expectation_parser": r"\bfunc\s+parseArtifactExpectation\s*\(",
+    "artifact_name_validator": r"\bfunc\s+validateArtifactName\s*\(",
     "base64_decoder_call": (
         r"\bbase64\.(?:RawURL|URL|RawStd|Std)Encoding"
         r"(?:\.Strict\(\))?\.Decode(?:String)?\s*\("
@@ -16,6 +18,7 @@ EXPECTED_SIGNALS = {
         r"\bbinary\.(?:BigEndian|LittleEndian)\.Uint(?:16|32|64)\s*\("
     ),
     "build_metadata_parser": r"\bfunc\s+validLocalMainVersion\s*\(",
+    "bundle_output_grammar": r"\bfunc\s+validateBundleOutput\s*\(",
     "filesystem_path_grammar_call": (
         r"\bfilepath\."
         r"(?:Base|Clean|Dir|EvalSymlinks|IsAbs|Rel|ToSlash)\s*\("
@@ -260,7 +263,7 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertEqual(totals["regexp_match_call"], 45)
         self.assertEqual(totals["string_split_parser_call"], 29)
         self.assertEqual(totals["strconv_parser_call"], 4)
-        self.assertEqual(totals["filesystem_path_grammar_call"], 59)
+        self.assertEqual(totals["filesystem_path_grammar_call"], 60)
         self.assertEqual(totals["fixed_scope_set_validator"], 1)
         self.assertEqual(totals["slash_path_grammar_call"], 6)
         self.assertEqual(totals["network_address_parser_call"], 7)
@@ -271,6 +274,9 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertEqual(totals["parser_function_declaration"], 25)
         self.assertEqual(totals["utf8_text_validator_call"], 1)
         self.assertEqual(totals["xml_text_escape_call"], 1)
+        self.assertEqual(totals["artifact_name_validator"], 1)
+        self.assertEqual(totals["artifact_expectation_parser"], 1)
+        self.assertEqual(totals["bundle_output_grammar"], 1)
 
     def test_service_and_deployment_path_grammars_have_exact_owners(self) -> None:
         service = (ROOT / "runtime/internal/service/service.go").read_text(
@@ -316,6 +322,7 @@ class ServerParserInventoryTests(unittest.TestCase):
             ROOT / "runtime/internal/deployment/path_fuzz_test.go"
         ).read_text(encoding="utf-8")
         for entrypoint in {
+            "validateArtifactName(candidate)",
             "validateAbsoluteCanonicalPath(candidate)",
             "canonicalAbsolutePath(candidate)",
             "requireStrictDescendant(homeDir, installRoot",
@@ -325,6 +332,25 @@ class ServerParserInventoryTests(unittest.TestCase):
                 self.assertIn(entrypoint, deployment_fuzzer)
         self.assertIn("exactDeploymentCanonicalPath", deployment_fuzzer)
         self.assertIn("exactStrictDescendant", deployment_fuzzer)
+        self.assertIn("exactArtifactName", deployment_fuzzer)
+        artifact_name_oracle = deployment_fuzzer[
+            deployment_fuzzer.index("func exactArtifactName") :
+            deployment_fuzzer.index("func exactDeploymentCanonicalPath")
+        ]
+        self.assertNotIn("validateArtifactName", artifact_name_oracle)
+        self.assertNotIn("filepath.", artifact_name_oracle)
+
+        scalar_fuzzer = (
+            ROOT / "runtime/internal/deployment/metadata_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        self.assertIn("parseArtifactExpectation(expectedBytes, digest)", scalar_fuzzer)
+        self.assertIn("exactArtifactExpectation(expectedBytes, digest)", scalar_fuzzer)
+        artifact_expectation_oracle = scalar_fuzzer[
+            scalar_fuzzer.index("func exactArtifactExpectation") :
+        ]
+        self.assertNotIn("parseArtifactExpectation", artifact_expectation_oracle)
+        self.assertNotIn("hex.Decode", artifact_expectation_oracle)
+        self.assertNotIn("strings.ToLower", artifact_expectation_oracle)
 
         installer_fuzzer = (
             ROOT / "runtime/internal/releasebundle/installer_fuzz_test.go"
@@ -337,6 +363,14 @@ class ServerParserInventoryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("validateBundleInputPaths(options)", bundle_fuzzer)
         self.assertIn("exactBundleInputPaths(options)", bundle_fuzzer)
+        self.assertIn("validateBundleOutput(output)", bundle_fuzzer)
+        self.assertIn("exactBundleOutput(output)", bundle_fuzzer)
+        bundle_output_oracle = bundle_fuzzer[
+            bundle_fuzzer.index("func exactBundleOutput") :
+            bundle_fuzzer.index("func exactBundleInputPaths")
+        ]
+        self.assertNotIn("validateBundleOutput", bundle_output_oracle)
+        self.assertNotIn("filepath.", bundle_output_oracle)
 
         cli_fuzzer = (
             ROOT / "runtime/internal/cli/response_fuzz_test.go"

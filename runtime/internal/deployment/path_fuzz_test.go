@@ -12,12 +12,22 @@ func FuzzDeploymentPathGrammar(f *testing.F) {
 	f.Add("/", "/opt/jat/deployment", "/var/lib/jat")
 	f.Add("/home/alice", "/home/alice-sibling/deployment", "/home/alice/../state")
 	f.Add(string([]byte{'/', 'h', 0, 'm', 'e'}), "/tmp//deployment", "relative/state")
+	f.Add("sshserver", "LICENSE", "name with spaces")
+	f.Add(".", "..", "nested/artifact")
+	f.Add(string([]byte{'n', 'a', 'm', 'e', 0}), strings.Repeat("a", 129), `backslash\name`)
 
 	f.Fuzz(func(t *testing.T, homeDir, installRoot, stateDir string) {
 		if len(homeDir) > 4096 || len(installRoot) > 4096 || len(stateDir) > 4096 {
 			return
 		}
 		for _, candidate := range []string{homeDir, installRoot, stateDir} {
+			firstNameErr := validateArtifactName(candidate)
+			secondNameErr := validateArtifactName(candidate)
+			wantName := exactArtifactName(candidate)
+			if (firstNameErr == nil) != wantName || (secondNameErr == nil) != wantName {
+				t.Fatalf("artifact-name acceptance first=%v second=%v want=%v for %q", firstNameErr == nil, secondNameErr == nil, wantName, candidate)
+			}
+
 			firstErr := validateAbsoluteCanonicalPath(candidate)
 			secondErr := validateAbsoluteCanonicalPath(candidate)
 			want := exactDeploymentCanonicalPath(candidate)
@@ -60,6 +70,11 @@ func FuzzDeploymentPathGrammar(f *testing.F) {
 			t.Fatalf("derived layout differs from exact grammar: first=%+v second=%+v want=%+v", first, second, want)
 		}
 	})
+}
+
+func exactArtifactName(value string) bool {
+	return value != "" && value != "." && value != ".." && len(value) <= 128 &&
+		strings.IndexByte(value, 0) < 0 && !strings.Contains(value, "/")
 }
 
 func exactDeploymentCanonicalPath(value string) bool {

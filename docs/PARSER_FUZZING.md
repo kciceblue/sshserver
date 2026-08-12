@@ -3,7 +3,7 @@
 This repository keeps coverage-guided Go fuzz targets at every source-derived
 project-owned runtime parsing boundary. The fail-closed inventory in
 `SERVER_PARSER_INVENTORY.json` scans non-vendored production Go source and maps
-all 273 current parser/grammar signals in 32 files to one or more executable
+all 277 current parser/grammar signals in 32 files to one or more executable
 owners. The derivation also includes a zero-count scanner-constructor signal,
 so introducing a scanner fails closed before the inventory can be updated.
 The targets cover:
@@ -31,9 +31,14 @@ The targets cover:
   exact installed-artifact filename/mode grammar
   (`FuzzValidateRemovableArtifactName`), plus service-manager stdout/stderr
   lifecycle classifications (`FuzzServiceManagerOutput`) and canonical
-  deployment path/descendant grammar (`FuzzDeploymentPathGrammar`);
+  deployment path/descendant plus staged artifact-name grammar
+  (`FuzzDeploymentPathGrammar`);
+- exact staged-artifact byte-count and lowercase SHA-256 expectation grammar
+  (`FuzzDeploymentScalarParsers`);
 - exact service-definition path, systemd quoting, launchd XML escaping, and
   output-path grammar (`FuzzServiceDefinitionPaths`);
+- release-bundle input paths plus immutable output name/payload/mode grammar
+  (`FuzzValidLocalMainVersion`);
 - protected instance configuration and listener grammar
   (`FuzzDecodeConfigJSON`);
 - owner-only admin-socket requests, raw HTTP/1 request-head limits and request
