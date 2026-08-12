@@ -27,6 +27,9 @@ EXPECTED_SIGNALS = {
     "go_buildinfo_decoder_call": r"\bdebugbuildinfo\.Read\s*\(",
     "header_token_parser": r"\bfunc\s+headerContainsToken\s*\(",
     "hex_decoder_call": r"\bhex\.(?:Decode|DecodeString)\s*\(",
+    "http_body_framing_parser": (
+        r"\bfunc\s+(?:readJSONBody|requireEmptyBody)\s*\("
+    ),
     "http_request_head_limit_parser": (
         r"\bfunc\s+\(connection\s+\*headerLimitConn\)\s+Read\s*\("
     ),
@@ -277,6 +280,48 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertEqual(totals["artifact_name_validator"], 1)
         self.assertEqual(totals["artifact_expectation_parser"], 1)
         self.assertEqual(totals["bundle_output_grammar"], 1)
+        self.assertEqual(totals["http_body_framing_parser"], 2)
+
+    def test_http_body_framing_grammar_is_fail_closed_and_executed(self) -> None:
+        production = (
+            ROOT / "runtime/internal/httpapi/handler.go"
+        ).read_text(encoding="utf-8")
+        counts = self.signal_counts(production)
+        self.assertEqual(counts["http_body_framing_parser"], 2)
+        self.assertNotEqual(
+            self.signal_counts(production + "\nfunc requireEmptyBody() {}\n"),
+            counts,
+        )
+
+        fuzzer = (
+            ROOT / "runtime/internal/httpapi/handler_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for production_entrypoint in {
+            "readJSONBody(httptest.NewRecorder(), firstRequest)",
+            "requireEmptyBody(httptest.NewRecorder(), firstEmptyRequest)",
+        }:
+            with self.subTest(production_entrypoint=production_entrypoint):
+                self.assertIn(production_entrypoint, fuzzer)
+        for independent_oracle in {
+            "exactJSONBodyFraming",
+            "exactEmptyBodyFraming",
+            "httpBodyFuzzReadCloser",
+            "MaxBodyBytes+1",
+            'contentType+"\\n"+contentType',
+        }:
+            with self.subTest(independent_oracle=independent_oracle):
+                self.assertIn(independent_oracle, fuzzer)
+        oracle_source = fuzzer[
+            fuzzer.index("func exactJSONBodyFraming") :
+            fuzzer.index("func transportRequestMutation")
+        ]
+        for production_helper in {
+            "readJSONBody(",
+            "requireEmptyBody(",
+            "http.MaxBytesReader",
+            "io.ReadAll",
+        }:
+            self.assertNotIn(production_helper, oracle_source)
 
     def test_service_and_deployment_path_grammars_have_exact_owners(self) -> None:
         service = (ROOT / "runtime/internal/service/service.go").read_text(

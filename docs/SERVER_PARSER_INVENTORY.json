@@ -15,6 +15,7 @@
       "go_buildinfo_decoder_call": "\\bdebugbuildinfo\\.Read\\s*\\(",
       "header_token_parser": "\\bfunc\\s+headerContainsToken\\s*\\(",
       "hex_decoder_call": "\\bhex\\.(?:Decode|DecodeString)\\s*\\(",
+      "http_body_framing_parser": "\\bfunc\\s+(?:readJSONBody|requireEmptyBody)\\s*\\(",
       "http_request_head_limit_parser": "\\bfunc\\s+\\(connection\\s+\\*headerLimitConn\\)\\s+Read\\s*\\(",
       "http_request_id_header_parser": "\\bfunc\\s+requestIDValues\\s*\\(",
       "http_transport_validator": "\\bfunc\\s+validateTransport\\s*\\(",
@@ -43,7 +44,7 @@
       "xml_text_escape_call": "\\bxml\\.EscapeText\\s*\\("
     },
     "sourceFileCount": 32,
-    "sourceSignalCount": 277,
+    "sourceSignalCount": 279,
     "sourceSignalCounts": {
       "runtime/internal/auth/token.go": {
         "fixed_scope_set_validator": 1
@@ -139,6 +140,7 @@
       },
       "runtime/internal/httpapi/handler.go": {
         "header_token_parser": 1,
+        "http_body_framing_parser": 2,
         "http_transport_validator": 1,
         "string_split_parser_call": 2
       },
@@ -318,6 +320,12 @@
       "testFile": "runtime/internal/releasebundle/bundle_fuzz_test.go",
       "testMethod": "FuzzValidLocalMainVersion"
     },
+    "http-body-framing": {
+      "corpus": "runtime/internal/httpapi/testdata/fuzz/FuzzHTTPBodyFraming",
+      "package": "./internal/httpapi",
+      "testFile": "runtime/internal/httpapi/handler_fuzz_test.go",
+      "testMethod": "FuzzHTTPBodyFraming"
+    },
     "http-header-tokens": {
       "corpus": "runtime/internal/httpapi/testdata/fuzz/FuzzHeaderContainsToken",
       "package": "./internal/httpapi",
@@ -451,7 +459,7 @@
     },
     {
       "id": "http-transport-grammar",
-      "coverageOwners": ["http-header-tokens", "http-transport-request"],
+      "coverageOwners": ["http-body-framing", "http-header-tokens", "http-transport-request"],
       "sourceFiles": ["runtime/internal/httpapi/handler.go"]
     },
     {
