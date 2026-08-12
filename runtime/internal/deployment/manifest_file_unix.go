@@ -5,14 +5,12 @@ package deployment
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
-	"strings"
 )
 
 // ReadPinnedManifestFile loads a bounded owner-only local manifest without
 // following links and authenticates its exact bytes before returning them.
 func ReadPinnedManifestFile(path, expectedSHA256 string) ([]byte, error) {
-	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsRune(path, '\x00') {
+	if err := validateAbsoluteCanonicalPath(path); err != nil {
 		return nil, errors.New("release manifest path must be canonical and absolute")
 	}
 	payload, err := readDeploymentFile(path, maxManifestBytes)

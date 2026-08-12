@@ -1,0 +1,4 @@
+go test fuzz v1
+string("v0.0.0-20260803123456-aaaaaaaaaaaa")
+string("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+string("2026-08-03T12:34:56Z")
