@@ -10,6 +10,7 @@
       "binary_integer_decoder_call": "\\bbinary\\.(?:BigEndian|LittleEndian)\\.Uint(?:16|32|64)\\s*\\(",
       "build_metadata_parser": "\\bfunc\\s+validLocalMainVersion\\s*\\(",
       "bundle_output_grammar": "\\bfunc\\s+validateBundleOutput\\s*\\(",
+      "deployment_executable_locator": "\\bfunc\\s+locateDeploymentExecutable\\s*\\(",
       "filesystem_path_grammar_call": "\\bfilepath\\.(?:Base|Clean|Dir|EvalSymlinks|IsAbs|Rel|ToSlash)\\s*\\(",
       "fixed_scope_set_validator": "\\bfunc\\s+ValidateScopes\\s*\\(",
       "go_buildinfo_decoder_call": "\\bdebugbuildinfo\\.Read\\s*\\(",
@@ -44,7 +45,7 @@
       "xml_text_escape_call": "\\bxml\\.EscapeText\\s*\\("
     },
     "sourceFileCount": 32,
-    "sourceSignalCount": 279,
+    "sourceSignalCount": 280,
     "sourceSignalCounts": {
       "runtime/internal/auth/token.go": {
         "fixed_scope_set_validator": 1
@@ -89,6 +90,7 @@
         "string_split_parser_call": 1
       },
       "runtime/internal/deployment/endpoint_unix.go": {
+        "deployment_executable_locator": 1,
         "filesystem_path_grammar_call": 8
       },
       "runtime/internal/deployment/lifecycle.go": {
@@ -272,6 +274,12 @@
       "testFile": "runtime/internal/config/config_fuzz_test.go",
       "testMethod": "FuzzDecodeConfigJSON"
     },
+    "deployment-executable-location": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzLocateDeploymentExecutable",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/endpoint_fuzz_test.go",
+      "testMethod": "FuzzLocateDeploymentExecutable"
+    },
     "deployment-identity-json": {
       "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzParseBuildIdentityJSON",
       "package": "./internal/deployment",
@@ -434,7 +442,7 @@
     },
     {
       "id": "deployment-inputs-and-state",
-      "coverageOwners": ["deployment-manifest", "deployment-preview", "deployment-metadata", "deployment-identity-json", "deployment-scalars", "deployment-paths", "artifact-go-build-metadata", "artifact-removal-filenames", "release-identifier", "uuid-v4"],
+      "coverageOwners": ["deployment-manifest", "deployment-preview", "deployment-metadata", "deployment-identity-json", "deployment-scalars", "deployment-paths", "deployment-executable-location", "artifact-go-build-metadata", "artifact-removal-filenames", "release-identifier", "uuid-v4"],
       "sourceFiles": ["runtime/internal/deployment/artifact.go", "runtime/internal/deployment/attestation.go", "runtime/internal/deployment/endpoint_unix.go", "runtime/internal/deployment/lifecycle.go", "runtime/internal/deployment/manifest.go", "runtime/internal/deployment/paths_unix.go", "runtime/internal/deployment/preview.go", "runtime/internal/deployment/protected_unix.go", "runtime/internal/deployment/remove_artifacts_unix.go", "runtime/internal/deployment/state.go"]
     },
     {

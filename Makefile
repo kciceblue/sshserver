@@ -55,6 +55,7 @@ runtime-fuzz-smoke:
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseBuildIdentityJSON$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDeploymentScalarParsers$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzDeploymentPathGrammar$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
+	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzLocateDeploymentExecutable$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzParseArtifactGoBuildInfo$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzValidateRemovableArtifactName$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment
 	cd runtime && $(GO) test -mod=readonly -run '^$$' -fuzz '^FuzzServiceManagerOutput$$' -fuzztime=64x -fuzzminimizetime=64x -parallel=1 ./internal/deployment

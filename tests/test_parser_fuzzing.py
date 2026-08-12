@@ -20,6 +20,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "runtime/internal/deployment/metadata_fuzz_test.go#identity": "FuzzParseBuildIdentityJSON",
             "runtime/internal/deployment/metadata_fuzz_test.go#scalars": "FuzzDeploymentScalarParsers",
             "runtime/internal/deployment/path_fuzz_test.go": "FuzzDeploymentPathGrammar",
+            "runtime/internal/deployment/endpoint_fuzz_test.go": "FuzzLocateDeploymentExecutable",
             "runtime/internal/deployment/metadata_fuzz_test.go#go-buildinfo": "FuzzParseArtifactGoBuildInfo",
             "runtime/internal/deployment/remove_artifacts_fuzz_test.go": "FuzzValidateRemovableArtifactName",
             "runtime/internal/deployment/manager_fuzz_test.go": "FuzzServiceManagerOutput",
@@ -56,7 +57,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
         deterministic_budget = (
             "-fuzztime=64x -fuzzminimizetime=64x -parallel=1"
         )
-        self.assertEqual(makefile.count(deterministic_budget), 29)
+        self.assertEqual(makefile.count(deterministic_budget), 30)
         for target in (
             "FuzzDecodeStrictJSON",
             "FuzzStoredJSONShapes",
@@ -70,6 +71,7 @@ class ParserFuzzingPolicyTests(unittest.TestCase):
             "FuzzParseBuildIdentityJSON",
             "FuzzDeploymentScalarParsers",
             "FuzzDeploymentPathGrammar",
+            "FuzzLocateDeploymentExecutable",
             "FuzzParseArtifactGoBuildInfo",
             "FuzzValidateRemovableArtifactName",
             "FuzzServiceManagerOutput",

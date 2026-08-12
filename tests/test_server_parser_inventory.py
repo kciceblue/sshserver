@@ -19,6 +19,9 @@ EXPECTED_SIGNALS = {
     ),
     "build_metadata_parser": r"\bfunc\s+validLocalMainVersion\s*\(",
     "bundle_output_grammar": r"\bfunc\s+validateBundleOutput\s*\(",
+    "deployment_executable_locator": (
+        r"\bfunc\s+locateDeploymentExecutable\s*\("
+    ),
     "filesystem_path_grammar_call": (
         r"\bfilepath\."
         r"(?:Base|Clean|Dir|EvalSymlinks|IsAbs|Rel|ToSlash)\s*\("
@@ -281,6 +284,45 @@ class ServerParserInventoryTests(unittest.TestCase):
         self.assertEqual(totals["artifact_expectation_parser"], 1)
         self.assertEqual(totals["bundle_output_grammar"], 1)
         self.assertEqual(totals["http_body_framing_parser"], 2)
+        self.assertEqual(totals["deployment_executable_locator"], 1)
+
+    def test_deployed_executable_locator_has_a_direct_tree_owner(self) -> None:
+        production = (
+            ROOT / "runtime/internal/deployment/endpoint_unix.go"
+        ).read_text(encoding="utf-8")
+        counts = self.signal_counts(production)
+        self.assertEqual(counts["deployment_executable_locator"], 1)
+        self.assertNotEqual(
+            self.signal_counts(
+                production + "\nfunc locateDeploymentExecutable() {}\n"
+            ),
+            counts,
+        )
+
+        fuzzer = (
+            ROOT / "runtime/internal/deployment/endpoint_fuzz_test.go"
+        ).read_text(encoding="utf-8")
+        for required_operation in {
+            "locateDeploymentExecutable(candidate)",
+            "exactDeploymentExecutableLocation",
+            "secureTestHome(t)",
+            "os.Symlink(resolvedExecutable, candidate)",
+            "os.Symlink(versionDir, alias)",
+            "os.Chmod(installRoot, 0o770)",
+            "os.Chmod(versionDir, 0o770)",
+            "for mode := uint8(0); mode < 13; mode++",
+        }:
+            with self.subTest(required_operation=required_operation):
+                self.assertIn(required_operation, fuzzer)
+        oracle_source = fuzzer[fuzzer.index("func exactDeploymentExecutableLocation") :]
+        for production_helper in {
+            "locateDeploymentExecutable(",
+            "validateAbsoluteCanonicalPath(",
+            "requireStrictDescendant(",
+            "openVerifiedDirectory(",
+            "filepath.EvalSymlinks(",
+        }:
+            self.assertNotIn(production_helper, oracle_source)
 
     def test_http_body_framing_grammar_is_fail_closed_and_executed(self) -> None:
         production = (

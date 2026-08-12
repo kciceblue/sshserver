@@ -3,7 +3,7 @@
 This repository keeps coverage-guided Go fuzz targets at every source-derived
 project-owned runtime parsing boundary. The fail-closed inventory in
 `SERVER_PARSER_INVENTORY.json` scans non-vendored production Go source and maps
-all 279 current parser/grammar signals in 32 files to one or more executable
+all 280 current parser/grammar signals in 32 files to one or more executable
 owners. The derivation also includes a zero-count scanner-constructor signal,
 so introducing a scanner fails closed before the inventory can be updated.
 The targets cover:
@@ -35,6 +35,9 @@ The targets cover:
   (`FuzzDeploymentPathGrammar`);
 - exact staged-artifact byte-count and lowercase SHA-256 expectation grammar
   (`FuzzDeploymentScalarParsers`);
+- deployed-executable physical path hierarchy, including real and symlinked
+  launch paths, exact `versions/<release>` ancestry, home containment, and
+  owner-controlled directories (`FuzzLocateDeploymentExecutable`);
 - exact service-definition path, systemd quoting, launchd XML escaping, and
   output-path grammar (`FuzzServiceDefinitionPaths`);
 - release-bundle input paths plus immutable output name/payload/mode grammar
@@ -56,7 +59,7 @@ The targets cover:
   its production decoder (`FuzzParseReleaseBundleGoBuildInfo`); and
 - one-line installer URL/payload inputs (`FuzzInstallCommandInput`).
 
-All 29 targets have a checked-in minimized seed under their package's
+All 30 targets have a checked-in minimized seed under their package's
 `testdata/fuzz` directory. Structured owners construct canonical accepted
 seeds; each executable-metadata owner mutates a bounded copy of the current Go
 test executable through the exact production decoder, so successful metadata
