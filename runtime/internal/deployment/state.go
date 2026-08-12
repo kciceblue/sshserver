@@ -419,5 +419,5 @@ func canonicalDeploymentJSON(value any) ([]byte, error) {
 }
 
 func canonicalAbsolutePath(value string) bool {
-	return value != "" && filepath.IsAbs(value) && filepath.Clean(value) == value
+	return validateAbsoluteCanonicalPath(value) == nil
 }

@@ -1,9 +1,14 @@
 package httpapi
 
 import (
+	"bytes"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/kciceblue/sshserver/runtime/internal/api"
 )
 
 func FuzzHeaderContainsToken(f *testing.F) {
@@ -56,6 +61,140 @@ func FuzzValidateTransportRequest(f *testing.F) {
 			t.Fatalf("transport request rejection=%v want=%v", firstRejected, wantRejected)
 		}
 	})
+}
+
+func FuzzHTTPBodyFraming(f *testing.F) {
+	const contentType = "application/json; charset=utf-8"
+	f.Add("POST", contentType, []byte(`{}`), int64(2), uint8(0))
+	f.Add("PUT", contentType, []byte("x"), int64(1), uint8(3))
+	f.Add("GET", contentType, []byte(`{}`), int64(2), uint8(0))
+	f.Add("POST", "application/json", []byte(`{}`), int64(2), uint8(0))
+	f.Add("POST", contentType+"\n"+contentType, []byte(`{}`), int64(2), uint8(0))
+	f.Add("POST", contentType, []byte{}, int64(1), uint8(0))
+	f.Add("POST", contentType, []byte(`{}`), int64(0), uint8(0))
+	f.Add("POST", contentType, []byte("x"), int64(1), uint8(5))
+	f.Add("GET", "", []byte{}, int64(0), uint8(4))
+	f.Add("GET", "", []byte("x"), int64(0), uint8(0))
+
+	f.Fuzz(func(t *testing.T, method, joinedContentTypes string, input []byte, declaredLength int64, mode uint8) {
+		if len(method) > 1024 || len(joinedContentTypes) > 64*1024 || len(input) > 64*1024 {
+			return
+		}
+		contentTypes := httpBodyFuzzContentTypes(joinedContentTypes, mode)
+		body := httpBodyFuzzPayload(input, mode)
+		wantBody, wantCode := exactJSONBodyFraming(method, contentTypes, declaredLength, body)
+
+		firstRequest, _ := httpBodyFuzzRequest(method, contentTypes, declaredLength, body, mode, false)
+		secondRequest, _ := httpBodyFuzzRequest(method, contentTypes, declaredLength, body, mode, false)
+		firstBody, firstErr := readJSONBody(httptest.NewRecorder(), firstRequest)
+		secondBody, secondErr := readJSONBody(httptest.NewRecorder(), secondRequest)
+		firstCode := httpBodyFuzzErrorCode(firstErr)
+		secondCode := httpBodyFuzzErrorCode(secondErr)
+		if firstCode != wantCode || secondCode != wantCode {
+			t.Fatalf("JSON body framing code first=%q second=%q want=%q", firstCode, secondCode, wantCode)
+		}
+		if !bytes.Equal(firstBody, wantBody) || !bytes.Equal(secondBody, wantBody) {
+			t.Fatalf("JSON body framing payload lengths first=%d second=%d want=%d", len(firstBody), len(secondBody), len(wantBody))
+		}
+
+		firstEmptyRequest, firstPresent := httpBodyFuzzRequest(method, contentTypes, declaredLength, body, mode, true)
+		secondEmptyRequest, secondPresent := httpBodyFuzzRequest(method, contentTypes, declaredLength, body, mode, true)
+		firstEmptyErr := requireEmptyBody(httptest.NewRecorder(), firstEmptyRequest)
+		secondEmptyErr := requireEmptyBody(httptest.NewRecorder(), secondEmptyRequest)
+		wantEmpty := exactEmptyBodyFraming(declaredLength, body, firstPresent)
+		if firstPresent != secondPresent || (firstEmptyErr == nil) != wantEmpty || (secondEmptyErr == nil) != wantEmpty {
+			t.Fatalf("empty body framing first=%v second=%v want=%v", firstEmptyErr == nil, secondEmptyErr == nil, wantEmpty)
+		}
+	})
+}
+
+type httpBodyFuzzReadCloser struct {
+	body   []byte
+	offset int
+	chunk  int
+}
+
+func (reader *httpBodyFuzzReadCloser) Read(destination []byte) (int, error) {
+	if reader.offset == len(reader.body) {
+		return 0, io.EOF
+	}
+	count := len(reader.body) - reader.offset
+	if count > reader.chunk {
+		count = reader.chunk
+	}
+	if count > len(destination) {
+		count = len(destination)
+	}
+	copy(destination, reader.body[reader.offset:reader.offset+count])
+	reader.offset += count
+	return count, nil
+}
+
+func (*httpBodyFuzzReadCloser) Close() error { return nil }
+
+func httpBodyFuzzRequest(method string, contentTypes []string, declaredLength int64, body []byte, mode uint8, allowNil bool) (*http.Request, bool) {
+	request := &http.Request{
+		Method:        method,
+		Header:        make(http.Header),
+		ContentLength: declaredLength,
+	}
+	bodyPresent := !allowNil || mode%8 != 4
+	if bodyPresent {
+		request.Body = &httpBodyFuzzReadCloser{body: body, chunk: 1 + int(mode%32)}
+	}
+	if contentTypes != nil {
+		request.Header["Content-Type"] = append([]string(nil), contentTypes...)
+	}
+	return request, bodyPresent
+}
+
+func httpBodyFuzzContentTypes(joined string, mode uint8) []string {
+	if mode%8 == 1 {
+		return nil
+	}
+	values := strings.Split(joined, "\n")
+	if mode%8 == 2 {
+		values = append(values, values...)
+	}
+	return values
+}
+
+func httpBodyFuzzPayload(input []byte, mode uint8) []byte {
+	if mode%8 != 5 {
+		return append([]byte(nil), input...)
+	}
+	payload := make([]byte, MaxBodyBytes+1)
+	if len(input) == 0 {
+		input = []byte{'x'}
+	}
+	for offset := 0; offset < len(payload); offset += len(input) {
+		copy(payload[offset:], input)
+	}
+	return payload
+}
+
+func httpBodyFuzzErrorCode(err *api.Error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Code
+}
+
+func exactJSONBodyFraming(method string, contentTypes []string, declaredLength int64, body []byte) ([]byte, string) {
+	if (method != "POST" && method != "PUT") || len(contentTypes) != 1 || contentTypes[0] != "application/json; charset=utf-8" || declaredLength <= 0 {
+		return nil, "invalid_request"
+	}
+	if len(body) > MaxBodyBytes {
+		return nil, "limit_exceeded"
+	}
+	if len(body) == 0 {
+		return nil, "invalid_request"
+	}
+	return append([]byte(nil), body...), ""
+}
+
+func exactEmptyBodyFraming(declaredLength int64, body []byte, bodyPresent bool) bool {
+	return declaredLength == 0 && (!bodyPresent || len(body) == 0)
 }
 
 func transportRequestMutation(mutation []byte) (*http.Request, bool) {

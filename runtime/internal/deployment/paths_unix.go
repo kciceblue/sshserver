@@ -67,7 +67,7 @@ func NewLayout(homeDir, installRoot, stateDir string) (Layout, error) {
 		"install root":    installRoot,
 		"state directory": stateDir,
 	} {
-		if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value || strings.ContainsRune(value, '\x00') {
+		if err := validateAbsoluteCanonicalPath(value); err != nil {
 			return Layout{}, fmt.Errorf("%s must be a canonical absolute path without NUL", name)
 		}
 	}

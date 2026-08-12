@@ -3,10 +3,13 @@
 This repository keeps coverage-guided Go fuzz targets at every source-derived
 project-owned runtime parsing boundary. The fail-closed inventory in
 `SERVER_PARSER_INVENTORY.json` scans non-vendored production Go source and maps
-all 87 current parser signals in 26 files to one or more executable owners.
+all 280 current parser/grammar signals in 32 files to one or more executable
+owners. The derivation also includes a zero-count scanner-constructor signal,
+so introducing a scanner fails closed before the inventory can be updated.
 The targets cover:
 
 - strict sync requests plus every V1 request DTO (`FuzzDecodeStrictJSON`);
+- the exact ordered, complete V1 authorization scope set (`FuzzStoredJSONShapes`);
 - device-revocation and snapshot-page route identifiers
   (`FuzzPathIdentifier`);
 - persisted operation-receipt keys and their destination-specific response
@@ -27,15 +30,27 @@ The targets cover:
   the production artifact decoder (`FuzzParseArtifactGoBuildInfo`) and the
   exact installed-artifact filename/mode grammar
   (`FuzzValidateRemovableArtifactName`), plus service-manager stdout/stderr
-  lifecycle classifications (`FuzzServiceManagerOutput`);
+  lifecycle classifications (`FuzzServiceManagerOutput`) and canonical
+  deployment path/descendant plus staged artifact-name grammar
+  (`FuzzDeploymentPathGrammar`);
+- exact staged-artifact byte-count and lowercase SHA-256 expectation grammar
+  (`FuzzDeploymentScalarParsers`);
+- deployed-executable physical path hierarchy, including real and symlinked
+  launch paths, exact `versions/<release>` ancestry, home containment, and
+  owner-controlled directories (`FuzzLocateDeploymentExecutable`);
+- exact service-definition path, systemd quoting, launchd XML escaping, and
+  output-path grammar (`FuzzServiceDefinitionPaths`);
+- release-bundle input paths plus immutable output name/payload/mode grammar
+  (`FuzzValidLocalMainVersion`);
 - protected instance configuration and listener grammar
   (`FuzzDecodeConfigJSON`);
 - owner-only admin-socket requests, raw HTTP/1 request-head limits and request
   IDs, and the CLI's strict loopback responses (`FuzzDecodeAdminRequest`,
   `FuzzHTTP1RequestHead`, `FuzzDecodeCLIResponses`);
-- the complete HTTP transport request grammar plus comma-delimited
-  `Connection` header tokens (`FuzzValidateTransportRequest`,
-  `FuzzHeaderContainsToken`);
+- the complete HTTP transport request grammar, comma-delimited `Connection`
+  header tokens, and exact JSON/empty-body framing over content type, declared
+  length, streamed payloads, and the body limit (`FuzzValidateTransportRequest`,
+  `FuzzHeaderContainsToken`, `FuzzHTTPBodyFraming`);
 - build attestations, UUIDv4, and release identifiers
   (`FuzzParseAttestation`, `FuzzParseUUIDv4`,
   `FuzzReleaseIdentifier`);
@@ -44,7 +59,7 @@ The targets cover:
   its production decoder (`FuzzParseReleaseBundleGoBuildInfo`); and
 - one-line installer URL/payload inputs (`FuzzInstallCommandInput`).
 
-All 26 targets have a checked-in minimized invalid seed under their package's
+All 30 targets have a checked-in minimized seed under their package's
 `testdata/fuzz` directory. Structured owners construct canonical accepted
 seeds; each executable-metadata owner mutates a bounded copy of the current Go
 test executable through the exact production decoder, so successful metadata
