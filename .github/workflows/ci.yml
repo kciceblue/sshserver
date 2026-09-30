@@ -11,8 +11,9 @@ on:
 
 jobs:
   policy:
+    timeout-minutes: 120
     name: Repository policy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64, kcice-ci]
     outputs:
       validated_head_sha: ${{ steps.checked_out.outputs.head_sha }}
     permissions:
@@ -27,6 +28,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pull_request_number }}
         run: |
           set -euo pipefail
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.repo.full_name)" = "$GITHUB_REPOSITORY"
           head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)"
           test -n "$head_sha"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
@@ -57,9 +59,11 @@ jobs:
         run: make check
 
   crypto_kat:
+    timeout-minutes: 120
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: Independent Swift and Go crypto KAT
     needs: policy
-    runs-on: macos-15
+    runs-on: [self-hosted, macOS, ARM64, kcice-ci]
     permissions:
       contents: read
     steps:
@@ -84,13 +88,14 @@ jobs:
         run: make kat
 
   runtime_matrix:
+    timeout-minutes: 120
     name: Runtime ${{ matrix.goos }} ${{ matrix.goarch }}
     needs: policy
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: [self-hosted, linux, X64, kcice-ci]
             goos: linux
             goarch: amd64
           - runner: ubuntu-24.04-arm
@@ -99,7 +104,7 @@ jobs:
           - runner: macos-15-intel
             goos: darwin
             goarch: amd64
-          - runner: macos-15
+          - runner: [self-hosted, macOS, ARM64, kcice-ci]
             goos: darwin
             goarch: arm64
     runs-on: ${{ matrix.runner }}
@@ -153,10 +158,11 @@ jobs:
         run: go test -mod=readonly -run '^TestRuntimeUserServiceSSHTunnel$' -v ./integration
 
   report:
+    timeout-minutes: 120
     name: Publish repository-policy status
-    if: always() && inputs.pull_request_number > 0
+    if: (always() && inputs.pull_request_number > 0) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: [policy, crypto_kat, runtime_matrix]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64, kcice-ci]
     permissions:
       pull-requests: read
       statuses: write
