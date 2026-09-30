@@ -47,6 +47,6 @@ The wazero attribution notice is:
 Complete distributed license and notice texts for this graph are collected in
 `ThirdPartyLicenses/runtime-go-modules-LICENSES.txt`.
 
-X.4 development CI uses actions/checkout v7.0.1 and actions/github-script v8
+X.4 development CI uses actions/checkout v7.0.1
 under the MIT license, pinned by commit in the workflow and recorded in the
 dependency inventory. These are CI-only tools, not product runtime code.
