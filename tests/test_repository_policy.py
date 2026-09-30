@@ -129,6 +129,13 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertNotIn("sudo", workflow)
         self.assertNotIn("curl |", workflow)
 
+    def test_release_dependents_require_success_even_when_not_cancelled(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        for job in ("deploy", "finalize"):
+            # Select the job's first condition directly; steps may have their own guards.
+            condition = workflow.split(f"\n  {job}:\n", 1)[1].split("    if:", 1)[1].splitlines()[0]
+            self.assertIn("success() && !cancelled()", condition, job)
+
     def test_runtime_build_preserves_absolute_and_whitespace_directories(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         self.assertIn(
