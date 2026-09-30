@@ -121,6 +121,18 @@
       "selector": "golang.org/x/sys@v0.41.0",
       "usage": "go-module",
       "version": "v0.41.0"
+    },
+    {
+      "license": "MIT",
+      "name": "actions/checkout",
+      "selector": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "usage": "ci-action"
+    },
+    {
+      "license": "MIT",
+      "name": "actions/github-script",
+      "selector": "actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd",
+      "usage": "ci-action"
     }
   ],
   "policy": "go-modules-ci-actions-and-test-tools",
