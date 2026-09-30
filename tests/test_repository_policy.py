@@ -182,7 +182,9 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("go-version-file: go.mod", workflow)
         self.assertIn("fetch-depth: 0", workflow)
         self.assertIn("runs-on: [self-hosted, macOS, ARM64, kcice-ci]", workflow)
-        self.assertIn("brew install openssl@3", workflow)
+        self.assertIn("openssl-3.6.3.tar.gz", workflow)
+        self.assertIn("243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1", workflow)
+        self.assertIn("JAT_OPENSSL_BIN=$OPENSSL_PREFIX/bin/openssl", workflow)
         self.assertIn("run: make kat", workflow)
         self.assertIn("needs: [policy, crypto_kat, runtime_matrix]", workflow)
         for runner in (

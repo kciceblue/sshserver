@@ -83,7 +83,26 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Provision the reviewed OpenSSL 3 provider
-        run: brew install openssl@3
+        env:
+          OPENSSL_PREFIX: ${{ runner.tool_cache }}/openssl/3.6.3
+        run: |
+          set -euo pipefail
+          if [ ! -x "$OPENSSL_PREFIX/bin/openssl" ]; then
+            build_dir="$(mktemp -d "$RUNNER_TEMP/openssl.XXXXXX")"
+            trap 'rm -rf "$build_dir"' EXIT
+            cd "$build_dir"
+            curl --fail --location --retry 3 --proto '=https' \
+              https://github.com/openssl/openssl/releases/download/openssl-3.6.3/openssl-3.6.3.tar.gz \
+              -o openssl.tar.gz
+            echo '243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1  openssl.tar.gz' | shasum -a 256 -c -
+            tar xzf openssl.tar.gz
+            cd openssl-3.6.3
+            ./Configure --prefix="$OPENSSL_PREFIX" no-shared
+            make -j4
+            make install_sw
+          fi
+          "$OPENSSL_PREFIX/bin/openssl" version
+          echo "JAT_OPENSSL_BIN=$OPENSSL_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Reproduce independent Swift and Go vectors
         run: make kat
 
