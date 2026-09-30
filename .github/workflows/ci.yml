@@ -60,7 +60,7 @@ jobs:
 
   crypto_kat:
     timeout-minutes: 120
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Independent Swift and Go crypto KAT
     needs: policy
     runs-on: [self-hosted, macOS, ARM64, kcice-ci]
@@ -179,7 +179,7 @@ jobs:
   report:
     timeout-minutes: 120
     name: Publish repository-policy status
-    if: (always() && inputs.pull_request_number > 0) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: ${{ !cancelled() && ((always() && inputs.pull_request_number > 0) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
     needs: [policy, crypto_kat, runtime_matrix]
     runs-on: [self-hosted, linux, X64, kcice-ci]
     permissions:
