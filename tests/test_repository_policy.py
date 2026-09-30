@@ -188,7 +188,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("uses: actions/setup-go@v6", workflow)
         self.assertIn("go-version-file: go.mod", workflow)
         self.assertIn("fetch-depth: 0", workflow)
-        self.assertIn("runs-on: [self-hosted, macOS, ARM64, kcice-ci]", workflow)
+        self.assertIn("runs-on: [self-hosted, macOS, ARM64, kcice-ci, kcice-build]", workflow)
         self.assertIn("openssl-3.6.3.tar.gz", workflow)
         self.assertIn("243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1", workflow)
         self.assertIn("JAT_OPENSSL_BIN=$OPENSSL_PREFIX/bin/openssl", workflow)
@@ -198,7 +198,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "[self-hosted, linux, X64, kcice-ci]",
             "ubuntu-24.04-arm",
             "macos-15-intel",
-            "[self-hosted, macOS, ARM64, kcice-ci]",
+            "[self-hosted, macOS, ARM64, kcice-ci, kcice-build]",
         ):
             self.assertIn(f"runner: {runner}", workflow)
         self.assertIn("go-version-file: runtime/go.mod", workflow)
