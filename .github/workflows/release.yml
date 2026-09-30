@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build:
     timeout-minutes: 120
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ success() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Build and archive exact release
     runs-on: [self-hosted, linux, X64, kcice-ci]
     permissions:
@@ -133,7 +133,7 @@ jobs:
 
   deploy:
     timeout-minutes: 120
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ success() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Deploy exact release site
     needs: build
     runs-on: [self-hosted, linux, X64, kcice-ci]
@@ -150,7 +150,7 @@ jobs:
 
   finalize:
     timeout-minutes: 120
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ success() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Verify publication and tag source
     needs: [build, deploy]
     runs-on: [self-hosted, linux, X64, kcice-ci]
