@@ -60,7 +60,7 @@ jobs:
 
   crypto_kat:
     timeout-minutes: 120
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ success() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Independent Swift and Go crypto KAT
     needs: policy
     runs-on: [self-hosted, macOS, ARM64, kcice-ci]
