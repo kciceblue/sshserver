@@ -18,8 +18,10 @@ concurrency:
 
 jobs:
   build:
+    timeout-minutes: 120
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: Build and archive exact release
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, X64, kcice-ci]
     permissions:
       contents: write
     outputs:
@@ -130,9 +132,11 @@ jobs:
           path: ${{ runner.temp }}/pages-artifact
 
   deploy:
+    timeout-minutes: 120
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: Deploy exact release site
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, X64, kcice-ci]
     permissions:
       pages: write
       id-token: write
@@ -145,9 +149,11 @@ jobs:
         uses: actions/deploy-pages@v4
 
   finalize:
+    timeout-minutes: 120
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: Verify publication and tag source
     needs: [build, deploy]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, X64, kcice-ci]
     permissions:
       contents: write
     steps:
