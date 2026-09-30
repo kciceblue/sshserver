@@ -72,12 +72,20 @@ class RepositoryPolicyTests(unittest.TestCase):
             'test "$current_head_sha" = "$VALIDATED_HEAD_SHA"', workflow
         )
 
-    def test_all_workflows_are_manual_only(self) -> None:
+    def test_only_local_review_is_automatic(self) -> None:
         workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
         self.assertTrue(workflows)
         for workflow in workflows:
             with self.subTest(workflow=workflow.name):
                 text = workflow.read_text(encoding="utf-8")
+                if workflow.name == "codex-review.yml":
+                    self.assertIn("on:\n  pull_request:", text)
+                    self.assertIn("\n  workflow_dispatch:", text)
+                    self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", text)
+                    self.assertIn("runs-on: [self-hosted, macOS, ARM64, kcice-ci, codex-review]", text)
+                    for trigger in ("push", "schedule", "merge_group", "pull_request_target"):
+                        self.assertNotIn(f"\n  {trigger}:", text)
+                    continue
                 self.assertIn("on:\n  workflow_dispatch:", text)
                 for trigger in ("pull_request", "push", "schedule", "merge_group"):
                     self.assertNotIn(f"\n  {trigger}:", text)
@@ -173,15 +181,15 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("uses: actions/setup-go@v6", workflow)
         self.assertIn("go-version-file: go.mod", workflow)
         self.assertIn("fetch-depth: 0", workflow)
-        self.assertIn("runs-on: macos-15", workflow)
+        self.assertIn("runs-on: [self-hosted, macOS, ARM64, kcice-ci]", workflow)
         self.assertIn("brew install openssl@3", workflow)
         self.assertIn("run: make kat", workflow)
         self.assertIn("needs: [policy, crypto_kat, runtime_matrix]", workflow)
         for runner in (
-            "ubuntu-24.04",
+            "[self-hosted, linux, X64, kcice-ci]",
             "ubuntu-24.04-arm",
             "macos-15-intel",
-            "macos-15",
+            "[self-hosted, macOS, ARM64, kcice-ci]",
         ):
             self.assertIn(f"runner: {runner}", workflow)
         self.assertIn("go-version-file: runtime/go.mod", workflow)
