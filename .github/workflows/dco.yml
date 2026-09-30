@@ -11,7 +11,7 @@ on:
 jobs:
   commits:
     timeout-minutes: 120
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ success() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Signed-off commits
     runs-on: [self-hosted, linux, X64, kcice-ci]
     outputs:
