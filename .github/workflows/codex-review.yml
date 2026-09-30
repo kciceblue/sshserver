@@ -28,21 +28,10 @@ jobs:
     steps:
       - name: Resolve the current PR commits
         id: pr
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
-        with:
-          script: |
-            const number = Number(process.env.PR_NUMBER);
-            if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid PR number');
-            const { data: pr } = await github.rest.pulls.get({...context.repo, pull_number: number});
-            if (pr.state !== 'open' || pr.draft) throw new Error('PR must be open and ready for review');
-            if (pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
-              throw new Error('This private runner only reviews same-repository branches');
-            }
-            core.setOutput('number', String(number));
-            core.setOutput('head', pr.head.sha);
-            core.setOutput('base', pr.base.sha);
+        run: python3 "${CI_CODEX_REVIEW:?Mac runner review helper is missing}" resolve
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.pr.outputs.head }}
@@ -51,43 +40,14 @@ jobs:
       - name: Review with the Mac mini's Codex subscription
         env:
           REVIEW_BASE: ${{ steps.pr.outputs.base }}
-        run: |
-          set -euo pipefail
-          # No build/test execution or GitHub write token in the review process.
-          # One Mac runner serializes reviews and preserves the existing login.
-          review_home="${CODEX_REVIEW_HOME:-$HOME}"
-          env -i HOME="$review_home" PATH="$review_home/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-            codex exec review --base "$REVIEW_BASE" \
-            --ignore-user-config --ignore-rules --ephemeral \
-            -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
-            -c 'model_reasoning_effort="high"' \
-            --output-last-message "$RUNNER_TEMP/codex-review.md"
-          test -s "$RUNNER_TEMP/codex-review.md"
+        run: python3 "${CI_CODEX_REVIEW:?Mac runner review helper is missing}" review
       - name: Update the PR review summary
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           REVIEW_HEAD: ${{ steps.pr.outputs.head }}
           REVIEW_BASE: ${{ steps.pr.outputs.base }}
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const issue_number = Number(process.env.PR_NUMBER);
-            const { data: pr } = await github.rest.pulls.get({...context.repo, pull_number: issue_number});
-            if (pr.state !== 'open' || pr.head.sha !== process.env.REVIEW_HEAD || pr.base.sha !== process.env.REVIEW_BASE) {
-              core.notice('PR changed during review; suppressing stale results.');
-              return;
-            }
-            const marker = '<!-- kcice-local-codex-review -->';
-            const report = fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'codex-review.md'), 'utf8');
-            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const body = `${marker}\n## Codex review · Mac mini\n\nReviewed \`${process.env.REVIEW_HEAD}\` against \`${process.env.REVIEW_BASE}\`. [Run](${run})\n\n${report.slice(0, 55000)}${report.length > 55000 ? '\n\nReport truncated; see the run log for the full review.' : ''}\n\n---\nAdvisory review using the maintainer’s Codex subscription. A successful check means the review completed; evaluate findings before merging.`;
-            const comments = await github.paginate(github.rest.issues.listComments, {...context.repo, issue_number, per_page: 100});
-            const existing = comments.find(c => c.user.login === 'github-actions[bot]' && (c.body.includes(marker) || c.body.includes('<!-- fontplayground-local-codex-review -->')));
-            if (existing) await github.rest.issues.updateComment({...context.repo, comment_id: existing.id, body});
-            else await github.rest.issues.createComment({...context.repo, issue_number, body});
-            await core.summary.addRaw(body).write();
+        run: python3 "${CI_CODEX_REVIEW:?Mac runner review helper is missing}" publish
       - name: Remove temporary review output
         if: always()
         run: rm -f "$RUNNER_TEMP/codex-review.md"
