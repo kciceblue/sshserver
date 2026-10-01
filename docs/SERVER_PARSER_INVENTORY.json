@@ -1,0 +1,521 @@
+{
+  "schemaVersion": 1,
+  "scope": "Project-owned Go runtime sources under runtime/, excluding vendored third_party code, tests, and the conformance fixture tool",
+  "sourceDerivation": {
+    "description": "Exact signal counts are recomputed by tests/test_server_parser_inventory.py. Any new or changed signal-bearing runtime file fails closed until its parser boundary and fuzz owner are reviewed together.",
+    "signals": {
+      "artifact_expectation_parser": "\\bfunc\\s+parseArtifactExpectation\\s*\\(",
+      "artifact_name_validator": "\\bfunc\\s+validateArtifactName\\s*\\(",
+      "base64_decoder_call": "\\bbase64\\.(?:RawURL|URL|RawStd|Std)Encoding(?:\\.Strict\\(\\))?\\.Decode(?:String)?\\s*\\(",
+      "binary_integer_decoder_call": "\\bbinary\\.(?:BigEndian|LittleEndian)\\.Uint(?:16|32|64)\\s*\\(",
+      "build_metadata_parser": "\\bfunc\\s+validLocalMainVersion\\s*\\(",
+      "bundle_output_grammar": "\\bfunc\\s+validateBundleOutput\\s*\\(",
+      "deployment_executable_locator": "\\bfunc\\s+locateDeploymentExecutable\\s*\\(",
+      "filesystem_path_grammar_call": "\\bfilepath\\.(?:Base|Clean|Dir|EvalSymlinks|IsAbs|Rel|ToSlash)\\s*\\(",
+      "fixed_scope_set_validator": "\\bfunc\\s+ValidateScopes\\s*\\(",
+      "go_buildinfo_decoder_call": "\\bdebugbuildinfo\\.Read\\s*\\(",
+      "header_token_parser": "\\bfunc\\s+headerContainsToken\\s*\\(",
+      "hex_decoder_call": "\\bhex\\.(?:Decode|DecodeString)\\s*\\(",
+      "http_body_framing_parser": "\\bfunc\\s+(?:readJSONBody|requireEmptyBody)\\s*\\(",
+      "http_request_head_limit_parser": "\\bfunc\\s+\\(connection\\s+\\*headerLimitConn\\)\\s+Read\\s*\\(",
+      "http_request_id_header_parser": "\\bfunc\\s+requestIDValues\\s*\\(",
+      "http_transport_validator": "\\bfunc\\s+validateTransport\\s*\\(",
+      "install_command_parser": "\\bfunc\\s+InstallCommand\\s*\\(",
+      "installed_artifact_filename_validator": "\\bfunc\\s+validateRemovableArtifact\\s*\\(",
+      "json_decoder_constructor": "\\bjson\\.NewDecoder\\s*\\(",
+      "json_unmarshal_call": "\\bjson\\.Unmarshal\\s*\\(",
+      "listener_validator": "\\bfunc\\s+ValidateListener\\s*\\(",
+      "network_address_parser_call": "\\bnet\\.(?:SplitHostPort|ParseIP|ParseCIDR)\\s*\\(",
+      "operation_receipt_key_parser": "\\bfunc\\s+validOperationReceiptKey\\s*\\(",
+      "parser_function_declaration": "\\bfunc\\s+(?:[Pp]arse|[Dd]ecode)[A-Za-z0-9_]*\\s*\\(",
+      "regexp_grammar_constructor": "\\bregexp\\.(?:MustCompile|Compile)\\s*\\(",
+      "regexp_match_call": "\\b[A-Za-z_][A-Za-z0-9_]*\\.(?:MatchString|FindStringSubmatch)\\s*\\(",
+      "release_identifier_validator": "\\bfunc\\s+Valid\\s*\\(",
+      "route_identifier_parser": "\\bfunc\\s+pathIdentifier\\s*\\(",
+      "scanner_constructor": "\\bbufio\\.NewScanner\\s*\\(",
+      "service_definition_grammar": "\\bfunc\\s+(?:Render|validPathText|validateServicePath|quoteSystemd(?:ExecArgument|Path)?)\\s*\\(",
+      "service_manager_output_parser": "(?:\\bfunc\\s+(?:(?:\\(adapter\\s+ServiceManagerAdapter\\)\\s+IsActive)|(?:managerUnavailable|managerNotLoaded|systemdInactiveState))\\s*\\(|\\bresult\\.(?:Stdout|Stderr)\\b)",
+      "sqlite_schema_state_parser": "\\bfunc\\s+(?:inspectSchemaState|validateSchemaState|readSchemaTables|schemaTablesEqual)\\s*\\(",
+      "strconv_parser_call": "\\bstrconv\\.(?:Atoi|ParseBool|ParseFloat|ParseInt|ParseUint)\\s*\\(",
+      "slash_path_grammar_call": "\\b(?:path|pathpkg)\\.(?:Base|Clean)\\s*\\(",
+      "string_split_parser_call": "\\b(?:bytes|strings)\\.(?:Split|SplitN|Fields|FieldsFunc|Cut|CutPrefix|Trim|TrimSpace|TrimPrefix|TrimSuffix)\\s*\\(",
+      "time_parser_call": "\\btime\\.Parse\\s*\\(",
+      "url_parser_call": "\\burl\\.(?:Parse|ParseQuery)\\s*\\(",
+      "utf8_text_validator_call": "\\butf8\\.ValidString\\s*\\(",
+      "xml_text_escape_call": "\\bxml\\.EscapeText\\s*\\("
+    },
+    "sourceFileCount": 32,
+    "sourceSignalCount": 280,
+    "sourceSignalCounts": {
+      "runtime/internal/auth/token.go": {
+        "fixed_scope_set_validator": 1
+      },
+      "runtime/internal/buildinfo/buildinfo.go": {
+        "parser_function_declaration": 1,
+        "regexp_grammar_constructor": 3,
+        "regexp_match_call": 3,
+        "string_split_parser_call": 3
+      },
+      "runtime/internal/cli/cli.go": {
+        "base64_decoder_call": 2,
+        "filesystem_path_grammar_call": 1,
+        "json_decoder_constructor": 2,
+        "network_address_parser_call": 1,
+        "parser_function_declaration": 2,
+        "strconv_parser_call": 1,
+        "string_split_parser_call": 1,
+        "time_parser_call": 1
+      },
+      "runtime/internal/config/config.go": {
+        "filesystem_path_grammar_call": 3,
+        "json_decoder_constructor": 1,
+        "listener_validator": 1,
+        "network_address_parser_call": 3,
+        "parser_function_declaration": 1,
+        "strconv_parser_call": 1
+      },
+      "runtime/internal/deployment/artifact.go": {
+        "artifact_expectation_parser": 1,
+        "artifact_name_validator": 1,
+        "filesystem_path_grammar_call": 9,
+        "go_buildinfo_decoder_call": 1,
+        "hex_decoder_call": 1,
+        "parser_function_declaration": 2,
+        "string_split_parser_call": 2
+      },
+      "runtime/internal/deployment/attestation.go": {
+        "json_decoder_constructor": 1,
+        "parser_function_declaration": 1,
+        "regexp_match_call": 3,
+        "string_split_parser_call": 1
+      },
+      "runtime/internal/deployment/endpoint_unix.go": {
+        "deployment_executable_locator": 1,
+        "filesystem_path_grammar_call": 8
+      },
+      "runtime/internal/deployment/lifecycle.go": {
+        "filesystem_path_grammar_call": 2,
+        "regexp_match_call": 4
+      },
+      "runtime/internal/deployment/manifest.go": {
+        "hex_decoder_call": 1,
+        "json_decoder_constructor": 1,
+        "parser_function_declaration": 3,
+        "regexp_grammar_constructor": 4,
+        "regexp_match_call": 10,
+        "slash_path_grammar_call": 4,
+        "string_split_parser_call": 2,
+        "url_parser_call": 2
+      },
+      "runtime/internal/deployment/manager.go": {
+        "filesystem_path_grammar_call": 2,
+        "service_manager_output_parser": 13,
+        "string_split_parser_call": 4
+      },
+      "runtime/internal/deployment/paths_unix.go": {
+        "filesystem_path_grammar_call": 8,
+        "string_split_parser_call": 3
+      },
+      "runtime/internal/deployment/preview.go": {
+        "filesystem_path_grammar_call": 2,
+        "json_decoder_constructor": 1,
+        "parser_function_declaration": 1,
+        "regexp_grammar_constructor": 1,
+        "regexp_match_call": 9,
+        "slash_path_grammar_call": 1,
+        "url_parser_call": 1
+      },
+      "runtime/internal/deployment/protected_unix.go": {
+        "filesystem_path_grammar_call": 1
+      },
+      "runtime/internal/deployment/remove_artifacts_unix.go": {
+        "installed_artifact_filename_validator": 1,
+        "regexp_grammar_constructor": 2,
+        "regexp_match_call": 4
+      },
+      "runtime/internal/deployment/state.go": {
+        "filesystem_path_grammar_call": 2,
+        "json_decoder_constructor": 1,
+        "parser_function_declaration": 1,
+        "regexp_grammar_constructor": 1,
+        "regexp_match_call": 9
+      },
+      "runtime/internal/httpapi/handler.go": {
+        "header_token_parser": 1,
+        "http_body_framing_parser": 2,
+        "http_transport_validator": 1,
+        "string_split_parser_call": 2
+      },
+      "runtime/internal/releasebundle/bundle.go": {
+        "build_metadata_parser": 1,
+        "bundle_output_grammar": 1,
+        "filesystem_path_grammar_call": 6,
+        "go_buildinfo_decoder_call": 1,
+        "parser_function_declaration": 1,
+        "regexp_grammar_constructor": 1,
+        "regexp_match_call": 1,
+        "time_parser_call": 2
+      },
+      "runtime/internal/releasebundle/installer.go": {
+        "filesystem_path_grammar_call": 4,
+        "install_command_parser": 1,
+        "regexp_grammar_constructor": 1,
+        "regexp_match_call": 1,
+        "slash_path_grammar_call": 1,
+        "string_split_parser_call": 3,
+        "url_parser_call": 1
+      },
+      "runtime/internal/releaseid/releaseid.go": {
+        "regexp_grammar_constructor": 1,
+        "regexp_match_call": 1,
+        "release_identifier_validator": 1
+      },
+      "runtime/internal/server/server.go": {
+        "http_request_head_limit_parser": 1,
+        "http_request_id_header_parser": 1,
+        "json_decoder_constructor": 1,
+        "network_address_parser_call": 3,
+        "parser_function_declaration": 1,
+        "strconv_parser_call": 1,
+        "string_split_parser_call": 2
+      },
+      "runtime/internal/service/service.go": {
+        "filesystem_path_grammar_call": 4,
+        "service_definition_grammar": 6,
+        "utf8_text_validator_call": 1,
+        "xml_text_escape_call": 1
+      },
+      "runtime/internal/store/collection.go": {
+        "json_unmarshal_call": 2
+      },
+      "runtime/internal/store/dataplane.go": {
+        "json_unmarshal_call": 1,
+        "operation_receipt_key_parser": 1,
+        "parser_function_declaration": 1,
+        "route_identifier_parser": 1,
+        "string_split_parser_call": 2
+      },
+      "runtime/internal/store/devices.go": {
+        "json_unmarshal_call": 1,
+        "time_parser_call": 1
+      },
+      "runtime/internal/store/envelope.go": {
+        "json_unmarshal_call": 1
+      },
+      "runtime/internal/store/models.go": {
+        "base64_decoder_call": 1,
+        "json_decoder_constructor": 2,
+        "json_unmarshal_call": 3,
+        "parser_function_declaration": 5,
+        "strconv_parser_call": 1,
+        "string_split_parser_call": 4,
+        "time_parser_call": 1
+      },
+      "runtime/internal/store/schema.go": {
+        "sqlite_schema_state_parser": 4
+      },
+      "runtime/internal/store/snapshot.go": {
+        "json_unmarshal_call": 2,
+        "parser_function_declaration": 1
+      },
+      "runtime/internal/store/store.go": {
+        "binary_integer_decoder_call": 1,
+        "filesystem_path_grammar_call": 8,
+        "json_unmarshal_call": 1,
+        "parser_function_declaration": 1
+      },
+      "runtime/internal/store/sync.go": {
+        "json_unmarshal_call": 5
+      },
+      "runtime/internal/store/validation.go": {
+        "json_unmarshal_call": 3,
+        "parser_function_declaration": 2
+      },
+      "runtime/internal/uuidv4/uuid.go": {
+        "hex_decoder_call": 1,
+        "parser_function_declaration": 1
+      }
+    }
+  },
+  "coverageOwners": {
+    "admin-request": {
+      "corpus": "runtime/internal/server/testdata/fuzz/FuzzDecodeAdminRequest",
+      "package": "./internal/server",
+      "testFile": "runtime/internal/server/server_fuzz_test.go",
+      "testMethod": "FuzzDecodeAdminRequest"
+    },
+    "artifact-go-build-metadata": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzParseArtifactGoBuildInfo",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/metadata_fuzz_test.go",
+      "testMethod": "FuzzParseArtifactGoBuildInfo"
+    },
+    "artifact-removal-filenames": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzValidateRemovableArtifactName",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/remove_artifacts_fuzz_test.go",
+      "testMethod": "FuzzValidateRemovableArtifactName"
+    },
+    "build-attestation": {
+      "corpus": "runtime/internal/buildinfo/testdata/fuzz/FuzzParseAttestation",
+      "package": "./internal/buildinfo",
+      "testFile": "runtime/internal/buildinfo/buildinfo_fuzz_test.go",
+      "testMethod": "FuzzParseAttestation"
+    },
+    "cli-responses": {
+      "corpus": "runtime/internal/cli/testdata/fuzz/FuzzDecodeCLIResponses",
+      "package": "./internal/cli",
+      "testFile": "runtime/internal/cli/response_fuzz_test.go",
+      "testMethod": "FuzzDecodeCLIResponses"
+    },
+    "config-json-and-listener": {
+      "corpus": "runtime/internal/config/testdata/fuzz/FuzzDecodeConfigJSON",
+      "package": "./internal/config",
+      "testFile": "runtime/internal/config/config_fuzz_test.go",
+      "testMethod": "FuzzDecodeConfigJSON"
+    },
+    "deployment-executable-location": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzLocateDeploymentExecutable",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/endpoint_fuzz_test.go",
+      "testMethod": "FuzzLocateDeploymentExecutable"
+    },
+    "deployment-identity-json": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzParseBuildIdentityJSON",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/metadata_fuzz_test.go",
+      "testMethod": "FuzzParseBuildIdentityJSON"
+    },
+    "deployment-manifest": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzParsePinnedManifest",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/parser_fuzz_test.go",
+      "testMethod": "FuzzParsePinnedManifest"
+    },
+    "deployment-metadata": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzDecodeDeploymentMetadata",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/metadata_fuzz_test.go",
+      "testMethod": "FuzzDecodeDeploymentMetadata"
+    },
+    "deployment-paths": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzDeploymentPathGrammar",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/path_fuzz_test.go",
+      "testMethod": "FuzzDeploymentPathGrammar"
+    },
+    "deployment-preview": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzParseDeploymentPreview",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/parser_fuzz_test.go",
+      "testMethod": "FuzzParseDeploymentPreview"
+    },
+    "deployment-scalars": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzDeploymentScalarParsers",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/metadata_fuzz_test.go",
+      "testMethod": "FuzzDeploymentScalarParsers"
+    },
+    "install-command": {
+      "corpus": "runtime/internal/releasebundle/testdata/fuzz/FuzzInstallCommandInput",
+      "package": "./internal/releasebundle",
+      "testFile": "runtime/internal/releasebundle/installer_fuzz_test.go",
+      "testMethod": "FuzzInstallCommandInput"
+    },
+    "local-main-build-metadata": {
+      "corpus": "runtime/internal/releasebundle/testdata/fuzz/FuzzValidLocalMainVersion",
+      "package": "./internal/releasebundle",
+      "testFile": "runtime/internal/releasebundle/bundle_fuzz_test.go",
+      "testMethod": "FuzzValidLocalMainVersion"
+    },
+    "http-body-framing": {
+      "corpus": "runtime/internal/httpapi/testdata/fuzz/FuzzHTTPBodyFraming",
+      "package": "./internal/httpapi",
+      "testFile": "runtime/internal/httpapi/handler_fuzz_test.go",
+      "testMethod": "FuzzHTTPBodyFraming"
+    },
+    "http-header-tokens": {
+      "corpus": "runtime/internal/httpapi/testdata/fuzz/FuzzHeaderContainsToken",
+      "package": "./internal/httpapi",
+      "testFile": "runtime/internal/httpapi/handler_fuzz_test.go",
+      "testMethod": "FuzzHeaderContainsToken"
+    },
+    "http-request-head": {
+      "corpus": "runtime/internal/server/testdata/fuzz/FuzzHTTP1RequestHead",
+      "package": "./internal/server",
+      "testFile": "runtime/internal/server/server_fuzz_test.go",
+      "testMethod": "FuzzHTTP1RequestHead"
+    },
+    "http-transport-request": {
+      "corpus": "runtime/internal/httpapi/testdata/fuzz/FuzzValidateTransportRequest",
+      "package": "./internal/httpapi",
+      "testFile": "runtime/internal/httpapi/handler_fuzz_test.go",
+      "testMethod": "FuzzValidateTransportRequest"
+    },
+    "release-identifier": {
+      "corpus": "runtime/internal/releaseid/testdata/fuzz/FuzzReleaseIdentifier",
+      "package": "./internal/releaseid",
+      "testFile": "runtime/internal/releaseid/releaseid_fuzz_test.go",
+      "testMethod": "FuzzReleaseIdentifier"
+    },
+    "release-bundle-go-build-metadata": {
+      "corpus": "runtime/internal/releasebundle/testdata/fuzz/FuzzParseReleaseBundleGoBuildInfo",
+      "package": "./internal/releasebundle",
+      "testFile": "runtime/internal/releasebundle/buildinfo_fuzz_test.go",
+      "testMethod": "FuzzParseReleaseBundleGoBuildInfo"
+    },
+    "service-definition-paths": {
+      "corpus": "runtime/internal/service/testdata/fuzz/FuzzServiceDefinitionPaths",
+      "package": "./internal/service",
+      "testFile": "runtime/internal/service/service_fuzz_test.go",
+      "testMethod": "FuzzServiceDefinitionPaths"
+    },
+    "service-manager-output": {
+      "corpus": "runtime/internal/deployment/testdata/fuzz/FuzzServiceManagerOutput",
+      "package": "./internal/deployment",
+      "testFile": "runtime/internal/deployment/manager_fuzz_test.go",
+      "testMethod": "FuzzServiceManagerOutput"
+    },
+    "sqlite-schema-state": {
+      "corpus": "runtime/internal/store/testdata/fuzz/FuzzSQLiteSchemaState",
+      "package": "./internal/store",
+      "testFile": "runtime/internal/store/schema_fuzz_test.go",
+      "testMethod": "FuzzSQLiteSchemaState"
+    },
+    "store-scalars-and-canonical": {
+      "corpus": "runtime/internal/store/testdata/fuzz/FuzzStoreScalarAndStoredParsers",
+      "package": "./internal/store",
+      "testFile": "runtime/internal/store/scalar_fuzz_test.go",
+      "testMethod": "FuzzStoreScalarAndStoredParsers"
+    },
+    "store-route-identifiers": {
+      "corpus": "runtime/internal/store/testdata/fuzz/FuzzPathIdentifier",
+      "package": "./internal/store",
+      "testFile": "runtime/internal/store/dataplane_fuzz_test.go",
+      "testMethod": "FuzzPathIdentifier"
+    },
+    "store-operation-receipts": {
+      "corpus": "runtime/internal/store/testdata/fuzz/FuzzOperationReceiptKey",
+      "package": "./internal/store",
+      "testFile": "runtime/internal/store/dataplane_fuzz_test.go",
+      "testMethod": "FuzzOperationReceiptKey"
+    },
+    "store-shapes": {
+      "corpus": "runtime/internal/store/testdata/fuzz/FuzzStoredJSONShapes",
+      "package": "./internal/store",
+      "testFile": "runtime/internal/store/scalar_fuzz_test.go",
+      "testMethod": "FuzzStoredJSONShapes"
+    },
+    "strict-wire-json": {
+      "corpus": "runtime/internal/store/testdata/fuzz/FuzzDecodeStrictJSON",
+      "package": "./internal/store",
+      "testFile": "runtime/internal/store/models_fuzz_test.go",
+      "testMethod": "FuzzDecodeStrictJSON"
+    },
+    "uuid-v4": {
+      "corpus": "runtime/internal/uuidv4/testdata/fuzz/FuzzParseUUIDv4",
+      "package": "./internal/uuidv4",
+      "testFile": "runtime/internal/uuidv4/uuid_fuzz_test.go",
+      "testMethod": "FuzzParseUUIDv4"
+    }
+  },
+  "boundaries": [
+    {
+      "id": "release-attestation",
+      "coverageOwners": ["build-attestation"],
+      "sourceFiles": ["runtime/internal/buildinfo/buildinfo.go"]
+    },
+    {
+      "id": "fixed-authorization-scope-grammar",
+      "coverageOwners": ["store-shapes"],
+      "sourceFiles": ["runtime/internal/auth/token.go"]
+    },
+    {
+      "id": "cli-loopback-responses",
+      "coverageOwners": ["cli-responses"],
+      "sourceFiles": ["runtime/internal/cli/cli.go"]
+    },
+    {
+      "id": "instance-configuration",
+      "coverageOwners": ["config-json-and-listener", "uuid-v4"],
+      "sourceFiles": ["runtime/internal/config/config.go"]
+    },
+    {
+      "id": "deployment-inputs-and-state",
+      "coverageOwners": ["deployment-manifest", "deployment-preview", "deployment-metadata", "deployment-identity-json", "deployment-scalars", "deployment-paths", "deployment-executable-location", "artifact-go-build-metadata", "artifact-removal-filenames", "release-identifier", "uuid-v4"],
+      "sourceFiles": ["runtime/internal/deployment/artifact.go", "runtime/internal/deployment/attestation.go", "runtime/internal/deployment/endpoint_unix.go", "runtime/internal/deployment/lifecycle.go", "runtime/internal/deployment/manifest.go", "runtime/internal/deployment/paths_unix.go", "runtime/internal/deployment/preview.go", "runtime/internal/deployment/protected_unix.go", "runtime/internal/deployment/remove_artifacts_unix.go", "runtime/internal/deployment/state.go"]
+    },
+    {
+      "id": "service-manager-output-grammar",
+      "coverageOwners": ["service-manager-output", "deployment-paths"],
+      "sourceFiles": ["runtime/internal/deployment/manager.go"]
+    },
+    {
+      "id": "service-definition-rendering-and-paths",
+      "coverageOwners": ["service-definition-paths"],
+      "sourceFiles": ["runtime/internal/service/service.go"]
+    },
+    {
+      "id": "installer-url-and-payload",
+      "coverageOwners": ["install-command", "release-identifier"],
+      "sourceFiles": ["runtime/internal/releasebundle/installer.go"]
+    },
+    {
+      "id": "release-build-metadata",
+      "coverageOwners": ["local-main-build-metadata", "release-bundle-go-build-metadata"],
+      "sourceFiles": ["runtime/internal/releasebundle/bundle.go"]
+    },
+    {
+      "id": "http-transport-grammar",
+      "coverageOwners": ["http-body-framing", "http-header-tokens", "http-transport-request"],
+      "sourceFiles": ["runtime/internal/httpapi/handler.go"]
+    },
+    {
+      "id": "release-identifier-grammar",
+      "coverageOwners": ["release-identifier"],
+      "sourceFiles": ["runtime/internal/releaseid/releaseid.go"]
+    },
+    {
+      "id": "owner-admin-and-public-http-server",
+      "coverageOwners": ["admin-request", "config-json-and-listener", "deployment-identity-json", "http-request-head"],
+      "sourceFiles": ["runtime/internal/server/server.go"]
+    },
+    {
+      "id": "sync-wire-and-persisted-json",
+      "coverageOwners": ["strict-wire-json", "store-shapes", "store-scalars-and-canonical", "store-route-identifiers", "store-operation-receipts", "uuid-v4"],
+      "sourceFiles": ["runtime/internal/store/collection.go", "runtime/internal/store/dataplane.go", "runtime/internal/store/devices.go", "runtime/internal/store/envelope.go", "runtime/internal/store/models.go", "runtime/internal/store/snapshot.go", "runtime/internal/store/store.go", "runtime/internal/store/sync.go", "runtime/internal/store/validation.go"]
+    },
+    {
+      "id": "sqlite-persisted-schema",
+      "coverageOwners": ["sqlite-schema-state"],
+      "sourceFiles": ["runtime/internal/store/schema.go"]
+    },
+    {
+      "id": "uuid-wire-grammar",
+      "coverageOwners": ["uuid-v4"],
+      "sourceFiles": ["runtime/internal/uuidv4/uuid.go"]
+    }
+  ],
+  "exclusions": [
+    {
+      "id": "conformance-tool",
+      "reason": "The root conformance/ tree is a frozen local KAT fixture program rather than a shipped server input boundary; its deterministic vectors remain covered by make kat."
+    },
+    {
+      "id": "stdlib-cli-flags-and-static-templates",
+      "reason": "flag.FlagSet and text/template parse source-controlled declarations and templates. Reflection splits only source-controlled Go struct tags. External installer URL, payload, and runtime path values are fuzzed through InstallCommand and validateInstallerRenderOptions."
+    },
+    {
+      "id": "validated-derived-path-and-listener-consumers",
+      "reason": "Redundant filepath and host/port operations in store, server, service-manager, and filesystem traversal code consume paths or listener settings already accepted by the inventoried config, deployment-path, or service-definition owners; the source calls remain counted so a new file or call still fails closed. Directory-component walkers retain deterministic filesystem tests in addition to the pure lexical fuzz owner."
+    },
+    {
+      "id": "scanner-entrypoints",
+      "reason": "There is no production bufio.Scanner constructor at this revision. The zero-count scanner_constructor signal is retained so adding one changes the exact derived inventory and fails closed."
+    },
+    {
+      "id": "tests-and-vendored-runtime",
+      "reason": "Test helpers and runtime/third_party are not project-owned shipping parsers; vendored dependency source remains governed by the repository dependency and license policy."
+    }
+  ]
+}

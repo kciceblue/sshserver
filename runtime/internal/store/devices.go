@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -151,6 +150,17 @@ func (store *Store) handleListDevices(ctx context.Context, call api.Request) (ap
 	return api.Response{Status: http.StatusOK, Body: body}, nil
 }
 
+func validateRevokeDeviceRequest(request revokeDeviceRequest) error {
+	return validateUUID(request.RequestID)
+}
+
+func validateTokenRotationRequest(request tokenRotationRequest) ([]byte, error) {
+	if validateUUID(request.RotationID) != nil || validateUUID(request.DeviceID) != nil {
+		return nil, errors.New("token-rotation request identity is invalid")
+	}
+	return decodeBase64(request.NewDeviceToken, 32, 0, 0)
+}
+
 func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, targetDeviceID string) (api.Response, *api.Error) {
 	presentedToken, tokenErr := parseAuthorization(call.Authorization, "Bearer")
 	defer clear(presentedToken)
@@ -171,7 +181,7 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 			return api.Response{}, api.NewError("token_revoked", false)
 		}
 		var replayRequest revokeDeviceRequest
-		if err := decodeStrict(call.Body, &replayRequest); err != nil || replayRequest.RequestID != call.RequestID || validateUUID(replayRequest.RequestID) != nil {
+		if err := decodeStrict(call.Body, &replayRequest); err != nil || replayRequest.RequestID != call.RequestID || validateRevokeDeviceRequest(replayRequest) != nil {
 			return api.Response{}, api.NewError("token_revoked", false)
 		}
 		selfFingerprint, protocolErr := requestFingerprint(store, "JAT self revocation body fingerprint v1", targetDeviceID, call.Body)
@@ -184,7 +194,7 @@ func (store *Store) handleRevokeDevice(ctx context.Context, call api.Request, ta
 		return api.Response{}, api.NewError("token_revoked", false)
 	}
 	var request revokeDeviceRequest
-	if err := decodeStrict(call.Body, &request); err != nil || request.RequestID != call.RequestID || validateUUID(request.RequestID) != nil {
+	if err := decodeStrict(call.Body, &request); err != nil || request.RequestID != call.RequestID || validateRevokeDeviceRequest(request) != nil {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}
 	if tokenErr != nil {
@@ -394,11 +404,10 @@ func (store *Store) lookupRetiredSelfRevocationReceipt(ctx context.Context, tran
 	receipt.requestID = requestID.String
 	copy(receipt.fingerprint[:], fingerprint)
 	var responseDevice device
-	if json.Unmarshal(headersBody, &receipt.headers) != nil {
+	if decodeStoredCanonical(headersBody, &receipt.headers) != nil {
 		return nil, api.NewError("internal_error", true)
 	}
-	canonicalHeaders, headersErr := json.Marshal(receipt.headers)
-	if headersErr != nil || !bytes.Equal(canonicalHeaders, headersBody) || receipt.status != http.StatusOK ||
+	if receipt.status != http.StatusOK ||
 		!slices.Equal(receipt.headers, api.V1ResponseHeaders(receipt.requestID, len(body))) ||
 		decodeStoredCanonical(body, &responseDevice) != nil || validateDevice(responseDevice) != nil ||
 		responseDevice.DeviceID != matchedDeviceID || responseDevice.Status != "revoked" {
@@ -463,10 +472,10 @@ func preflightTokenRotationKey(ctx context.Context, transaction *sql.Tx, rotatio
 
 func (store *Store) handleTokenRotation(ctx context.Context, call api.Request) (api.Response, *api.Error) {
 	var request tokenRotationRequest
-	if err := decodeStrict(call.Body, &request); err != nil || validateUUID(request.RotationID) != nil || validateUUID(request.DeviceID) != nil {
+	if err := decodeStrict(call.Body, &request); err != nil {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}
-	newToken, err := decodeBase64(request.NewDeviceToken, 32, 0, 0)
+	newToken, err := validateTokenRotationRequest(request)
 	if err != nil {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}

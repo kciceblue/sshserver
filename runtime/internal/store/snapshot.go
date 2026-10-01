@@ -38,6 +38,30 @@ type snapshotRevisionReference struct {
 
 const snapshotMetadataLimit int64 = 64 * 1024 * 1024
 
+var errUnsupportedSnapshotCapabilities = errors.New("snapshot capabilities are unsupported")
+
+func validateSnapshotCreateRequest(request snapshotCreateRequest) error {
+	if request.ProtocolVersion != "1" || validateUUID(request.DeviceID) != nil || validateUUID(request.RequestID) != nil {
+		return errors.New("snapshot-create request profile is invalid")
+	}
+	if !slices.Equal(request.RequiredCapabilities, requiredSnapshotCapabilities) {
+		return errUnsupportedSnapshotCapabilities
+	}
+	return nil
+}
+
+func validateSnapshotPageRequest(request snapshotPageRequest) error {
+	if request.ProtocolVersion != "1" || validateUUID(request.DeviceID) != nil {
+		return errors.New("snapshot-page request profile is invalid")
+	}
+	token, err := decodeBase64(request.PageToken, 32, 0, 0)
+	clear(token)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 const snapshotOwnerKeyProbeSQL = `
 	SELECT octet_length(owner_device_id),
 	       CASE WHEN typeof(owner_device_id) = 'text'
@@ -103,12 +127,14 @@ func preflightSnapshotOwnerKeys(ctx context.Context, transaction *sql.Tx, ownerD
 
 func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) (api.Response, *api.Error) {
 	var request snapshotCreateRequest
-	if err := decodeStrict(call.Body, &request); err != nil || request.ProtocolVersion != "1" ||
-		validateUUID(request.DeviceID) != nil || validateUUID(request.RequestID) != nil || request.RequestID != call.RequestID {
+	if err := decodeStrict(call.Body, &request); err != nil || request.RequestID != call.RequestID {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}
-	if !slices.Equal(request.RequiredCapabilities, requiredSnapshotCapabilities) {
-		return api.Response{}, api.NewError("unsupported_capability", false)
+	if err := validateSnapshotCreateRequest(request); err != nil {
+		if errors.Is(err, errUnsupportedSnapshotCapabilities) {
+			return api.Response{}, api.NewError("unsupported_capability", false)
+		}
+		return api.Response{}, api.NewError("invalid_request", false)
 	}
 	transaction, protocolErr := beginTransaction(ctx, store.db)
 	if protocolErr != nil {
@@ -312,10 +338,7 @@ func (store *Store) handleCreateSnapshot(ctx context.Context, call api.Request) 
 
 func (store *Store) handleSnapshotPage(ctx context.Context, call api.Request, snapshotID string) (api.Response, *api.Error) {
 	var request snapshotPageRequest
-	if err := decodeStrict(call.Body, &request); err != nil || request.ProtocolVersion != "1" || validateUUID(request.DeviceID) != nil {
-		return api.Response{}, api.NewError("invalid_request", false)
-	}
-	if _, err := decodeBase64(request.PageToken, 32, 0, 0); err != nil {
+	if err := decodeStrict(call.Body, &request); err != nil || validateSnapshotPageRequest(request) != nil {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}
 	transaction, protocolErr := beginTransaction(ctx, store.db)

@@ -223,7 +223,11 @@ func (store *Store) HandleAPI(ctx context.Context, request api.Request) (api.Res
 }
 
 func pathIdentifier(path, prefix, suffix string) (string, bool) {
-	value := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if prefix == "" || suffix == "" || len(path) < len(prefix)+len(suffix) ||
+		!strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	value := path[len(prefix) : len(path)-len(suffix)]
 	if value == "" || strings.Contains(value, "/") || validateUUID(value) != nil {
 		return "", false
 	}

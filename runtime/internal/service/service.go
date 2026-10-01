@@ -29,13 +29,11 @@ func Render(platform, binary, stateDir string) ([]byte, error) {
 	if platform != "linux" && platform != "darwin" {
 		return nil, fmt.Errorf("unsupported service platform %q", platform)
 	}
-	for name, value := range map[string]string{"binary": binary, "state directory": stateDir} {
-		if !filepath.IsAbs(value) || filepath.Clean(value) != value || !validPathText(value) {
-			return nil, fmt.Errorf("%s must be a canonical absolute path without control characters", name)
-		}
+	if err := validateServicePath("binary", binary, true); err != nil {
+		return nil, err
 	}
-	if stateDir == string(filepath.Separator) {
-		return nil, errors.New("state directory must not be the filesystem root")
+	if err := validateServicePath("state directory", stateDir, false); err != nil {
+		return nil, err
 	}
 	if platform == "linux" {
 		binaryArgument, err := quoteSystemdExecArgument(binary)
@@ -77,11 +75,24 @@ func validPathText(value string) bool {
 		return false
 	}
 	for _, character := range value {
-		if character < 0x20 || character == 0x7f {
+		// The same accepted path alphabet is rendered into both systemd text
+		// and XML 1.0. Exclude XML's noncharacters as well as control bytes so
+		// xml.EscapeText can never silently replace an accepted path rune.
+		if character < 0x20 || character == 0x7f || character == 0xfffe || character == 0xffff {
 			return false
 		}
 	}
 	return true
+}
+
+func validateServicePath(name, value string, allowRoot bool) error {
+	if !filepath.IsAbs(value) || filepath.Clean(value) != value || !validPathText(value) {
+		return fmt.Errorf("%s must be a canonical absolute path without control characters", name)
+	}
+	if !allowRoot && value == string(filepath.Separator) {
+		return fmt.Errorf("%s must not be the filesystem root", name)
+	}
+	return nil
 }
 
 func quoteSystemdExecArgument(value string) (string, error) {
@@ -155,8 +166,8 @@ func Install(platform, binary, stateDir, outputPath string) (string, error) {
 			return "", err
 		}
 	}
-	if !filepath.IsAbs(outputPath) || filepath.Clean(outputPath) != outputPath || !validPathText(outputPath) {
-		return "", errors.New("service output path must be canonical, absolute, and free of control characters")
+	if err := validateServicePath("service output path", outputPath, false); err != nil {
+		return "", err
 	}
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o700); err != nil {
 		return "", fmt.Errorf("create service directory: %w", err)

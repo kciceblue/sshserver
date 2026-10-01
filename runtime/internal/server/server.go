@@ -530,7 +530,11 @@ func (connection *headerLimitConn) replaceWithLimitRequest(destination []byte) (
 }
 
 func requestIDValues(requestHead []byte) []string {
-	lines := bytes.Split(requestHead, []byte("\r\n"))
+	completeEnd := bytes.LastIndex(requestHead, []byte("\r\n"))
+	if completeEnd < 0 {
+		return nil
+	}
+	lines := bytes.Split(requestHead[:completeEnd], []byte("\r\n"))
 	values := make([]string, 0, 1)
 	for _, line := range lines[1:] {
 		separator := bytes.IndexByte(line, ':')

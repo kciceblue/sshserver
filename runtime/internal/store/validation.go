@@ -1997,15 +1997,10 @@ func validatePersistentEnrollmentsAndRotations(ctx context.Context, query schema
 			!boundedRequiredBytes(tokenHashLength, tokenHash, 32) || tokenHashLength != 32 ||
 			!devices[deviceID.String].revoked || status != http.StatusOK ||
 			!boundedRequiredBytes(headersLength, headersBody, maxBodyBytes) || !boundedRequiredBytes(bodyLength, body, maxBodyBytes) ||
-			json.Unmarshal(headersBody, &headers) != nil || !slices.Equal(headers, api.V1ResponseHeaders(requestID.String, len(body))) ||
+			decodeStoredCanonical(headersBody, &headers) != nil || !slices.Equal(headers, api.V1ResponseHeaders(requestID.String, len(body))) ||
 			decodeStoredCanonical(body, &response) != nil || validateDevice(response) != nil || response.DeviceID != deviceID.String || response.Status != "revoked" {
 			selfRows.Close()
 			return invalidPersistentState("invalid self-revocation receipt")
-		}
-		canonicalHeaders, _ := json.Marshal(headers)
-		if !bytes.Equal(canonicalHeaders, headersBody) {
-			selfRows.Close()
-			return invalidPersistentState("noncanonical self-revocation headers")
 		}
 	}
 	if selfRows.Err() != nil || selfRows.Close() != nil {

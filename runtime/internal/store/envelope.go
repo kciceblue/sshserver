@@ -61,6 +61,29 @@ func (store *Store) handleGetEnvelope(ctx context.Context, call api.Request) (ap
 	return api.Response{Status: http.StatusOK, Body: body}, nil
 }
 
+func validatePutEnvelopeRequestGenerations(request putEnvelopeRequest, expectedGeneration uint64) (uint64, error) {
+	encodedExpected, err := parseUint64(request.ExpectedGeneration)
+	if err != nil || encodedExpected != expectedGeneration {
+		return 0, errors.New("expected envelope generation is invalid")
+	}
+	if expectedGeneration == math.MaxUint64 {
+		return 0, errors.New("envelope generation has no successor")
+	}
+	newGeneration, err := parseUint64(request.NewGeneration)
+	if err != nil || newGeneration != expectedGeneration+1 {
+		return 0, errors.New("new envelope generation is invalid")
+	}
+	return newGeneration, nil
+}
+
+func validatePutEnvelopeRequestEnvelope(request putEnvelopeRequest, identity Identity, newGeneration, secretGeneration uint64) error {
+	envelopeGeneration, envelopeSecretGeneration, err := validateEnvelope(request.Envelope, identity)
+	if err != nil || envelopeGeneration != newGeneration || envelopeSecretGeneration != secretGeneration {
+		return errors.New("envelope profile is invalid")
+	}
+	return nil
+}
+
 func (store *Store) handlePutEnvelope(ctx context.Context, call api.Request) (api.Response, *api.Error) {
 	var request putEnvelopeRequest
 	if err := decodeStrict(call.Body, &request); err != nil {
@@ -102,18 +125,14 @@ func (store *Store) handlePutEnvelope(ctx context.Context, call api.Request) (ap
 	if storedGeneration == math.MaxUint64 {
 		return api.Response{}, api.NewError("generation_exhausted", false)
 	}
-	newGeneration, err := parseUint64(request.NewGeneration)
+	newGeneration, err := validatePutEnvelopeRequestGenerations(request, storedGeneration)
 	if err != nil {
-		return api.Response{}, api.NewError("invalid_request", false)
-	}
-	if newGeneration != storedGeneration+1 {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}
 	if cursor == math.MaxUint64 {
 		return api.Response{}, api.NewError("server_cursor_exhausted", false)
 	}
-	envelopeGeneration, envelopeSecretGeneration, err := validateEnvelope(request.Envelope, store.identity)
-	if err != nil || envelopeGeneration != newGeneration || envelopeSecretGeneration != secretGeneration {
+	if err := validatePutEnvelopeRequestEnvelope(request, store.identity, newGeneration, secretGeneration); err != nil {
 		return api.Response{}, api.NewError("invalid_request", false)
 	}
 	responseBody, err := marshalJSON(request.Envelope)

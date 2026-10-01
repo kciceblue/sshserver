@@ -141,6 +141,9 @@ func validateRemovableArtifact(name string, stat unix.Stat_t) error {
 	if err := validateOwnedRegularFile(stat, 0, false); err != nil {
 		return fmt.Errorf("installed artifact %q is not trusted: %w", name, err)
 	}
+	if stat.Mode&(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0 {
+		return fmt.Errorf("installed artifact %q has special mode bits", name)
+	}
 	permissions := uint32(stat.Mode) & 0o777
 	if installedArtifactNamePattern.MatchString(name) {
 		if permissions != 0o500 {
