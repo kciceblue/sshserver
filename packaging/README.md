@@ -4,6 +4,11 @@ Task 2.5's server-side release foundation produces one immutable directory for
 Linux and macOS on amd64 and arm64. Run it only from the exact clean source
 revision being released:
 
+Operators should start with the complete
+[self-hosting guide](../docs/SELF-HOSTING.md), which covers app-guided and
+independently pinned installation, enrollment, protection modes, lifecycle
+operations, troubleshooting, and cold backup/restore.
+
 ```sh
 make runtime-release-bundle-check \
   VERSION=v1.2.3 \
